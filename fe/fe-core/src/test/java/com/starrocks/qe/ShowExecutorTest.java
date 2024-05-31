@@ -493,19 +493,19 @@ public class ShowExecutorTest {
         ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
 
         // Ready to Assert
-        String partitionKeyTitle = resultSet.getMetaData().getColumn(6).getName();
+        String partitionKeyTitle = resultSet.getMetaData().getColumn(8).getName();
         Assert.assertEquals(partitionKeyTitle, "PartitionKey");
-        String valuesTitle = resultSet.getMetaData().getColumn(7).getName();
+        String valuesTitle = resultSet.getMetaData().getColumn(9).getName();
         Assert.assertEquals(valuesTitle, "List");
 
-        String partitionKey1 = resultSet.getResultRows().get(0).get(6);
+        String partitionKey1 = resultSet.getResultRows().get(0).get(8);
         Assert.assertEquals(partitionKey1, "dt, province");
-        String partitionKey2 = resultSet.getResultRows().get(1).get(6);
+        String partitionKey2 = resultSet.getResultRows().get(1).get(8);
         Assert.assertEquals(partitionKey2, "dt, province");
 
-        String values1 = resultSet.getResultRows().get(0).get(7);
+        String values1 = resultSet.getResultRows().get(0).get(9);
         Assert.assertEquals(values1, "(('2022-04-15', 'guangdong'), ('2022-04-15', 'tianjin'))");
-        String values2 = resultSet.getResultRows().get(1).get(7);
+        String values2 = resultSet.getResultRows().get(1).get(9);
         Assert.assertEquals(values2, "(('2022-04-16', 'shanghai'), ('2022-04-16', 'beijing'))");
     }
 

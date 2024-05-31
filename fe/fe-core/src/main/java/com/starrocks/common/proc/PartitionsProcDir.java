@@ -109,8 +109,11 @@ public class PartitionsProcDir implements ProcDirInterface {
                     .add("PartitionId")
                     .add("PartitionName")
                     .add("CompactVersion")
+                    .add("DataVersion")
                     .add("VisibleVersion")
                     .add("NextVersion")
+                    .add("VersionEpoch")
+                    .add("VersionTxnType")
                     .add("State")
                     .add("PartitionKey")
                     .add(partitionType == PartitionType.LIST ? "List" : "Range")
@@ -131,6 +134,8 @@ public class PartitionsProcDir implements ProcDirInterface {
                     .add("VisibleVersion")
                     .add("VisibleVersionTime")
                     .add("VisibleVersionHash")
+                    .add("VersionEpoch")
+                    .add("VersionTxnType")
                     .add("State")
                     .add("PartitionKey")
                     .add(partitionType == PartitionType.LIST ? "List" : "Range")
@@ -337,6 +342,8 @@ public class PartitionsProcDir implements ProcDirInterface {
         partitionInfo.add(physicalPartition.getVisibleVersion()); // VisibleVersion
         partitionInfo.add(TimeUtils.longToTimeString(physicalPartition.getVisibleVersionTime())); // VisibleVersionTime
         partitionInfo.add(0); // VisibleVersionHash
+        partitionInfo.add(physicalPartition.getVersionEpoch());
+        partitionInfo.add(physicalPartition.getVersionTxnType());
         partitionInfo.add(partition.getState()); // State
 
         // partition key , range or list value
@@ -374,8 +381,11 @@ public class PartitionsProcDir implements ProcDirInterface {
         partitionInfo.add(physicalPartition.getId()); // PartitionId
         partitionInfo.add(partition.getName()); // PartitionName
         partitionInfo.add(statistics != null ? statistics.getCompactionVersion().getVersion() : 0); // CompactVersion
+        partitionInfo.add(physicalPartition.getDataVersion()); // DataVersion
         partitionInfo.add(physicalPartition.getVisibleVersion()); // VisibleVersion
         partitionInfo.add(physicalPartition.getNextVersion()); // NextVersion
+        partitionInfo.add(physicalPartition.getVersionEpoch());
+        partitionInfo.add(physicalPartition.getVersionTxnType());
         partitionInfo.add(partition.getState()); // State
         partitionInfo.add(Joiner.on(", ")
                 .join(tblPartitionInfo.getPartitionColumns(table.getIdToColumn()))); // PartitionKey

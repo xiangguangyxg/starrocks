@@ -1740,6 +1740,7 @@ struct TPartitionReplicationInfo {
     1: optional i64 partition_id
     2: optional i64 src_version
     3: optional map<i64, TIndexReplicationInfo> index_replication_infos
+    4: optional i64 src_version_epoch
 }
 
 struct TTableReplicationRequest {
