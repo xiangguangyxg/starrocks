@@ -174,6 +174,7 @@ struct TAlterTabletReqV2 {
     16: optional Descriptors.TDescriptorTable desc_tbl
     17: optional Exprs.TExpr where_expr
     18: optional list<string> base_table_column_names 
+    19: optional i64 gtid
 }
 
 struct TClusterInfo {
@@ -208,6 +209,7 @@ struct TPushReq {
     31: optional string timezone
 
     32: optional TTabletType tablet_type
+    33: optional i64 gtid
 }
 
 struct TCloneReq {
@@ -390,6 +392,7 @@ struct TRemoteSnapshotRequest {
      12: optional Types.TVersion src_visible_version
      13: optional list<Types.TBackend> src_backends
      14: optional i32 timeout_sec
+     15: optional i64 gtid
  }
 
  struct TReplicateSnapshotRequest {
@@ -407,6 +410,7 @@ struct TRemoteSnapshotRequest {
      12: optional Types.TVersion src_visible_version
      13: optional list<Types.TSnapshotInfo> src_snapshot_infos
      14: optional binary encryption_meta
+     15: optional i64 gtid
  }
 
 enum TTabletMetaType {
@@ -445,6 +449,7 @@ struct TUpdateTabletMetaInfoReq {
     // for update lake tablet meta
     2: optional TTabletType tablet_type
     3: optional i64 txn_id
+    4: optional i64 gtid
 }
 
 struct TPluginMetaInfo {

@@ -121,6 +121,8 @@ private:
         auto txn_log = std::make_shared<TxnLog>();
         txn_log->set_tablet_id(_tablet_id);
         txn_log->set_txn_id(_txn_id);
+        // TODO: Use real gtid
+        txn_log->set_gtid(0);
         auto op_write = txn_log->mutable_op_write();
         for (auto& f : _tablet_writer->files()) {
             if (is_segment(f.path)) {

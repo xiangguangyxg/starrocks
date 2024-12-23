@@ -291,6 +291,10 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
         return GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getTransactionIDGenerator().peekNextTransactionId();
     }
 
+    public static long getNextGtid() {
+        return GlobalStateMgr.getCurrentState().getGtidGenerator().nextGtid();
+    }
+
     @VisibleForTesting
     public void setIsCancelling(boolean isCancelling) {
         this.isCancelling.set(isCancelling);
@@ -412,6 +416,7 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
             OlapTable table = getTableOrThrow(db, tableId);
             Preconditions.checkState(table.getState() == OlapTable.OlapTableState.SCHEMA_CHANGE);
             watershedTxnId = getNextTransactionId();
+            watershedGtid = getNextGtid();
             addShadowIndexToCatalog(table, watershedTxnId);
         }
 
@@ -651,6 +656,7 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
             txnInfo.combinedTxnLog = false;
             txnInfo.txnType = TxnTypePB.TXN_NORMAL;
             txnInfo.commitTime = finishedTimeMs / 1000;
+            txnInfo.gtid = watershedGtid;
             for (long partitionId : physicalPartitionIndexMap.rowKeySet()) {
                 long commitVersion = commitVersionMap.get(partitionId);
                 Map<Long, MaterializedIndex> shadowIndexMap = physicalPartitionIndexMap.row(partitionId);
@@ -753,6 +759,7 @@ public class LakeTableSchemaChangeJob extends LakeTableSchemaChangeJobBase {
             this.indexChange = other.indexChange;
             this.indexes = other.indexes;
             this.watershedTxnId = other.watershedTxnId;
+            this.watershedGtid = other.watershedGtid;
             this.startTime = other.startTime;
             this.commitVersionMap = other.commitVersionMap;
             // this.schemaChangeBatchTask = other.schemaChangeBatchTask;

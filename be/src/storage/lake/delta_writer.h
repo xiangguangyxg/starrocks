@@ -86,6 +86,8 @@ public:
 
     [[nodiscard]] int64_t txn_id() const;
 
+    [[nodiscard]] int64_t gtid() const;
+
     [[nodiscard]] MemTracker* mem_tracker();
 
     const int64_t queueing_memtable_num() const;
@@ -128,6 +130,11 @@ public:
 
     DeltaWriterBuilder& set_txn_id(int64_t txn_id) {
         _txn_id = txn_id;
+        return *this;
+    }
+
+    DeltaWriterBuilder& set_gtid(int64_t gtid) {
+        _gtid = gtid;
         return *this;
     }
 
@@ -201,6 +208,7 @@ public:
 private:
     TabletManager* _tablet_mgr{nullptr};
     int64_t _txn_id{0};
+    int64_t _gtid{0};
     int64_t _table_id{0};
     int64_t _partition_id{0};
     int64_t _schema_id{0};

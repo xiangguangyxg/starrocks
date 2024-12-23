@@ -94,6 +94,7 @@ Status OlapTableSink::init(const TDataSink& t_sink, RuntimeState* state) {
     _load_id.set_hi(table_sink.load_id.hi);
     _load_id.set_lo(table_sink.load_id.lo);
     _txn_id = table_sink.txn_id;
+    _gtid = table_sink.gtid;
     _sink_id = t_sink.__isset.sink_id ? t_sink.sink_id : 0;
     _txn_trace_parent = table_sink.txn_trace_parent;
     _span = Tracer::Instance().start_trace_or_add_span("olap_table_sink", _txn_trace_parent);
@@ -174,6 +175,7 @@ void OlapTableSink::_prepare_profile(RuntimeState* state) {
         _profile = state->obj_pool()->add(new RuntimeProfile("OlapTableSink"));
     }
     _profile->add_info_string("TxnID", fmt::format("{}", _txn_id));
+    _profile->add_info_string("GTID", fmt::format("{}", _gtid));
     _profile->add_info_string("IndexNum", fmt::format("{}", _schema->indexes().size()));
     _profile->add_info_string("ReplicatedStorage", fmt::format("{}", _enable_replicated_storage));
     _profile->add_info_string("AutomaticPartition", fmt::format("{}", _enable_automatic_partition));
@@ -206,7 +208,7 @@ void OlapTableSink::_prepare_profile(RuntimeState* state) {
 void OlapTableSink::set_profile(RuntimeProfile* profile) {
     if (_profile != nullptr) {
         LOG(WARNING) << "OlapTableSink profile is set duplicated, load_id: " << print_id(_load_id)
-                     << ", txn_id: " << _txn_id << ", stack\n"
+                     << ", txn_id: " << _txn_id << ", gtid: " << _gtid << ", stack\n"
                      << get_stack_trace();
         return;
     }
@@ -416,7 +418,7 @@ Status OlapTableSink::_automatic_create_partition() {
         request.__set_is_temp(true);
     }
 
-    LOG(INFO) << "load_id=" << print_id(_load_id) << ", txn_id: " << std::to_string(_txn_id)
+    LOG(INFO) << "load_id=" << print_id(_load_id) << ", txn_id: " << _txn_id << ", gtid: " << _gtid
               << " automatic partition rpc begin request " << request;
     TNetworkAddress master_addr = get_master_address();
     auto timeout_ms = _runtime_state->query_options().query_timeout * 1000 / 2;
@@ -426,7 +428,7 @@ Status OlapTableSink::_automatic_create_partition() {
     do {
         if (retry_times++ > 1) {
             SleepFor(MonoDelta::FromMilliseconds(std::min(5000, timeout_ms)));
-            VLOG(2) << "load_id=" << print_id(_load_id) << ", txn_id: " << std::to_string(_txn_id)
+            VLOG(2) << "load_id=" << print_id(_load_id) << ", txn_id: " << _txn_id << ", gtid: " << _gtid
                     << " automatic partition rpc retry " << retry_times;
         }
         RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
@@ -436,7 +438,7 @@ Status OlapTableSink::_automatic_create_partition() {
     } while (result.status.status_code == TStatusCode::SERVICE_UNAVAILABLE &&
              butil::gettimeofday_s() - start_ts < timeout_ms / 1000);
 
-    LOG(INFO) << "load_id=" << print_id(_load_id) << ", txn_id: " << std::to_string(_txn_id)
+    LOG(INFO) << "load_id=" << print_id(_load_id) << ", txn_id: " << _txn_id << ", gtid: " << _gtid
               << " automatic partition rpc end response " << result;
     if (result.status.status_code == TStatusCode::OK) {
         // add new created partitions
@@ -1159,6 +1161,7 @@ Status OlapTableSink::reset_epoch(RuntimeState* state) {
     pipeline::StreamEpochManager* stream_epoch_manager = state->query_ctx()->stream_epoch_manager();
     DCHECK(stream_epoch_manager);
     _txn_id = stream_epoch_manager->epoch_info().txn_id;
+    _gtid = stream_epoch_manager->epoch_info().gtid;
     _channels.clear();
     _node_channels.clear();
     _failed_channels.clear();

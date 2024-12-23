@@ -64,6 +64,8 @@ public:
 
     [[nodiscard]] int64_t txn_id() const { return _writer->txn_id(); }
 
+    [[nodiscard]] int64_t gtid() const { return _writer->gtid(); }
+
     [[nodiscard]] bool is_immutable() const { return _writer->is_immutable(); }
 
     Status check_immutable() { return _writer->check_immutable(); }
@@ -155,7 +157,8 @@ inline int AsyncDeltaWriterImpl::execute(void* meta, bthread::TaskIterator<Async
             if (st.ok()) {
                 st.update(delta_writer->write(*(write_task->chunk), write_task->indexes, write_task->indexes_size));
                 LOG_IF(ERROR, !st.ok()) << "Fail to write. tablet_id: " << delta_writer->tablet_id()
-                                        << " txn_id: " << delta_writer->txn_id() << ": " << st;
+                                        << " txn_id: " << delta_writer->txn_id() << " gtid: " << delta_writer->gtid()
+                                        << ": " << st;
             }
             write_task->cb(st);
             break;
@@ -174,7 +177,8 @@ inline int AsyncDeltaWriterImpl::execute(void* meta, bthread::TaskIterator<Async
                 auto res = delta_writer->finish_with_txnlog(finish_task->finish_mode);
                 st.update(res.status());
                 LOG_IF(ERROR, !st.ok()) << "Fail to finish write. tablet_id: " << delta_writer->tablet_id()
-                                        << " txn_id: " << delta_writer->txn_id() << ": " << st;
+                                        << " txn_id: " << delta_writer->txn_id() << " gtid: " << delta_writer->gtid()
+                                        << ": " << st;
                 finish_task->cb(std::move(res));
             } else {
                 finish_task->cb(st);
@@ -324,6 +328,10 @@ int64_t AsyncDeltaWriter::txn_id() const {
     return _impl->txn_id();
 }
 
+int64_t AsyncDeltaWriter::gtid() const {
+    return _impl->gtid();
+}
+
 bool AsyncDeltaWriter::is_immutable() const {
     return _impl->is_immutable();
 }
@@ -340,6 +348,7 @@ StatusOr<AsyncDeltaWriterBuilder::AsyncDeltaWriterPtr> AsyncDeltaWriterBuilder::
     ASSIGN_OR_RETURN(auto writer, DeltaWriterBuilder()
                                           .set_tablet_manager(_tablet_mgr)
                                           .set_txn_id(_txn_id)
+                                          .set_gtid(_gtid)
                                           .set_tablet_id(_tablet_id)
                                           .set_table_id(_table_id)
                                           .set_partition_id(_partition_id)

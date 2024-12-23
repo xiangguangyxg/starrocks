@@ -59,9 +59,11 @@ struct CompactionTaskStats {
 
 // Context of a single tablet compaction task.
 struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
-    explicit CompactionTaskContext(int64_t txn_id_, int64_t tablet_id_, int64_t version_, bool force_base_compaction_,
-                                   bool is_checker_, std::shared_ptr<CompactionTaskCallback> cb_)
+    explicit CompactionTaskContext(int64_t txn_id_, int64_t gtid_, int64_t tablet_id_, int64_t version_,
+                                   bool force_base_compaction_, bool is_checker_,
+                                   std::shared_ptr<CompactionTaskCallback> cb_)
             : txn_id(txn_id_),
+              gtid(gtid_),
               tablet_id(tablet_id_),
               version(version_),
               force_base_compaction(force_base_compaction_),
@@ -75,6 +77,7 @@ struct CompactionTaskContext : public butil::LinkNode<CompactionTaskContext> {
 #endif
 
     const int64_t txn_id;
+    const int64_t gtid;
     const int64_t tablet_id;
     const int64_t version;
     const bool force_base_compaction;

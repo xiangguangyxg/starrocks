@@ -24,8 +24,7 @@ namespace starrocks::lake {
 
 CompactionTask::CompactionTask(VersionedTablet tablet, std::vector<std::shared_ptr<Rowset>> input_rowsets,
                                CompactionTaskContext* context, std::shared_ptr<const TabletSchema> tablet_schema)
-        : _txn_id(context->txn_id),
-          _tablet(std::move(tablet)),
+        : _tablet(std::move(tablet)),
           _input_rowsets(std::move(input_rowsets)),
           _mem_tracker(std::make_unique<MemTracker>(MemTracker::COMPACTION, -1,
                                                     "Compaction-" + std::to_string(_tablet.metadata()->id()),

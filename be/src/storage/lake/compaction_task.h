@@ -54,7 +54,6 @@ public:
     Status fill_compaction_segment_info(TxnLogPB_OpCompaction* op_compaction, TabletWriter* writer);
 
 protected:
-    int64_t _txn_id;
     VersionedTablet _tablet;
     std::vector<std::shared_ptr<Rowset>> _input_rowsets;
     std::unique_ptr<MemTracker> _mem_tracker = nullptr;

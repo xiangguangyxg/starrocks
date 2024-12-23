@@ -84,6 +84,8 @@ struct MVMaintenanceTaskInfo {
 struct EpochInfo {
     // transaction id
     int64_t txn_id;
+    // global transaction id
+    int64_t gtid;
     // load_id
     TUniqueId load_id;
     // epoch marker id

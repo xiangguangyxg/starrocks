@@ -38,6 +38,7 @@ struct SchemaChangeParams {
     VersionedTablet base_tablet;
     VersionedTablet new_tablet;
     int64_t txn_id;
+    int64_t gtid;
     MaterializedViewParamMap materialized_params_map;
     std::unique_ptr<TExpr> where_expr;
     bool sc_sorting = false;
@@ -50,8 +51,8 @@ struct SchemaChangeParams {
 
 class SchemaChange {
 public:
-    explicit SchemaChange(TabletManager* tablet_manager, int64_t txn_id)
-            : _tablet_manager(tablet_manager), _txn_id(txn_id) {}
+    explicit SchemaChange(TabletManager* tablet_manager, int64_t txn_id, int64_t gtid)
+            : _tablet_manager(tablet_manager), _txn_id(txn_id), _gtid(gtid) {}
 
     virtual ~SchemaChange() = default;
 
@@ -61,11 +62,13 @@ public:
 protected:
     TabletManager* _tablet_manager;
     int64_t _txn_id;
+    int64_t _gtid;
 };
 
 class LinkedSchemaChange final : public SchemaChange {
 public:
-    explicit LinkedSchemaChange(TabletManager* tablet_manager, int64_t txn_id) : SchemaChange(tablet_manager, txn_id) {}
+    explicit LinkedSchemaChange(TabletManager* tablet_manager, int64_t txn_id, int64_t gtid)
+            : SchemaChange(tablet_manager, txn_id, gtid) {}
     ~LinkedSchemaChange() override = default;
 
     DISALLOW_COPY_AND_MOVE(LinkedSchemaChange);
@@ -76,9 +79,9 @@ public:
 
 class ConvertedSchemaChange : public SchemaChange {
 public:
-    explicit ConvertedSchemaChange(TabletManager* tablet_manager, int64_t txn_id, VersionedTablet base_tablet,
-                                   VersionedTablet new_tablet, ChunkChanger* chunk_changer)
-            : SchemaChange(tablet_manager, txn_id),
+    explicit ConvertedSchemaChange(TabletManager* tablet_manager, int64_t txn_id, int64_t gtid,
+                                   VersionedTablet base_tablet, VersionedTablet new_tablet, ChunkChanger* chunk_changer)
+            : SchemaChange(tablet_manager, txn_id, gtid),
               _base_tablet(std::move(base_tablet)),
               _new_tablet(std::move(new_tablet)),
               _chunk_changer(chunk_changer) {
@@ -107,9 +110,9 @@ protected:
 
 class DirectSchemaChange final : public ConvertedSchemaChange {
 public:
-    explicit DirectSchemaChange(TabletManager* tablet_manager, int64_t txn_id, VersionedTablet base_tablet,
-                                VersionedTablet new_tablet, ChunkChanger* chunk_changer)
-            : ConvertedSchemaChange(tablet_manager, txn_id, std::move(base_tablet), std::move(new_tablet),
+    explicit DirectSchemaChange(TabletManager* tablet_manager, int64_t txn_id, int64_t gtid,
+                                VersionedTablet base_tablet, VersionedTablet new_tablet, ChunkChanger* chunk_changer)
+            : ConvertedSchemaChange(tablet_manager, txn_id, gtid, std::move(base_tablet), std::move(new_tablet),
                                     chunk_changer) {}
 
     ~DirectSchemaChange() override = default;
@@ -121,9 +124,10 @@ public:
 
 class SortedSchemaChange final : public ConvertedSchemaChange {
 public:
-    explicit SortedSchemaChange(TabletManager* tablet_manager, int64_t txn_id, VersionedTablet base_tablet,
-                                VersionedTablet new_tablet, ChunkChanger* chunk_changer, size_t memory_limitation)
-            : ConvertedSchemaChange(tablet_manager, txn_id, std::move(base_tablet), std::move(new_tablet),
+    explicit SortedSchemaChange(TabletManager* tablet_manager, int64_t txn_id, int64_t gtid,
+                                VersionedTablet base_tablet, VersionedTablet new_tablet, ChunkChanger* chunk_changer,
+                                size_t memory_limitation)
+            : ConvertedSchemaChange(tablet_manager, txn_id, gtid, std::move(base_tablet), std::move(new_tablet),
                                     chunk_changer),
               _memory_limitation(memory_limitation) {}
 
@@ -251,6 +255,7 @@ Status SortedSchemaChange::process(RowsetPtr rowset, RowsetMetadata* new_rowset_
                                           .set_tablet_manager(_tablet_manager)
                                           .set_tablet_id(_new_tablet.id())
                                           .set_txn_id(_txn_id)
+                                          .set_gtid(_gtid)
                                           .set_max_buffer_size(_max_buffer_size)
                                           .set_mem_tracker(CurrentThread::mem_tracker())
                                           .set_schema_id(_new_tablet_schema->id()) // TODO: pass tablet schema directly
@@ -354,6 +359,7 @@ Status SchemaChangeHandler::do_process_alter_tablet(const TAlterTabletReqV2& req
     sc_params.chunk_changer =
             std::make_unique<ChunkChanger>(base_schema, new_schema, base_table_columns, request.alter_job_type);
     sc_params.txn_id = request.txn_id;
+    sc_params.gtid = request.gtid;
 
     auto* chunk_changer = sc_params.chunk_changer.get();
     if (request.alter_job_type == TAlterJobType::ROLLUP) {
@@ -386,6 +392,7 @@ Status SchemaChangeHandler::do_process_alter_tablet(const TAlterTabletReqV2& req
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(new_tablet.id());
     txn_log->set_txn_id(request.txn_id);
+    txn_log->set_gtid(request.gtid);
     auto op_schema_change = txn_log->mutable_op_schema_change();
     op_schema_change->set_alter_version(alter_version);
     // convert historical rowsets
@@ -401,16 +408,16 @@ Status SchemaChangeHandler::process_update_tablet_meta(const TUpdateTabletMetaIn
         LOG(WARNING) << "txn_id not set in request";
         return Status::InternalError("txn_id not set in request");
     }
-    int64_t txn_id = request.txn_id;
 
     for (const auto& tablet_meta_info : request.tabletMetaInfos) {
-        RETURN_IF_ERROR(do_process_update_tablet_meta(tablet_meta_info, txn_id));
+        RETURN_IF_ERROR(do_process_update_tablet_meta(tablet_meta_info, request.txn_id, request.gtid));
     }
 
     return Status::OK();
 }
 
-Status SchemaChangeHandler::do_process_update_tablet_meta(const TTabletMetaInfo& tablet_meta_info, int64_t txn_id) {
+Status SchemaChangeHandler::do_process_update_tablet_meta(const TTabletMetaInfo& tablet_meta_info, int64_t txn_id,
+                                                          int64_t gtid) {
     auto timer = MonotonicStopWatch{};
     timer.start();
     LOG(INFO) << "Updating tablet metadata: " << ThriftDebugString(tablet_meta_info);
@@ -422,6 +429,7 @@ Status SchemaChangeHandler::do_process_update_tablet_meta(const TTabletMetaInfo&
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(tablet_id);
     txn_log->set_txn_id(txn_id);
+    txn_log->set_gtid(gtid);
     auto op_alter_metadata = txn_log->mutable_op_alter_metadata();
     auto metadata_update_info = op_alter_metadata->add_metadata_update_infos();
     if (tablet_meta_info.__isset.enable_persistent_index) {
@@ -462,16 +470,16 @@ Status SchemaChangeHandler::convert_historical_rowsets(const SchemaChangeParams&
         LOG(INFO) << "doing sorted schema change for base tablet: " << base_tablet.id();
         size_t memory_limitation =
                 static_cast<size_t>(config::memory_limitation_per_thread_for_schema_change) * 1024 * 1024 * 1024;
-        sc_procedure = std::make_unique<SortedSchemaChange>(_tablet_manager, sc_params.txn_id, base_tablet, new_tablet,
-                                                            chunk_changer, memory_limitation);
+        sc_procedure = std::make_unique<SortedSchemaChange>(_tablet_manager, sc_params.txn_id, sc_params.gtid,
+                                                            base_tablet, new_tablet, chunk_changer, memory_limitation);
         op_schema_change->set_linked_segment(false);
     } else {
         // Note: In current implementation, linked schema change may refer to the segments deleted by gc,
         // so disable linked schema change and will support it in the later version.
         LOG(INFO) << "doing direct schema change for base tablet: " << base_tablet.id()
                   << ", params directly: " << sc_params.sc_directly;
-        sc_procedure = std::make_unique<DirectSchemaChange>(_tablet_manager, sc_params.txn_id, base_tablet, new_tablet,
-                                                            chunk_changer);
+        sc_procedure = std::make_unique<DirectSchemaChange>(_tablet_manager, sc_params.txn_id, sc_params.gtid,
+                                                            base_tablet, new_tablet, chunk_changer);
         op_schema_change->set_linked_segment(false);
     }
     RETURN_IF_ERROR(sc_procedure->init());

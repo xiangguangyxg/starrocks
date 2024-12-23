@@ -212,6 +212,7 @@ private:
 
     // initialized in open function
     int64_t _txn_id = -1;
+    int64_t _gtid = -1;
     int64_t _index_id = -1;
     std::shared_ptr<OlapTableSchemaParam> _schema;
 
@@ -289,6 +290,7 @@ Status LakeTabletsChannel::open(const PTabletWriterOpenRequest& params, PTabletW
     COUNTER_UPDATE(_open_counter, 1);
     std::unique_lock<bthreads::BThreadSharedMutex> l(_rw_mtx);
     _txn_id = params.txn_id();
+    _gtid = params.gtid();
     _index_id = params.index_id();
     _schema = schema;
     _is_incremental_channel = is_incremental;
@@ -320,14 +322,15 @@ Status LakeTabletsChannel::open(const PTabletWriterOpenRequest& params, PTabletW
     for (auto& [id, writer] : _delta_writers) {
         auto st = writer->check_immutable();
         if (!st.ok()) {
-            LOG(WARNING) << "check immutable failed, tablet " << id << ", txn " << _txn_id << ", status " << st;
+            LOG(WARNING) << "check immutable failed, tablet_id: " << id << ", txn_id: " << _txn_id
+                         << ", gtid: " << _gtid << ", status: " << st;
         }
         if (writer->is_immutable()) {
             result->add_immutable_tablet_ids(id);
             result->add_immutable_partition_ids(writer->partition_id());
         }
-        VLOG(2) << "check tablet writer for tablet " << id << ", partition " << writer->partition_id() << ", txn "
-                << _txn_id << ", is_immutable  " << writer->is_immutable();
+        VLOG(2) << "check tablet writer for tablet_id: " << id << ", partition_id: " << writer->partition_id()
+                << ", txn_id: " << _txn_id << ", gtid: " << _gtid << ", is_immutable:  " << writer->is_immutable();
     }
     COUNTER_SET(_tablets_num, (int64_t)_delta_writers.size());
 
@@ -370,7 +373,7 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
     std::lock_guard l(sender.lock);
 
     if (UNLIKELY(request.packet_seq() < sender.next_seq && request.eos())) { // duplicated eos packet
-        LOG(ERROR) << "Duplicated eos packet. txn_id=" << _txn_id;
+        LOG(ERROR) << "Duplicated eos packet. txn_id=" << _txn_id << ", gtid=" << _gtid;
         response->mutable_status()->set_status_code(TStatusCode::DUPLICATE_RPC_INVOCATION);
         response->mutable_status()->add_error_msgs("duplicated eos packet");
         return;
@@ -422,21 +425,22 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
         int64_t tablet_id = tablet_ids[row_indexes[from]];
         auto& dw = _delta_writers[tablet_id];
         if (dw == nullptr) {
-            LOG(WARNING) << "LakeTabletsChannel txn_id: " << _txn_id << " load_id: " << print_id(request.id())
-                         << " not found tablet_id: " << tablet_id;
+            LOG(WARNING) << "LakeTabletsChannel txn_id: " << _txn_id << ", gtid: " << _gtid
+                         << ", load_id: " << print_id(request.id()) << " not found tablet_id: " << tablet_id;
             response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
             response->mutable_status()->add_error_msgs(
-                    fmt::format("Failed to add_chunk since tablet_id {} not exists, txn_id: {}, load_id: {}", tablet_id,
-                                _txn_id, print_id(request.id())));
+                    fmt::format("Failed to add_chunk since tablet_id {} not exists, txn_id: {}, gtid: {}, load_id: {}",
+                                tablet_id, _txn_id, _gtid, print_id(request.id())));
             return;
         }
 
         // back pressure OlapTableSink since there are too many memtables need to flush
         while (dw->queueing_memtable_num() >= config::max_queueing_memtable_per_tablet) {
             if (watch.elapsed_time() / 1000000 > request.timeout_ms()) {
-                LOG(INFO) << "LakeTabletsChannel txn_id: " << _txn_id << " load_id: " << print_id(request.id())
-                          << " wait tablet " << tablet_id << " flush memtable " << request.timeout_ms()
-                          << "ms still has queueing num " << dw->queueing_memtable_num();
+                LOG(INFO) << "LakeTabletsChannel txn_id: " << _txn_id << ", gtid: " << _gtid
+                          << " load_id: " << print_id(request.id()) << " wait tablet " << tablet_id
+                          << " flush memtable " << request.timeout_ms() << "ms still has queueing num "
+                          << dw->queueing_memtable_num();
                 break;
             }
             bthread_usleep(10000); // 10ms
@@ -465,7 +469,7 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
             count_down_latch.count_down(_delta_writers.size());
         } else if (unfinished_senders == 0) {
             close_channel = true;
-            VLOG(5) << "Closing channel. txn_id=" << _txn_id;
+            VLOG(5) << "Closing channel. txn_id=" << _txn_id << ", gtid=" << _gtid;
             std::lock_guard l1(_dirty_partitions_lock);
             for (auto& [tablet_id, dw] : _delta_writers) {
                 if (_dirty_partitions.count(dw->partition_id()) == 0) {
@@ -537,7 +541,8 @@ void LakeTabletsChannel::add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequ
 
     if (!close_channel && request.wait_all_sender_close()) {
         _num_initial_senders.fetch_sub(1);
-        std::string msg = fmt::format("LakeTabletsChannel txn_id: {} load_id: {}", _txn_id, print_id(request.id()));
+        std::string msg = fmt::format("LakeTabletsChannel txn_id: {}, gtid: {}, load_id: {}", _txn_id, _gtid,
+                                      print_id(request.id()));
         // wait for senders to be closed, may be timed out
         auto remain = request.timeout_ms();
         remain -= watch.elapsed_time() / 1000000;
@@ -622,13 +627,13 @@ void LakeTabletsChannel::_flush_stale_memtables() {
                 }
             }
             if (log_flushed) {
-                VLOG(2) << "Flush stale memtable tablet_id: " << tablet_id << " txn_id: " << _txn_id
-                        << " partition_id: " << writer->partition_id() << " is_immutable: " << writer->is_immutable()
-                        << " last_write_ts: " << now - last_write_ts
-                        << " job_mem_usage: " << _mem_tracker->consumption()
-                        << " job_mem_limit: " << _mem_tracker->limit()
-                        << " load_mem_usage: " << _mem_tracker->parent()->consumption()
-                        << " load_mem_limit: " << _mem_tracker->parent()->limit();
+                VLOG(2) << "Flush stale memtable tablet_id: " << tablet_id << ", txn_id: " << _txn_id
+                        << ", gtid: " << _gtid << ", partition_id: " << writer->partition_id()
+                        << ", is_immutable: " << writer->is_immutable() << ", last_write_ts: " << now - last_write_ts
+                        << ", job_mem_usage: " << _mem_tracker->consumption()
+                        << ", job_mem_limit: " << _mem_tracker->limit()
+                        << ", load_mem_usage: " << _mem_tracker->parent()->consumption()
+                        << ", load_mem_limit: " << _mem_tracker->parent()->limit();
             }
         }
     }
@@ -679,6 +684,7 @@ Status LakeTabletsChannel::_create_delta_writers(const PTabletWriterOpenRequest&
                                               .set_tablet_manager(_tablet_manager)
                                               .set_tablet_id(tablet.tablet_id())
                                               .set_txn_id(_txn_id)
+                                              .set_gtid(_gtid)
                                               .set_partition_id(tablet.partition_id())
                                               .set_slot_descriptors(slots)
                                               .set_merge_condition(params.merge_condition())

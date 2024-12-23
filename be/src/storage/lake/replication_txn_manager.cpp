@@ -137,6 +137,7 @@ Status ReplicationTxnManager::remote_snapshot(const TRemoteSnapshotRequest& requ
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(request.tablet_id);
     txn_log->set_txn_id(request.transaction_id);
+    txn_log->set_txn_id(request.gtid);
 
     auto* txn_meta = txn_log->mutable_op_replication()->mutable_txn_meta();
     txn_meta->set_txn_id(request.transaction_id);
@@ -381,6 +382,7 @@ Status ReplicationTxnManager::replicate_remote_snapshot(const TReplicateSnapshot
 
     txn_log->set_tablet_id(request.tablet_id);
     txn_log->set_txn_id(request.transaction_id);
+    txn_log->set_gtid(request.gtid);
 
     auto* txn_meta = txn_log->mutable_op_replication()->mutable_txn_meta();
     txn_meta->set_txn_id(request.transaction_id);

@@ -44,7 +44,7 @@ private:
     Status do_process_alter_tablet(const TAlterTabletReqV2& request);
     Status convert_historical_rowsets(const SchemaChangeParams& sc_params, TxnLogPB_OpSchemaChange* op_schema_change);
 
-    Status do_process_update_tablet_meta(const TTabletMetaInfo& request, int64_t txn_id);
+    Status do_process_update_tablet_meta(const TTabletMetaInfo& request, int64_t txn_id, int64_t gtid);
 
     TabletManager* _tablet_manager;
 };

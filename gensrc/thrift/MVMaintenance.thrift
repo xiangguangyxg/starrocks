@@ -45,6 +45,7 @@ struct TMVEpoch {
     2: optional i64 epoch_id
     3: optional Types.TTimestamp start_ts
     4: optional Types.TTimestamp commit_ts
+    5: optional i64 gtid
 }
 
 struct TMVStartEpochTask {

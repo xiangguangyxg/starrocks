@@ -163,6 +163,7 @@ private:
     // unique load id
     PUniqueId _load_id;
     int64_t _txn_id = -1;
+    int64_t _gtid = -1;
     int64_t _sink_id = 0;
     std::string _txn_trace_parent;
     Span _span;

@@ -47,8 +47,9 @@ Status VerticalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flush
 
     uint32_t max_rows_per_segment =
             CompactionUtils::get_segment_max_rows(config::max_segment_file_size, _total_num_rows, _total_data_size);
-    ASSIGN_OR_RETURN(auto writer, _tablet.new_writer_with_schema(kVertical, _txn_id, max_rows_per_segment, flush_pool,
-                                                                 true /** is compaction**/, _tablet_schema));
+    ASSIGN_OR_RETURN(auto writer,
+                     _tablet.new_writer_with_schema(kVertical, _context->txn_id, max_rows_per_segment, flush_pool,
+                                                    true /** is compaction**/, _tablet_schema));
     RETURN_IF_ERROR(writer->open());
     DeferOp defer([&]() { writer->close(); });
 
@@ -85,7 +86,8 @@ Status VerticalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flush
     auto txn_log = std::make_shared<TxnLog>();
     auto op_compaction = txn_log->mutable_op_compaction();
     txn_log->set_tablet_id(_tablet.id());
-    txn_log->set_txn_id(_txn_id);
+    txn_log->set_txn_id(_context->txn_id);
+    txn_log->set_gtid(_context->gtid);
     RETURN_IF_ERROR(fill_compaction_segment_info(op_compaction, writer.get()));
     op_compaction->set_compact_version(_tablet.metadata()->version());
     RETURN_IF_ERROR(execute_index_major_compaction(txn_log.get()));
@@ -96,8 +98,8 @@ Status VerticalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flush
         _tablet.tablet_manager()->update_mgr()->preload_compaction_state(*txn_log, t, _tablet_schema);
     }
 
-    LOG(INFO) << "Vertical compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _txn_id
-              << ", statistics: " << _context->stats->to_json_stats();
+    LOG(INFO) << "Vertical compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _context->txn_id
+              << ", gtid: " << _context->gtid << ", statistics: " << _context->stats->to_json_stats();
 
     return Status::OK();
 }

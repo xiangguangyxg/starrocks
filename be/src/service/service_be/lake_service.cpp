@@ -615,7 +615,7 @@ void LakeServiceImpl::delete_data(::google::protobuf::RpcController* controller,
                 response->add_failed_tablets(tablet_id);
                 return;
             }
-            auto res = tablet->delete_data(request->txn_id(), request->delete_predicate());
+            auto res = tablet->delete_data(request->txn_id(), request->gtid(), request->delete_predicate());
             if (!res.ok()) {
                 LOG(WARNING) << "Fail to delete data. tablet_id: " << tablet_id << ", txn_id: " << request->txn_id()
                              << ", error: " << res;

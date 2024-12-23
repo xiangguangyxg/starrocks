@@ -111,6 +111,7 @@ Status SparkLoadHandler::_load_convert(VersionedTablet& cur_tablet) {
     auto txn_log = std::make_shared<TxnLogPB>();
     txn_log->set_tablet_id(cur_tablet.id());
     txn_log->set_txn_id(_request.transaction_id);
+    txn_log->set_txn_id(_request.gtid);
     auto op_write = txn_log->mutable_op_write();
     for (auto& f : writer->files()) {
         if (is_segment(f.path)) {

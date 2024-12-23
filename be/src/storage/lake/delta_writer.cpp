@@ -73,15 +73,16 @@ private:
 
 class DeltaWriterImpl {
 public:
-    explicit DeltaWriterImpl(TabletManager* tablet_manager, int64_t tablet_id, int64_t txn_id, int64_t partition_id,
-                             const std::vector<SlotDescriptor*>* slots, std::string merge_condition,
-                             bool miss_auto_increment_column, int64_t table_id, int64_t immutable_tablet_size,
-                             MemTracker* mem_tracker, int64_t max_buffer_size, int64_t schema_id,
-                             const PartialUpdateMode& partial_update_mode,
+    explicit DeltaWriterImpl(TabletManager* tablet_manager, int64_t tablet_id, int64_t txn_id, int64_t gtid,
+                             int64_t partition_id, const std::vector<SlotDescriptor*>* slots,
+                             std::string merge_condition, bool miss_auto_increment_column, int64_t table_id,
+                             int64_t immutable_tablet_size, MemTracker* mem_tracker, int64_t max_buffer_size,
+                             int64_t schema_id, const PartialUpdateMode& partial_update_mode,
                              const std::map<string, string>* column_to_expr_value, PUniqueId load_id)
             : _tablet_manager(tablet_manager),
               _tablet_id(tablet_id),
               _txn_id(txn_id),
+              _gtid(gtid),
               _table_id(table_id),
               _partition_id(partition_id),
               _schema_id(schema_id),
@@ -114,6 +115,8 @@ public:
     [[nodiscard]] int64_t tablet_id() const { return _tablet_id; }
 
     [[nodiscard]] int64_t txn_id() const { return _txn_id; }
+
+    [[nodiscard]] int64_t gtid() const { return _gtid; }
 
     [[nodiscard]] MemTracker* mem_tracker() { return _mem_tracker; }
 
@@ -155,6 +158,7 @@ private:
     TabletManager* _tablet_manager;
     const int64_t _tablet_id;
     const int64_t _txn_id;
+    const int64_t _gtid;
     const int64_t _table_id;
     const int64_t _partition_id;
     const int64_t _schema_id;
@@ -219,7 +223,7 @@ Status DeltaWriterImpl::check_immutable() {
         if (_tablet_manager->in_writing_data_size(_tablet_id) > _immutable_tablet_size) {
             _is_immutable.store(true, std::memory_order_relaxed);
         }
-        VLOG(2) << "check delta writer, tablet=" << _tablet_id << ", txn=" << _txn_id
+        VLOG(2) << "check delta writer, tablet_id=" << _tablet_id << ", txn_id=" << _txn_id << ", gtid=" << _gtid
                 << ", immutable_tablet_size=" << _immutable_tablet_size
                 << ", data_size=" << _tablet_manager->in_writing_data_size(_tablet_id)
                 << ", is_immutable=" << _is_immutable.load(std::memory_order_relaxed);
@@ -284,7 +288,7 @@ inline Status DeltaWriterImpl::flush_async() {
                 if (_tablet_manager->in_writing_data_size(_tablet_id) > _immutable_tablet_size) {
                     _is_immutable.store(true, std::memory_order_relaxed);
                 }
-                VLOG(2) << "flush memtable, tablet=" << _tablet_id << ", txn=" << _txn_id
+                VLOG(2) << "flush memtable, tablet_id=" << _tablet_id << ", txn_id=" << _txn_id << ", gtid=" << _gtid
                         << " _immutable_tablet_size=" << _immutable_tablet_size << ", segment_size=" << seg->data_size()
                         << ", in_writing_data_size=" << _tablet_manager->in_writing_data_size(_tablet_id)
                         << ", is_immutable=" << _is_immutable.load(std::memory_order_relaxed);
@@ -472,6 +476,7 @@ StatusOr<TxnLogPtr> DeltaWriterImpl::finish_with_txnlog(DeltaWriterFinishMode mo
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(_tablet_id);
     txn_log->set_txn_id(_txn_id);
+    txn_log->set_gtid(_gtid);
     txn_log->set_partition_id(_partition_id);
     auto op_write = txn_log->mutable_op_write();
 
@@ -713,6 +718,10 @@ int64_t DeltaWriter::txn_id() const {
     return _impl->txn_id();
 }
 
+int64_t DeltaWriter::gtid() const {
+    return _impl->gtid();
+}
+
 MemTracker* DeltaWriter::mem_tracker() {
     return _impl->mem_tracker();
 }
@@ -780,6 +789,9 @@ StatusOr<DeltaWriterBuilder::DeltaWriterPtr> DeltaWriterBuilder::build() {
     if (UNLIKELY(_txn_id == 0)) {
         return Status::InvalidArgument("txn_id not set");
     }
+    if (UNLIKELY(_gtid == 0)) {
+        return Status::InvalidArgument("gtid not set");
+    }
     if (UNLIKELY(_mem_tracker == nullptr)) {
         return Status::InvalidArgument("mem_tracker not set");
     }
@@ -793,7 +805,7 @@ StatusOr<DeltaWriterBuilder::DeltaWriterPtr> DeltaWriterBuilder::build() {
         return Status::InvalidArgument("schema_id not set");
     }
     auto impl =
-            new DeltaWriterImpl(_tablet_mgr, _tablet_id, _txn_id, _partition_id, _slots, _merge_condition,
+            new DeltaWriterImpl(_tablet_mgr, _tablet_id, _txn_id, _gtid, _partition_id, _slots, _merge_condition,
                                 _miss_auto_increment_column, _table_id, _immutable_tablet_size, _mem_tracker,
                                 _max_buffer_size, _schema_id, _partial_update_mode, _column_to_expr_value, _load_id);
     return std::make_unique<DeltaWriter>(impl);

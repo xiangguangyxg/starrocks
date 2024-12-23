@@ -231,6 +231,7 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
                 throw new IllegalStateException("Table State doesn't equal to ROLLUP, it is " + table.getState() + ".");
             }
             watershedTxnId = getNextTransactionId();
+            watershedGtid = getNextGtid();
             addRollIndexToCatalog(table);
         }
 
@@ -493,6 +494,7 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
             this.timeoutMs = other.timeoutMs;
 
             this.watershedTxnId = other.watershedTxnId;
+            this.watershedGtid = other.watershedGtid;
             this.commitVersionMap = other.commitVersionMap;
 
             this.physicalPartitionIdToBaseRollupTabletIdMap = other.physicalPartitionIdToBaseRollupTabletIdMap;
@@ -582,6 +584,10 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
         return GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getTransactionIDGenerator().peekNextTransactionId();
     }
 
+    public static long getNextGtid() {
+        return GlobalStateMgr.getCurrentState().getGtidGenerator().nextGtid();
+    }
+
     void addRollIndexToCatalog(@NotNull LakeTable tbl) {
         for (Partition partition : tbl.getPartitions()) {
             for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
@@ -657,6 +663,7 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
                 rollUpTxnInfo.combinedTxnLog = false;
                 rollUpTxnInfo.commitTime = finishedTimeMs / 1000;
                 rollUpTxnInfo.txnType = TxnTypePB.TXN_NORMAL;
+                rollUpTxnInfo.gtid = watershedGtid;
                 // publish rollup tablets
                 Utils.publishVersion(physicalPartitionIdToRollupIndex.get(partitionId).getTablets(), rollUpTxnInfo,
                         1, commitVersion, warehouseId);
@@ -666,6 +673,7 @@ public class LakeRollupJob extends LakeTableSchemaChangeJobBase {
                 originTxnInfo.combinedTxnLog = false;
                 originTxnInfo.commitTime = finishedTimeMs / 1000;
                 originTxnInfo.txnType = TxnTypePB.TXN_EMPTY;
+                originTxnInfo.gtid = watershedGtid;
                 // publish origin tablets
                 Utils.publishVersion(allOtherPartitionTablets, originTxnInfo, commitVersion - 1,
                         commitVersion, warehouseId);

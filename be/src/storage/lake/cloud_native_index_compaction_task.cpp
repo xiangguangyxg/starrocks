@@ -23,14 +23,15 @@ Status CloudNativeIndexCompactionTask::execute(CancelFunc cancel_func, ThreadPoo
     auto txn_log = std::make_shared<TxnLog>();
     auto op_compaction = txn_log->mutable_op_compaction();
     txn_log->set_tablet_id(_tablet.id());
-    txn_log->set_txn_id(_txn_id);
+    txn_log->set_txn_id(_context->txn_id);
+    txn_log->set_gtid(_context->gtid);
     op_compaction->set_compact_version(_tablet.metadata()->version());
     RETURN_IF_ERROR(cancel_func());
     RETURN_IF_ERROR(execute_index_major_compaction(txn_log.get()));
     _context->progress.update(100);
     RETURN_IF_ERROR(_tablet.tablet_manager()->put_txn_log(txn_log));
-    VLOG(2) << "CloudNative Index compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _txn_id
-            << ", statistics: " << _context->stats->to_json_stats();
+    VLOG(2) << "CloudNative Index compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _context->txn_id
+            << ", gtid: " << _context->gtid << ", statistics: " << _context->stats->to_json_stats();
     return Status::OK();
 }
 

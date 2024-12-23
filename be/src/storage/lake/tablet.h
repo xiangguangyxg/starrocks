@@ -136,7 +136,7 @@ public:
 
     [[nodiscard]] std::string sst_location(std::string_view sst_name) const;
 
-    Status delete_data(int64_t txn_id, const DeletePredicatePB& delete_predicate);
+    Status delete_data(int64_t txn_id, int64_t gtid, const DeletePredicatePB& delete_predicate);
 
     StatusOr<bool> has_delete_predicates(int64_t version);
 

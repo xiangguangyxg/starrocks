@@ -54,9 +54,9 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
     reader_params.column_access_paths = &_column_access_paths;
     RETURN_IF_ERROR(reader.open(reader_params));
 
-    ASSIGN_OR_RETURN(auto writer,
-                     _tablet.new_writer_with_schema(kHorizontal, _txn_id, 0, flush_pool, true /** compaction **/,
-                                                    _tablet_schema /** output rowset schema**/))
+    ASSIGN_OR_RETURN(auto writer, _tablet.new_writer_with_schema(kHorizontal, _context->txn_id, 0, flush_pool,
+                                                                 true /** compaction **/,
+                                                                 _tablet_schema /** output rowset schema**/))
     RETURN_IF_ERROR(writer->open());
     DeferOp defer([&]() { writer->close(); });
 
@@ -114,7 +114,8 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
     auto txn_log = std::make_shared<TxnLog>();
     auto op_compaction = txn_log->mutable_op_compaction();
     txn_log->set_tablet_id(_tablet.id());
-    txn_log->set_txn_id(_txn_id);
+    txn_log->set_txn_id(_context->txn_id);
+    txn_log->set_gtid(_context->gtid);
     RETURN_IF_ERROR(fill_compaction_segment_info(op_compaction, writer.get()));
     op_compaction->set_compact_version(_tablet.metadata()->version());
     RETURN_IF_ERROR(execute_index_major_compaction(txn_log.get()));
@@ -125,7 +126,7 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
         _tablet.tablet_manager()->update_mgr()->preload_compaction_state(*txn_log, t, _tablet_schema);
     }
 
-    LOG(INFO) << "Horizontal compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _txn_id
+    LOG(INFO) << "Horizontal compaction finished. tablet: " << _tablet.id() << ", txn_id: " << _context->txn_id
               << ", statistics: " << _context->stats->to_json_stats();
 
     return Status::OK();

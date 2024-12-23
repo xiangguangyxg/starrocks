@@ -171,10 +171,11 @@ std::string Tablet::root_location() const {
     return _location_provider->root_location(_id);
 }
 
-Status Tablet::delete_data(int64_t txn_id, const DeletePredicatePB& delete_predicate) {
+Status Tablet::delete_data(int64_t txn_id, int64_t gtid, const DeletePredicatePB& delete_predicate) {
     auto txn_log = std::make_shared<TxnLog>();
     txn_log->set_tablet_id(_id);
     txn_log->set_txn_id(txn_id);
+    txn_log->set_gtid(gtid);
     auto op_write = txn_log->mutable_op_write();
     auto rowset = op_write->mutable_rowset();
     rowset->set_overlapped(false);

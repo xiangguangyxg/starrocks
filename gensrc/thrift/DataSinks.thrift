@@ -235,6 +235,7 @@ struct TOlapTableSink {
     30: optional bool ignore_out_of_partition
     31: optional binary encryption_meta;
     32: optional bool dynamic_overwrite
+    33: optional i64 gtid
 }
 
 struct TSchemaTableSink {
