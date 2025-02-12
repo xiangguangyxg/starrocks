@@ -80,12 +80,12 @@ public:
 private:
     struct ShardInfoDetails {
         ShardInfo shard_info;
-        std::shared_ptr<FileSystem> fs;
+        std::string fs_cache_key;
 
         ShardInfoDetails(const ShardInfo& info) : shard_info(info) {}
     };
 
-    using CacheValue = std::weak_ptr<FileSystem>;
+    using CacheValue = std::shared_ptr<FileSystem>;
 
     // This function can be made static perfectly. The only reason to make it `virtual`
     // is, for unit test MOCK as it is the only interface to interact with g_starlet.
@@ -110,12 +110,17 @@ private:
     uint64_t get_table_id(const ShardInfo& shared_info);
 
     absl::StatusOr<std::shared_ptr<FileSystem>> build_filesystem_on_demand(ShardId id, const Configuration& conf);
-    absl::StatusOr<std::shared_ptr<FileSystem>> build_filesystem_from_shard_info(const ShardInfo& info,
-                                                                                 const Configuration& conf);
-    absl::StatusOr<std::shared_ptr<FileSystem>> new_shared_filesystem(std::string_view scheme,
-                                                                      const Configuration& conf);
+    absl::StatusOr<std::pair<std::string, std::shared_ptr<FileSystem>>> build_filesystem_from_shard_info(
+            const ShardInfo& info, const Configuration& conf);
+    absl::StatusOr<std::pair<std::string, std::shared_ptr<FileSystem>>> new_shared_filesystem(
+            std::string_view scheme, const Configuration& conf);
     absl::Status invalidate_fs(const ShardInfo& shard);
 
+    CacheValue lookup_fs_cache(const std::string& key);
+
+    void insert_fs_cache(const std::string& key, const CacheValue& fs);
+
+private:
     mutable std::shared_mutex _mtx;
     std::unordered_map<ShardId, ShardInfoDetails> _shards;
     std::unique_ptr<Cache> _fs_cache;
