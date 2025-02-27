@@ -15,10 +15,13 @@
 package com.starrocks.server;
 
 import com.google.common.base.Strings;
+import com.staros.proto.FilePathInfo;
 import com.staros.proto.FileStoreInfo;
 import com.staros.util.LockCloseable;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.TableProperty;
 import com.starrocks.common.AlreadyExistsException;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
@@ -28,6 +31,7 @@ import com.starrocks.common.InvalidConfException;
 import com.starrocks.common.util.concurrent.lock.LockType;
 import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.connector.share.credential.CloudConfigurationConstants;
+import com.starrocks.lake.StorageInfo;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.storagevolume.StorageVolume;
 import org.apache.logging.log4j.LogManager;
@@ -99,6 +103,11 @@ public class SharedDataStorageVolumeMgr extends StorageVolumeMgr {
     @Override
     protected void updateInternalNoLock(StorageVolume sv) throws DdlException {
         GlobalStateMgr.getCurrentState().getStarOSAgent().updateFileStore(sv.toFileStoreInfo());
+    }
+
+    @Override
+    protected void replaceInternalNoLock(StorageVolume sv) throws DdlException {
+        GlobalStateMgr.getCurrentState().getStarOSAgent().replaceFileStore(sv.toFileStoreInfo());
     }
 
     @Override
@@ -357,6 +366,66 @@ public class SharedDataStorageVolumeMgr extends StorageVolumeMgr {
         bindings.add(dbBindings);
         bindings.add(tableBindings);
         return bindings;
+    }
+
+    @Override
+    protected void updateTableStorageInfo(String storageVolumeId) throws DdlException {
+        Map<Database, List<Table>> dbAndTables = getBindedDbAndTablesOfStorageVolume(storageVolumeId);
+        if (dbAndTables == null) {
+            return;
+        }
+        for (Map.Entry<Database, List<Table>> entry : dbAndTables.entrySet()) {
+            Database db = entry.getKey();
+            List<Table> tables = entry.getValue();
+            for (Table table : tables) {
+                OlapTable olapTable = ((OlapTable) table);
+                FilePathInfo pathInfo = GlobalStateMgr.getCurrentState().getStarOSAgent()
+                        .allocateFilePath(storageVolumeId, db.getId(), table.getId());
+                TableProperty tableProperty = olapTable.getTableProperty();
+                if (tableProperty != null) {
+                    StorageInfo storageInfo = tableProperty.getStorageInfo();
+                    if (storageInfo != null) {
+                        tableProperty.setStorageInfo(new StorageInfo(pathInfo, storageInfo.getCacheInfo()));
+                    }
+                }
+            }
+        }
+    }
+
+    private Map<Database, List<Table>> getBindedDbAndTablesOfStorageVolume(String storageVolumeId) {
+        Map<Database, List<Table>> dbAndTableIds = new HashMap<>();
+        try (LockCloseable lock = new LockCloseable(rwLock.readLock())) {
+            Set<Long> dbIds = storageVolumeToDbs.get(storageVolumeId);
+            if (dbIds == null) {
+                return dbAndTableIds;
+            }
+
+            Set<Long> tableIds = storageVolumeToTables.get(storageVolumeId);
+            if (tableIds == null) {
+                return dbAndTableIds;
+            }
+
+            for (Long dbId : dbIds) {
+                Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDbIncludeRecycleBin(dbId);
+                if (db == null) {
+                    continue;
+                }
+                List<Table> tables = GlobalStateMgr.getCurrentState().getLocalMetastore()
+                        .getTablesIncludeRecycleBin(db);
+                if (tables == null) {
+                    continue;
+                }
+
+                List<Table> tableIdsInDb = new ArrayList<>();
+                for (Table table : tables) {
+                    if (tableIds.contains(table.getId())) {
+                        tableIdsInDb.add(table);
+                    }
+                }
+                dbAndTableIds.put(db, tableIdsInDb);
+            }
+        }
+        return dbAndTableIds;
     }
 
     private static URI normalizeConfigPath(String uriStr, String defaultScheme, String configNameInErrMsg, boolean matchScheme)
