@@ -118,6 +118,9 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
     @SerializedName(value = "tablets")
     private List<Tablet> tablets;
 
+    @SerializedName(value = "splittingTablets")
+    private Map<Long, List<Tablet>> splittingTablets;
+
     @SerializedName(value = "shardGroupId")
     private long shardGroupId = PhysicalPartition.INVALID_SHARD_GROUP_ID;
 

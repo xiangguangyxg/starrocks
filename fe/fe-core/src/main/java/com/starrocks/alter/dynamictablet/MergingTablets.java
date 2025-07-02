@@ -76,6 +76,15 @@ public class MergingTablets implements DynamicTablets {
     }
 
     @Override
+    public long getParallelTablets() {
+        long dynamicTabletCount = 0;
+        for (Pair<List<Long>, Tablet> mergingTablet : mergingTablets) {
+            dynamicTabletCount += mergingTablet.first.size();
+        }
+        return dynamicTabletCount;
+    }
+
+    @Override
     public boolean isEmpty() {
         return mergingTablets.isEmpty();
     }

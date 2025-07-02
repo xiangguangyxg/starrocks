@@ -30,11 +30,13 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
+
 public class DynamicTabletJobMgrTest {
     public static class TestNormalDynamicTabletJob extends DynamicTabletJob {
 
         public TestNormalDynamicTabletJob(long jobId, DynamicTabletJob.JobType jobType, long dbId, long tableId) {
-            super(jobId, jobType, dbId, tableId);
+            super(jobId, jobType, dbId, tableId, Collections.emptyMap());
         }
 
         @Override

@@ -68,6 +68,15 @@ public class SplittingTablets implements DynamicTablets {
     }
 
     @Override
+    public long getParallelTablets() {
+        long dynamicTabletCount = 0;
+        for (List<Tablet> tablets : splittingTablets.values()) {
+            dynamicTabletCount += tablets.size();
+        }
+        return dynamicTabletCount;
+    }
+
+    @Override
     public boolean isEmpty() {
         return splittingTablets.isEmpty();
     }
