@@ -15,18 +15,25 @@
 package com.starrocks.alter.dynamictablet;
 
 import com.google.gson.annotations.SerializedName;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.Map;
+import java.util.concurrent.Future;
 
 /*
  * DynamicTabletContext saves the context during tablet splitting or merging for a physical partition
  */
 public class DynamicTabletContext {
+    private static final Logger LOG = LogManager.getLogger(SplitTabletJob.class);
+
     @SerializedName(value = "commitVersion")
     protected long commitVersion = 0;
 
     @SerializedName(value = "indexIdToDynamicTablets")
     protected final Map<Long, DynamicTablets> indexIdToDynamicTablets;
+
+    protected Future<Boolean> publishFuture;
 
     public DynamicTabletContext(Map<Long, DynamicTablets> indexIdToDynamicTablets) {
         this.indexIdToDynamicTablets = indexIdToDynamicTablets;
@@ -42,6 +49,32 @@ public class DynamicTabletContext {
 
     public Map<Long, DynamicTablets> getIndexIdToDynamicTablets() {
         return indexIdToDynamicTablets;
+    }
+
+    public void setPublishFuture(Future<Boolean> publishFuture) {
+        this.publishFuture = publishFuture;
+    }
+
+    /*
+     * < 0: Publish not start or failed
+     * > 0: Publish success
+     * = 0: Publish in progress
+     */
+    public int getPublishState() {
+        if (publishFuture == null) {
+            return -1;
+        }
+
+        if (!publishFuture.isDone()) {
+            return 0;
+        }
+
+        try {
+            return publishFuture.get() ? 1 : -1;
+        } catch (Exception e) {
+            LOG.warn("Failed to publish future get. ", e);
+            return -1;
+        }
     }
 
     public long getParallelTablets() {

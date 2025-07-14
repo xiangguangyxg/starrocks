@@ -24,7 +24,7 @@ import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.concurrent.lock.LockType;
-import com.starrocks.common.util.concurrent.lock.Locker;
+import com.starrocks.common.util.concurrent.lock.LockedObject;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
@@ -32,6 +32,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -86,6 +87,12 @@ public abstract class DynamicTabletJob implements Writable {
     // Physical partition id -> DynamicTabletContext
     @SerializedName(value = "dynamicTabletContexts")
     protected final Map<Long, DynamicTabletContext> dynamicTabletContexts;
+
+    @SerializedName(value = "watershedTxnId")
+    protected long watershedTxnId;
+
+    @SerializedName(value = "watershedGtid")
+    protected long watershedGtid;
 
     public DynamicTabletJob(long jobId, JobType jobType, long dbId, long tableId,
             Map<Long, DynamicTabletContext> dynamicTabletContexts) {
@@ -165,66 +172,8 @@ public abstract class DynamicTabletJob implements Writable {
         return parallelTablets;
     }
 
-    protected abstract void runPendingJob();
-
-    protected abstract void runPreparingJob();
-
-    protected abstract void runRunningJob();
-
-    protected abstract void runCleaningJob();
-
-    protected abstract void runAbortingJob();
-
-    protected abstract boolean canAbort();
-
-    public abstract void replay();
-
-    protected void forEachDynamicTablets(Consumer<DynamicTabletEntry> consumer) {
-        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(dbId, tableId);
-        if (table == null) {
-            // Table is dropped
-            return;
-        }
-
-        OlapTable olapTable = (OlapTable) table;
-
-        Locker locker = new Locker();
-        locker.lockTableWithIntensiveDbLock(dbId, tableId, LockType.WRITE);
-        try {
-            for (Map.Entry<Long, DynamicTabletContext> physicalPartitionEntry : dynamicTabletContexts.entrySet()) {
-                long physicalPartitionId = physicalPartitionEntry.getKey();
-                DynamicTabletContext dynamicTabletContext = physicalPartitionEntry.getValue();
-
-                PhysicalPartition physicalPartition = olapTable.getPhysicalPartition(physicalPartitionId);
-                if (physicalPartition == null) {
-                    continue;
-                }
-
-                Map<Long, DynamicTablets> indexIdToDynamicTablets = dynamicTabletContext.getIndexIdToDynamicTablets();
-                for (Map.Entry<Long, DynamicTablets> indexEntry : indexIdToDynamicTablets.entrySet()) {
-                    MaterializedIndex materializedIndex = physicalPartition.getIndex(indexEntry.getKey());
-                    if (materializedIndex == null) {
-                        continue;
-                    }
-
-                    DynamicTablets dynamicTablets = indexEntry.getValue();
-                    DynamicTabletEntry entry = new DynamicTabletEntry(physicalPartition, dynamicTabletContext,
-                            materializedIndex, dynamicTablets);
-
-                    consumer.accept(entry);
-                }
-            }
-        } finally {
-            locker.unLockTableWithIntensiveDbLock(dbId, tableId, LockType.WRITE);
-        }
-    }
-
-    protected void setDynamicTablets() {
-        forEachDynamicTablets(entry -> entry.getMaterializedIndex().setDynamicTablets(entry.getDynamicTablets()));
-    }
-
-    protected void clearDynamicTablets() {
-        forEachDynamicTablets(entry -> entry.getMaterializedIndex().setDynamicTablets(null));
+    public long getTxnId() {
+        return watershedTxnId;
     }
 
     public void run() {
@@ -267,7 +216,72 @@ public abstract class DynamicTabletJob implements Writable {
         }
     }
 
+    protected abstract void runPendingJob();
+
+    protected abstract void runPreparingJob();
+
+    protected abstract void runRunningJob();
+
+    protected abstract void runCleaningJob();
+
+    protected abstract void runAbortingJob();
+
+    protected abstract boolean canAbort();
+
+    public abstract void replay();
+
+    protected LockedObject<OlapTable> getLockedTable(LockType lockType) {
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(dbId, tableId);
+        if (table == null) {
+            // Table is dropped
+            throw new DynamicTabletJobException("Not found table: " + dbId + "." + tableId);
+        }
+
+        OlapTable olapTable = (OlapTable) table;
+
+        return new LockedObject<OlapTable>(dbId, List.of(tableId), lockType, olapTable);
+    }
+
+    protected void forEachDynamicTablets(LockType lockType, Consumer<DynamicTabletEntry> consumer) {
+        try (LockedObject<OlapTable> lockedTable = getLockedTable(lockType)) {
+            OlapTable olapTable = lockedTable.get();
+
+            for (Map.Entry<Long, DynamicTabletContext> physicalPartitionEntry : dynamicTabletContexts.entrySet()) {
+                PhysicalPartition physicalPartition = olapTable.getPhysicalPartition(physicalPartitionEntry.getKey());
+                if (physicalPartition == null) {
+                    continue;
+                }
+
+                DynamicTabletContext dynamicTabletContext = physicalPartitionEntry.getValue();
+                Map<Long, DynamicTablets> indexIdToDynamicTablets = dynamicTabletContext.getIndexIdToDynamicTablets();
+                for (Map.Entry<Long, DynamicTablets> indexEntry : indexIdToDynamicTablets.entrySet()) {
+                    MaterializedIndex materializedIndex = physicalPartition.getIndex(indexEntry.getKey());
+                    if (materializedIndex == null) {
+                        continue;
+                    }
+
+                    DynamicTablets dynamicTablets = indexEntry.getValue();
+                    DynamicTabletEntry entry = new DynamicTabletEntry(olapTable, physicalPartition,
+                            dynamicTabletContext, materializedIndex, dynamicTablets);
+
+                    consumer.accept(entry);
+                }
+            }
+        }
+    }
+
+    protected void setDynamicTablets() {
+        forEachDynamicTablets(LockType.WRITE,
+                entry -> entry.getMaterializedIndex().setDynamicTablets(entry.getDynamicTablets()));
+    }
+
+    protected void clearDynamicTablets() {
+        forEachDynamicTablets(LockType.WRITE,
+                entry -> entry.getMaterializedIndex().setDynamicTablets(null));
+    }
+
     private void onJobDone() {
+        // TODO: Remove shard group
         LOG.info("Dynamic tablet job is done. {}", this);
     }
 
@@ -286,6 +300,7 @@ public abstract class DynamicTabletJob implements Writable {
         if (errorMessage != null) {
             sb.append(", error_message: ").append(errorMessage);
         }
+        sb.append(", txn_id: ").append(watershedTxnId);
         sb.append("}");
         return sb.toString();
     }

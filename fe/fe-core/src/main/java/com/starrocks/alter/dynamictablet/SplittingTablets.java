@@ -20,6 +20,7 @@ import com.starrocks.catalog.Tablet;
 import com.starrocks.common.Pair;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.ListIterator;
@@ -160,6 +161,6 @@ public class SplittingTablets implements DynamicTablets {
 
     @Override
     public List<Pair<List<Long>, Tablet>> getMergingTablets() {
-        return null;
+        return Collections.emptyList();
     }
 }

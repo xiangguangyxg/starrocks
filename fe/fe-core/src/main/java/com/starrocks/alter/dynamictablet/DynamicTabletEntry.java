@@ -15,23 +15,31 @@
 package com.starrocks.alter.dynamictablet;
 
 import com.starrocks.catalog.MaterializedIndex;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.PhysicalPartition;
 
 /*
  * DynamicTabletEntry is used to iterate dynamic tablets for each materailized index
  */
 public class DynamicTabletEntry {
+    protected final OlapTable olapTable;
     protected final PhysicalPartition physicalPartition;
     protected final DynamicTabletContext dynamicTabletContext;
     protected final MaterializedIndex materializedIndex;
     protected final DynamicTablets dynamicTablets;
 
-    public DynamicTabletEntry(PhysicalPartition physicalPartition, DynamicTabletContext dynamicTabletContext,
-            MaterializedIndex materializedIndex, DynamicTablets dynamicTablets) {
+    public DynamicTabletEntry(OlapTable olapTable, PhysicalPartition physicalPartition,
+            DynamicTabletContext dynamicTabletContext, MaterializedIndex materializedIndex,
+            DynamicTablets dynamicTablets) {
+        this.olapTable = olapTable;
         this.physicalPartition = physicalPartition;
         this.dynamicTabletContext = dynamicTabletContext;
         this.materializedIndex = materializedIndex;
         this.dynamicTablets = dynamicTablets;
+    }
+
+    public OlapTable getOlapTable() {
+        return olapTable;
     }
 
     public PhysicalPartition getPhysicalPartition() {
