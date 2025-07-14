@@ -15,10 +15,14 @@
 package com.starrocks.alter.dynamictablet;
 
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.LockedObject;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
@@ -26,6 +30,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /*
@@ -80,6 +86,12 @@ public abstract class DynamicTabletJob implements Writable {
     @SerializedName(value = "physicalPartitionContexts")
     protected final Map<Long, PhysicalPartitionContext> physicalPartitionContexts;
 
+    @SerializedName(value = "watershedTxnId")
+    protected long watershedTxnId;
+
+    @SerializedName(value = "watershedGtid")
+    protected long watershedGtid;
+
     public DynamicTabletJob(long jobId, JobType jobType, long dbId, long tableId,
             Map<Long, PhysicalPartitionContext> physicalPartitionContexts) {
         this.jobId = jobId;
@@ -103,9 +115,7 @@ public abstract class DynamicTabletJob implements Writable {
 
     protected void setJobState(JobState jobState) {
         this.jobState = jobState;
-        if (jobState.isFinalState()) {
-            this.finishedTimeMs = System.currentTimeMillis();
-        }
+        this.finishedTimeMs = System.currentTimeMillis();
 
         GlobalStateMgr.getCurrentState().getEditLog().logUpdateDynamicTabletJob(this);
         LOG.info("Dynamic tablet job set job state. {}", this);
@@ -158,19 +168,9 @@ public abstract class DynamicTabletJob implements Writable {
         return parallelTablets;
     }
 
-    protected abstract void runPendingJob();
-
-    protected abstract void runPreparingJob();
-
-    protected abstract void runRunningJob();
-
-    protected abstract void runCleaningJob();
-
-    protected abstract void runAbortingJob();
-
-    protected abstract boolean canAbort();
-
-    public abstract void replay();
+    public long getTransactionId() {
+        return watershedTxnId;
+    }
 
     public void run() {
         try {
@@ -212,8 +212,80 @@ public abstract class DynamicTabletJob implements Writable {
         }
     }
 
+    protected abstract void runPendingJob();
+
+    protected abstract void runPreparingJob();
+
+    protected abstract void runRunningJob();
+
+    protected abstract void runCleaningJob();
+
+    protected abstract void runAbortingJob();
+
+    protected abstract boolean canAbort();
+
+    public abstract void replay();
+
+    protected LockedObject<OlapTable> getLockedTable(LockType lockType) {
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(dbId, tableId);
+        if (table == null) {
+            // Table is dropped
+            throw new DynamicTabletJobException("Not found table: " + dbId + "." + tableId);
+        }
+
+        OlapTable olapTable = (OlapTable) table;
+
+        return new LockedObject<OlapTable>(dbId, List.of(tableId), lockType, olapTable);
+    }
+
     private void onJobDone() {
         LOG.info("Dynamic tablet job is done. {}", this);
+    }
+
+    protected void registerDynamicTablets() {
+        DynamicTabletJobMgr dynamicTabletJobMgr = GlobalStateMgr.getCurrentState().getDynamicTabletJobMgr();
+        for (PhysicalPartitionContext physicalPartitionContext : physicalPartitionContexts.values()) {
+            long visibleVersion = physicalPartitionContext.getCommitVersion();
+            for (MaterializedIndexContext indexContext : physicalPartitionContext.getIndexContexts().values()) {
+                DynamicTablets dynamicTablets = indexContext.getDynamicTablets();
+                for (SplittingTablet splittingTablet : dynamicTablets.getSplittingTablets().values()) {
+                    dynamicTabletJobMgr.registerDynamicTablet(splittingTablet.getOldTabletId(),
+                            splittingTablet, visibleVersion);
+                }
+                for (MergingTablet mergingTablet : dynamicTablets.getMergingTablets()) {
+                    for (Long tabletId : mergingTablet.getOldTabletIds()) {
+                        dynamicTabletJobMgr.registerDynamicTablet(tabletId, mergingTablet, visibleVersion);
+                    }
+                }
+            }
+        }
+    }
+
+    protected void unregisterDynamicTablets() {
+        DynamicTabletJobMgr dynamicTabletJobMgr = GlobalStateMgr.getCurrentState().getDynamicTabletJobMgr();
+        for (PhysicalPartitionContext physicalPartitionContext : physicalPartitionContexts.values()) {
+            for (MaterializedIndexContext indexContext : physicalPartitionContext.getIndexContexts().values()) {
+                DynamicTablets dynamicTablets = indexContext.getDynamicTablets();
+                for (SplittingTablet splittingTablet : dynamicTablets.getSplittingTablets().values()) {
+                    dynamicTabletJobMgr.unregisterDynamicTablet(splittingTablet.getOldTabletId());
+                }
+                for (MergingTablet mergingTablet : dynamicTablets.getMergingTablets()) {
+                    for (Long tabletId : mergingTablet.getOldTabletIds()) {
+                        dynamicTabletJobMgr.unregisterDynamicTablet(tabletId);
+                    }
+                }
+            }
+        }
+    }
+
+    protected Map<Long, Long> getOldIndexIdToNewIndexIds() {
+        Map<Long, Long> oldIndexIdToNewIndexIds = new HashMap<>();
+        for (PhysicalPartitionContext physicalPartitionContext : physicalPartitionContexts.values()) {
+            for (var indexEntry : physicalPartitionContext.getIndexContexts().entrySet()) {
+                oldIndexIdToNewIndexIds.put(indexEntry.getKey(), indexEntry.getValue().getMaterializedIndex().getId());
+            }
+        }
+        return oldIndexIdToNewIndexIds;
     }
 
     @Override
@@ -231,6 +303,7 @@ public abstract class DynamicTabletJob implements Writable {
         if (errorMessage != null) {
             sb.append(", error_message: ").append(errorMessage);
         }
+        sb.append(", txn_id: ").append(watershedTxnId);
         sb.append("}");
         return sb.toString();
     }

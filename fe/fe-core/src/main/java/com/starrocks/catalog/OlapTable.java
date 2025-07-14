@@ -763,6 +763,28 @@ public class OlapTable extends Table {
                  name, fullSchema, maxColUniqueId);
     }
 
+    public boolean replaceIndex(long oldIndexId, long newIndexId) {
+        MaterializedIndexMeta indexMeta = indexIdToMeta.remove(oldIndexId);
+        if (indexMeta == null) {
+            return false;
+        }
+
+        String indexName = getIndexNameById(oldIndexId);
+        if (indexName == null) {
+            return false;
+        }
+
+        indexMeta.setIndexIdForRestore(newIndexId);
+        indexIdToMeta.put(newIndexId, indexMeta);
+        indexNameToId.put(indexName, newIndexId);
+
+        if (oldIndexId == baseIndexId) {
+            baseIndexId = newIndexId;
+        }
+
+        return true;
+    }
+
     public boolean deleteIndexInfo(String indexName) {
         if (!indexNameToId.containsKey(indexName)) {
             return false;

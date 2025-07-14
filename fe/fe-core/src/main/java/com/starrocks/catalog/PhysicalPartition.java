@@ -80,6 +80,15 @@ public class PhysicalPartition extends MetaObject implements GsonPostProcessable
     @SerializedName(value = "idToShadowIndex")
     private Map<Long, MaterializedIndex> idToShadowIndex = Maps.newHashMap();
 
+    /*
+     * Stale indexes are indexes which are not visible to user.
+     * New load and query will not run on these stale indexes.
+     * But unfinished load process may still use these stale indexes.
+     * Stale indexes will keep until these unfinished load process finished.
+     */
+    @SerializedName(value = "idToStaleIndex")
+    private Map<Long, MaterializedIndex> idToStaleIndex = Maps.newHashMap();
+
     /**
      * committed version(hash): after txn is committed, set committed version(hash)
      * visible version(hash): after txn is published, set visible version
@@ -379,11 +388,18 @@ public class PhysicalPartition extends MetaObject implements GsonPostProcessable
         if (baseIndex.getId() == indexId) {
             return baseIndex;
         }
-        if (idToVisibleRollupIndex.containsKey(indexId)) {
-            return idToVisibleRollupIndex.get(indexId);
-        } else {
-            return idToShadowIndex.get(indexId);
+
+        MaterializedIndex index = idToVisibleRollupIndex.get(indexId);
+        if (index != null) {
+            return index;
         }
+
+        index = idToShadowIndex.get(indexId);
+        if (index != null) {
+            return index;
+        }
+
+        return idToStaleIndex.get(indexId);
     }
 
     public List<MaterializedIndex> getMaterializedIndices(IndexExtState extState) {
@@ -405,6 +421,32 @@ public class PhysicalPartition extends MetaObject implements GsonPostProcessable
                 break;
         }
         return indices;
+    }
+
+    public MaterializedIndex replaceIndex(long oldIndexId, MaterializedIndex newIndex) {
+        MaterializedIndex oldIndex = null;
+        if (baseIndex.getId() == oldIndexId) {
+            oldIndex = baseIndex;
+            baseIndex = newIndex;
+        } else {
+            oldIndex = idToVisibleRollupIndex.replace(oldIndexId, newIndex);
+            if (oldIndex == null) {
+                oldIndex = idToShadowIndex.replace(oldIndexId, newIndex);
+            }
+        }
+
+        if (oldIndex == null) {
+            return null;
+        }
+
+        Preconditions.checkState(oldIndex.getState() == newIndex.getState());
+        idToStaleIndex.put(oldIndexId, oldIndex);
+
+        return oldIndex;
+    }
+
+    public MaterializedIndex deleteStaleIndex(long staleIndexId) {
+        return idToStaleIndex.remove(staleIndexId);
     }
 
     public long getTabletMaxDataSize() {

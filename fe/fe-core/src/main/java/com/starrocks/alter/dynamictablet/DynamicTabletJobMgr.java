@@ -14,6 +14,7 @@
 
 package com.starrocks.alter.dynamictablet;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Database;
@@ -41,6 +42,8 @@ public class DynamicTabletJobMgr extends FrontendDaemon {
     @SerializedName(value = "dynamicTabletJobs")
     protected final Map<Long, DynamicTabletJob> dynamicTabletJobs = Maps.newConcurrentMap();
 
+    protected final Map<Long, DynamicTabletContext> dynamicTabletContexts = Maps.newConcurrentMap();
+
     public DynamicTabletJobMgr() {
         super("DynamicTabletJobMgr", Config.dynamic_tablet_job_scheduler_interval_ms);
     }
@@ -51,6 +54,19 @@ public class DynamicTabletJobMgr extends FrontendDaemon {
 
     public Map<Long, DynamicTabletJob> getDynamicTabletJobs() {
         return dynamicTabletJobs;
+    }
+
+    public DynamicTablet getDynamicTablet(long tabletId, long visibleVersion) {
+        DynamicTabletContext dynamicTabletContext = dynamicTabletContexts.get(tabletId);
+        if (dynamicTabletContext == null) {
+            return null;
+        }
+
+        if (visibleVersion <= dynamicTabletContext.getVisibleVersion()) {
+            return null;
+        }
+
+        return dynamicTabletContext.getDynamicTablet();
     }
 
     public void createDynamicTabletJob(Database db, OlapTable table, SplitTabletClause splitTabletClause)
@@ -97,6 +113,15 @@ public class DynamicTabletJobMgr extends FrontendDaemon {
                     dynamicTabletJobId);
 
         }
+    }
+
+    protected void registerDynamicTablet(long tabletId, DynamicTablet dynamicTablet, long visibleVersion) {
+        Preconditions.checkState(dynamicTabletContexts.putIfAbsent(tabletId,
+                new DynamicTabletContext(dynamicTablet, visibleVersion)) == null);
+    }
+
+    protected void unregisterDynamicTablet(long tabletId) {
+        dynamicTabletContexts.remove(tabletId);
     }
 
     @Override
