@@ -483,4 +483,40 @@ public class MetaService {
             return;
         }
     }
+
+    public static class ServiceIdAction extends MetaBaseAction {
+
+        public ServiceIdAction(ActionController controller) {
+            super(controller);
+        }
+
+        public static void registerAction(ActionController controller)
+                throws IllegalArgException {
+            controller.registerHandler(HttpMethod.GET, "/service_id", new ServiceIdAction(controller));
+        }
+
+        @Override
+        public boolean needAdmin() {
+            return true;
+        }
+
+        @Override
+        protected boolean needCheckClientIsFe() {
+            return false;
+        }
+
+        @Override
+        public void executeGet(BaseRequest request, BaseResponse response) {
+            if (RunMode.getCurrentRunMode() != RunMode.SHARED_DATA) {
+                String str = "current run mode " + RunMode.name() + " does not support service id.";
+                response.appendContent(str);
+            } else {
+                String serviceId = GlobalStateMgr.getCurrentState().getStarOSAgent().getRawServiceId();
+                response.updateHeader("service_id", serviceId);
+            }
+
+            writeResponse(request, response);
+            return;
+        }
+    }
 }
