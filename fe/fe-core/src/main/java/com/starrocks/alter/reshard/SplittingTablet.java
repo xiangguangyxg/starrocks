@@ -14,7 +14,6 @@
 
 package com.starrocks.alter.reshard;
 
-import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
 
 import java.util.List;
@@ -31,10 +30,6 @@ public class SplittingTablet implements ReshardingTablet {
     protected final List<Long> newTabletIds;
 
     public SplittingTablet(long oldTabletId, List<Long> newTabletIds) {
-        // New tablet size is usaully 2, but we allow a power of 2
-        Preconditions.checkState(TabletReshardUtils.isPowerOfTwo(newTabletIds.size()),
-                "New tablet size must be a power of 2, actual: " + newTabletIds.size());
-
         this.oldTabletId = oldTabletId;
         this.newTabletIds = newTabletIds;
     }
