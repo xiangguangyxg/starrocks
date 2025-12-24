@@ -42,6 +42,8 @@ public:
 
     const std::vector<DatumVariant>& values() const { return _values; }
 
+    void clear() { _values.clear(); }
+
     int compare(const VariantTuple& other) const;
 
     void to_proto(TuplePB* tuplePB) const;

@@ -14,10 +14,12 @@
 
 #include "storage/lake/tablet_reshard.h"
 
+#include <set>
 #include <span>
 
 #include "storage/lake/metacache.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/variant_tuple.h"
 
 namespace starrocks::lake {
 
@@ -113,6 +115,170 @@ static void set_all_data_files_shared(TabletMetadataPB* tablet_metadata) {
     }
 }
 
+struct Statistic {
+    int64_t num_rows = 0;
+    int64_t data_size = 0;
+};
+
+struct TabletRangeInfo {
+    TabletRangePB range;
+    // rowset_id -> rowset stat
+    std::unordered_map<uint32_t, Statistic> rowset_stats;
+};
+
+static Status get_tablet_split_ranges(const TabletMetadataPtr& tablet_metadata, int32_t split_count,
+                                      std::vector<TabletRangeInfo>& split_ranges) {
+    if (split_count < 2) {
+        return Status::InvalidArgument("Invalid split count, it is less than 2");
+    }
+
+    struct SegmentInfo {
+        uint32_t rowset_id;
+        VariantTuple min;
+        VariantTuple max;
+        Statistic stat;
+    };
+
+    // Collect all segment infos
+    std::vector<SegmentInfo> segment_infos;
+    for (const auto& rowset : tablet_metadata->rowsets()) {
+        DCHECK(rowset.segments_size() == rowset.segment_size_size() &&
+               rowset.segments_size() == rowset.segment_metas_size());
+        for (int32_t i = 0; i < rowset.segments_size(); ++i) {
+            auto& segment_info = segment_infos.emplace_back();
+            segment_info.rowset_id = rowset.id();
+            const auto& segment_meta = rowset.segment_metas(i);
+            RETURN_IF_ERROR(segment_info.min.from_proto(segment_meta.sort_key_min()));
+            RETURN_IF_ERROR(segment_info.max.from_proto(segment_meta.sort_key_max()));
+            segment_info.stat.num_rows = segment_meta.num_rows();
+            segment_info.stat.data_size = rowset.segment_size(i);
+        }
+    }
+
+    // Collect all segment range boundaries in order
+    auto comparator = [](const VariantTuple* key1, const VariantTuple* key2) { return key1->compare(*key2) < 0; };
+    std::set<const VariantTuple*, decltype(comparator)> ordered_range_boundaries;
+    int64_t total_num_rows = 0;
+    for (const auto& segment_info : segment_infos) {
+        ordered_range_boundaries.insert(&segment_info.min);
+        ordered_range_boundaries.insert(&segment_info.max);
+        total_num_rows += segment_info.stat.num_rows;
+    }
+
+    struct RangeInfo {
+        VariantTuple min;
+        VariantTuple max;
+        Statistic stat;
+        // rowset_id -> rowset stat
+        std::unordered_map<uint32_t, Statistic> rowset_stats;
+    };
+
+    // Build ordered ranges
+    std::vector<RangeInfo> ordered_ranges;
+    ordered_ranges.reserve(ordered_range_boundaries.size());
+    const VariantTuple* last_boundary = nullptr;
+    for (const auto* range_boundary : ordered_range_boundaries) {
+        if (last_boundary != nullptr) {
+            auto& range_info = ordered_ranges.emplace_back();
+            range_info.min = *last_boundary;
+            range_info.max = *range_boundary;
+            range_info.stat.num_rows = 0;
+            range_info.stat.data_size = 0;
+        }
+        last_boundary = range_boundary;
+    }
+
+    // Estimate num_rows and data_size in each ordered ranges
+    for (const auto& segment_info : segment_infos) {
+        std::vector<RangeInfo*> overlapping_ranges;
+        for (auto& range_info : ordered_ranges) {
+            if (!(range_info.max.compare(segment_info.min) < 0 || range_info.min.compare(segment_info.max) > 0)) {
+                overlapping_ranges.push_back(&range_info);
+            }
+        }
+
+        DCHECK(!overlapping_ranges.empty());
+        // Divide num rows and data size equally among all overlapping ranges,
+        // we can add more samples to improve the accuracy of estimation in future
+        const auto split_num_rows = segment_info.stat.num_rows / overlapping_ranges.size();
+        const auto remain_num_rows = segment_info.stat.num_rows % overlapping_ranges.size();
+        const auto split_data_size = segment_info.stat.data_size / overlapping_ranges.size();
+        const auto remain_data_size = segment_info.stat.data_size % overlapping_ranges.size();
+        for (size_t i = 0; i < overlapping_ranges.size(); ++i) {
+            auto delta_num_rows = split_num_rows;
+            auto delta_data_size = split_data_size;
+            if (i < remain_num_rows) {
+                ++delta_num_rows;
+            }
+            if (i < remain_data_size) {
+                ++delta_data_size;
+            }
+
+            auto* range_info = overlapping_ranges[i];
+            range_info->stat.num_rows += delta_num_rows;
+            range_info->stat.data_size += delta_data_size;
+
+            auto& rowset_stat = range_info->rowset_stats[segment_info.rowset_id];
+            rowset_stat.num_rows += delta_num_rows;
+            rowset_stat.data_size += delta_data_size;
+        }
+    }
+
+    // Calculate split ranges
+    DCHECK(split_ranges.empty());
+    split_ranges.reserve(split_count);
+    const int64_t avg_num_rows = total_num_rows / split_count;
+    int64_t cur_num_rows = 0;
+    last_boundary = nullptr;
+    for (const auto& range_info : ordered_ranges) {
+        cur_num_rows += range_info.stat.num_rows;
+        if (cur_num_rows >= avg_num_rows && split_ranges.size() < split_count) {
+            auto& split_range = split_ranges.emplace_back();
+            if (last_boundary == nullptr) {
+                // Use lower bound in tablet range
+                split_range.range = tablet_metadata->range();
+            } else {
+                last_boundary->to_proto(split_range.range.mutable_lower_bound());
+                split_range.range.set_lower_bound_included(true);
+            }
+
+            range_info.max.to_proto(split_range.range.mutable_upper_bound());
+            split_range.range.set_upper_bound_included(false);
+
+            for (const auto& [rowset_id, stat] : range_info.rowset_stats) {
+                Statistic rowset_stat = split_range.rowset_stats[rowset_id];
+                rowset_stat.num_rows += stat.num_rows;
+                rowset_stat.data_size += stat.data_size;
+            }
+
+            cur_num_rows = 0;
+        }
+        last_boundary = &range_info.max;
+    }
+
+    if (split_ranges.size() == split_count) {
+        auto& split_range = split_ranges.back();
+        if (tablet_metadata->range().has_upper_bound()) {
+            split_range.range.mutable_lower_bound()->CopyFrom(tablet_metadata->range().upper_bound());
+            split_range.range.set_upper_bound_included(tablet_metadata->range().upper_bound_included());
+        } else {
+            split_range.range.clear_upper_bound();
+            split_range.range.clear_upper_bound_included();
+        }
+    } else if (split_ranges.size() + 1 == split_count) {
+        auto& split_range = split_ranges.emplace_back();
+        // Use upper bound in tablet range
+        split_range.range = tablet_metadata->range();
+        // Lower bound use the upper bound of previous range
+        split_range.range.mutable_lower_bound()->CopyFrom(split_ranges[split_count - 2].range.upper_bound());
+        split_range.range.set_lower_bound_included(true);
+    } else {
+        return Status::InvalidArgument("Invalid split count, it is too large");
+    }
+
+    return Status::OK();
+}
+
 static Status handle_splitting_tablet(TabletManager* tablet_manager, const SplittingTabletInfoPB& splitting_tablet,
                                       int64_t base_version, int64_t new_version, const TxnInfoPB& txn_info,
                                       std::unordered_map<int64_t, TabletMetadataPtr>& new_metadatas,
@@ -140,8 +306,8 @@ static Status handle_splitting_tablet(TabletManager* tablet_manager, const Split
                 goto CONTINUE_HANDLE_SPLITTING_TABLET;
             }
 
+            tablet_ranges.emplace(new_tablet_id, cached_new_tablet_new_metadata->range());
             new_metadatas.emplace(new_tablet_id, std::move(cached_new_tablet_new_metadata));
-            tablet_ranges.emplace(new_tablet_id, TabletRangePB());
         }
 
         // All new metadatas found in cache, return ok
@@ -171,8 +337,9 @@ CONTINUE_HANDLE_SPLITTING_TABLET:
                 return old_tablet_old_metadata_or.status();
             }
 
-            new_metadatas.emplace(new_tablet_id, std::move(new_tablet_new_metadata_or.value()));
-            tablet_ranges.emplace(new_tablet_id, TabletRangePB());
+            auto& new_tablet_new_metadata = new_tablet_new_metadata_or.value();
+            tablet_ranges.emplace(new_tablet_id, new_tablet_new_metadata->range());
+            new_metadatas.emplace(new_tablet_id, std::move(new_tablet_new_metadata));
         }
 
         // All new metadatas found, return ok
@@ -181,7 +348,7 @@ CONTINUE_HANDLE_SPLITTING_TABLET:
 
     if (!old_tablet_old_metadata_or.ok()) {
         LOG(WARNING) << "Failed to get tablet: " << splitting_tablet.old_tablet_id() << ", version: " << base_version
-                     << ", status: " << old_tablet_old_metadata_or.status();
+                     << ", txn_id: " << txn_info.txn_id() << ", status: " << old_tablet_old_metadata_or.status();
         return old_tablet_old_metadata_or.status();
     }
 
@@ -198,8 +365,35 @@ CONTINUE_HANDLE_SPLITTING_TABLET:
         new_metadatas.emplace(splitting_tablet.old_tablet_id(), std::move(old_tablet_new_metadata));
     }
 
+    std::vector<TabletRangeInfo> split_ranges;
+    Status status =
+            get_tablet_split_ranges(old_tablet_old_metadata, splitting_tablet.new_tablet_ids_size(), split_ranges);
+    if (!status.ok()) {
+        LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: "
+                     << splitting_tablet.old_tablet_id() << ", version: " << base_version
+                     << ", txn_id: " << txn_info.txn_id() << ", status: " << old_tablet_old_metadata_or.status();
+
+        auto new_tablet_id = splitting_tablet.new_tablet_ids(0);
+        auto new_tablet_new_metadata = std::make_shared<TabletMetadataPB>(*old_tablet_old_metadata);
+        new_tablet_new_metadata->set_id(new_tablet_id);
+        new_tablet_new_metadata->set_version(new_version);
+        new_tablet_new_metadata->set_commit_time(txn_info.commit_time());
+        new_tablet_new_metadata->set_gtid(txn_info.gtid());
+        // New tablet in identical tablet need not to share data files
+
+        tablet_ranges.emplace(new_tablet_id, new_tablet_new_metadata->range());
+        new_metadatas.emplace(new_tablet_id, std::move(new_tablet_new_metadata));
+        return Status::OK();
+    }
+
+    // Got tablet split ranges
+    DCHECK(split_ranges.size() == splitting_tablet.new_tablet_ids_size());
+
     // New tablets
-    for (auto new_tablet_id : splitting_tablet.new_tablet_ids()) {
+    for (int32_t i = 0; i < splitting_tablet.new_tablet_ids_size(); ++i) {
+        auto new_tablet_id = splitting_tablet.new_tablet_ids(i);
+        auto& new_tablet_range = split_ranges[i];
+
         auto new_tablet_new_metadata = std::make_shared<TabletMetadataPB>(*old_tablet_old_metadata);
         new_tablet_new_metadata->set_id(new_tablet_id);
         new_tablet_new_metadata->set_version(new_version);
@@ -209,13 +403,13 @@ CONTINUE_HANDLE_SPLITTING_TABLET:
 
         // Update num rows and data size for rowsets
         for (auto& rowset_metadata : *new_tablet_new_metadata->mutable_rowsets()) {
-            rowset_metadata.set_num_rows(rowset_metadata.num_rows() / splitting_tablet.new_tablet_ids_size());
-            rowset_metadata.set_data_size(rowset_metadata.data_size() / splitting_tablet.new_tablet_ids_size());
+            const auto& rowset_stat = new_tablet_range.rowset_stats[rowset_metadata.id()];
+            rowset_metadata.set_num_rows(rowset_stat.num_rows);
+            rowset_metadata.set_data_size(rowset_stat.data_size);
         }
 
         new_metadatas.emplace(new_tablet_id, std::move(new_tablet_new_metadata));
-        // TODO: Get split point and construct new ranges
-        tablet_ranges.emplace(new_tablet_id, TabletRangePB());
+        tablet_ranges.emplace(new_tablet_id, std::move(new_tablet_range.range));
     }
 
     return Status::OK();
@@ -287,7 +481,7 @@ CONTINUE_HANDLE_IDENTICAL_TABLET:
 
     if (!old_tablet_old_metadata_or.ok()) {
         LOG(WARNING) << "Failed to get tablet: " << identical_tablet.old_tablet_id() << ", version: " << base_version
-                     << ", status: " << old_tablet_old_metadata_or.status();
+                     << ", txn_id: " << txn_info.txn_id() << ", status: " << old_tablet_old_metadata_or.status();
         return old_tablet_old_metadata_or.status();
     }
 
