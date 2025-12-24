@@ -36,6 +36,7 @@
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/test_util.h"
 #include "storage/lake/txn_log.h"
+#include "storage/variant_tuple.h"
 #include "testutil/assert.h"
 #include "testutil/id_generator.h"
 #include "testutil/sync_point.h"
@@ -99,14 +100,30 @@ protected:
         return seg_name;
     }
 
+    TuplePB generate_sort_key(int value) {
+        DatumVariant variant(get_type_info(LogicalType::TYPE_INT), Datum(value));
+        VariantTuple tuple;
+        tuple.append(variant);
+        TuplePB tuplePB;
+        tuple.to_proto(&tuplePB);
+        return tuplePB;
+    }
+
     TxnLog generate_write_txn_log(int num_segments, int64_t num_rows, int64_t data_size) {
         auto txn_id = next_id();
         TxnLog log;
         log.set_tablet_id(_tablet_id);
         log.set_partition_id(_partition_id);
         log.set_txn_id(txn_id);
+        int sort_key = 0;
         for (int i = 0; i < num_segments; i++) {
             log.mutable_op_write()->mutable_rowset()->add_segments(generate_segment_file(txn_id));
+            log.mutable_op_write()->mutable_rowset()->add_segment_size(1024);
+            auto* segment_meta = log.mutable_op_write()->mutable_rowset()->add_segment_metas();
+            segment_meta->mutable_sort_key_min()->CopyFrom(generate_sort_key(sort_key));
+            sort_key += 100;
+            segment_meta->mutable_sort_key_max()->CopyFrom(generate_sort_key(sort_key));
+            segment_meta->set_num_rows(100);
         }
         log.mutable_op_write()->mutable_rowset()->set_data_size(data_size);
         log.mutable_op_write()->mutable_rowset()->set_num_rows(num_rows);
