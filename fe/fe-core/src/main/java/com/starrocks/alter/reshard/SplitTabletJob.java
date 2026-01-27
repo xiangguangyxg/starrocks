@@ -466,9 +466,6 @@ public class SplitTabletJob extends TabletReshardJob {
     private void setTableState(OlapTable.OlapTableState expectedState, OlapTable.OlapTableState newState) {
         try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
             OlapTable olapTable = lockedTable.get();
-            if (olapTable.getState() == newState) {
-                return;
-            }
             if (expectedState != null && olapTable.getState() != expectedState) {
                 throw new TabletReshardException(
                         "Unexpected table state " + olapTable.getState() + " in table " + olapTable.getName());
