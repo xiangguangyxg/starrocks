@@ -840,4 +840,34 @@ public class BackupHandlerTest {
                 Maps.newHashMap());
         Assertions.assertEquals(true, AuditEncryptionChecker.needEncrypt(stmt));
     }
+
+    @Test
+    public void testCreateRepositoryStripsTrailingSlash(@Mocked GlobalStateMgr globalStateMgr,
+                                                        @Mocked BrokerMgr brokerMgr, @Mocked EditLog editLog)
+            throws Exception {
+        setUpMocker(globalStateMgr, brokerMgr, editLog);
+        new MockUp<Repository>() {
+            @Mock
+            public Status initRepository() {
+                return Status.OK;
+            }
+        };
+
+        new Expectations() {
+            {
+                brokerMgr.containsBroker(anyString);
+                minTimes = 0;
+                result = true;
+            }
+        };
+
+        BackupHandler handler = new BackupHandler(GlobalStateMgr.getCurrentState());
+
+        CreateRepositoryStmt stmt = new CreateRepositoryStmt(false, "test_repo", "brokerName",
+                "bos://location/path/", Maps.newHashMap());
+        handler.createRepository(stmt);
+
+        Repository repo = handler.getRepoMgr().getRepo("test_repo");
+        Assertions.assertEquals("bos://location/path", repo.getLocation());
+    }
 }
