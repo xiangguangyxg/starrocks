@@ -5684,6 +5684,15 @@ Compaction Score 代表了一个表分区是否值得进行 Compaction 的评分
 - 描述：FE 加载镜像后是否进行重载标志检测。如果某个 Base MV 已完成重载，其他依赖它的 MV 则无需再次重载。
 - 引入版本：v3.5.0
 
+##### enable_table_metrics_collect
+
+- 默认值：true
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：是否在 FE 中导出表级指标。关闭后，FE 将跳过导出表级指标（如表扫描/导入计数器及表大小指标），但仍会在内存中记录计数器。
+- 引入版本：-
+
 ##### enable_trace_historical_node
 - 默认值：false
 - 类型：布尔值
