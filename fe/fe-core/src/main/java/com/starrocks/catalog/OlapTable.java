@@ -91,6 +91,7 @@ import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.lake.DataCacheInfo;
 import com.starrocks.lake.StarOSAgent;
 import com.starrocks.lake.StorageInfo;
+import com.starrocks.memory.estimate.IgnoreMemoryTrack;
 import com.starrocks.persist.ColocatePersistInfo;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
@@ -213,6 +214,7 @@ public class OlapTable extends Table {
     @SerializedName(value = "indexIdToMeta")
     protected Map<Long, MaterializedIndexMeta> indexIdToMeta = Maps.newHashMap();
     // index name -> index id
+    @IgnoreMemoryTrack
     @SerializedName(value = "indexNameToId")
     protected Map<String, Long> indexNameToId = Maps.newHashMap();
 
@@ -224,6 +226,7 @@ public class OlapTable extends Table {
 
     @SerializedName(value = "idToPartition")
     protected Map<Long, Partition> idToPartition = new HashMap<>();
+    @IgnoreMemoryTrack
     protected Map<String, Partition> nameToPartition = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
 
     protected Map<Long, Long> physicalPartitionIdToPartitionId = new HashMap<>();
