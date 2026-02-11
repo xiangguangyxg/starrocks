@@ -615,6 +615,8 @@ public class AlterJobMgr {
 
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
         View view = (View) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
+        long sqlMode = alterViewInfo.getSqlMode();
+        String originalViewDef = alterViewInfo.getOriginalViewDef();
 
         Locker locker = new Locker();
         locker.lockTablesWithIntensiveDbLock(db.getId(), Lists.newArrayList(view.getId()), LockType.WRITE);
@@ -626,6 +628,8 @@ public class AlterJobMgr {
             } catch (StarRocksException e) {
                 throw new AlterJobException("failed to init view stmt", e);
             }
+            view.setInlineViewDefWithSqlMode(inlineViewDef, sqlMode);
+            view.setOriginalViewDef(originalViewDef);
             view.setNewFullSchema(newFullSchema);
             view.setComment(comment);
             AlterMVJobExecutor.inactiveRelatedMaterializedViewsRecursive(view,
