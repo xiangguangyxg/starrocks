@@ -377,6 +377,7 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
     public void gsonPostProcess() {
         // build "idToTablets" from "tablets"
         for (Tablet tablet : tablets) {
+            tablet.setRange(null);
             idToTablets.put(tablet.getId(), tablet);
         }
         if (metaId == 0L) {
