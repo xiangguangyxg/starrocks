@@ -197,7 +197,7 @@ StatusOr<std::vector<int64_t>> PrimaryCompactionPolicy::pick_rowset_indexes(
         if (rowset_pb.has_num_dels()) {
             stat.num_dels = rowset_pb.num_dels();
         } else {
-            stat.num_dels = mgr->get_rowset_num_deletes(tablet_id, tablet_version, rowset_pb);
+            stat.num_dels = mgr->get_rowset_num_deletes(*tablet_metadata, rowset_pb);
         }
         rowset_vec.emplace_back(&rowset_pb, stat, i);
     }
