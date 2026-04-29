@@ -299,12 +299,13 @@ static int compare_lower_position(const TabletRange& a, const TabletRange& b) {
 // True iff |first| (with first.lower <= second.lower) extends to or past
 // |second|.lower without leaving a gap. Caller guarantees the ordering.
 static bool first_meets_second(const TabletRange& first, const TabletRange& second) {
-    if (first.is_maximum()) return true;       // first covers everything to the right
-    if (second.is_minimum()) return true;      // second covers everything to the left,
-                                               //   which forces first.lower == -∞ too
+    if (first.is_maximum()) return true; // first covers everything to the right
+    if (second.is_minimum())
+        return true; // second covers everything to the left,
+                     //   which forces first.lower == -∞ too
     int c = first.upper_bound().compare(second.lower_bound());
-    if (c < 0) return false;                   // strict gap
-    if (c > 0) return true;                    // overlap
+    if (c < 0) return false; // strict gap
+    if (c > 0) return true;  // overlap
     return first.upper_bound_included() || second.lower_bound_included();
 }
 
@@ -419,19 +420,18 @@ StatusOr<std::vector<TabletRangePB>> compute_disjoint_gaps_within(
     }
 
     // Final gap: [running_lower, bound.upper].
-    RETURN_IF_ERROR(emit_gap(bound.upper_bound(),
-                             bound.is_maximum() ? false : bound.upper_bound_included(), bound.is_maximum()));
+    RETURN_IF_ERROR(emit_gap(bound.upper_bound(), bound.is_maximum() ? false : bound.upper_bound_included(),
+                             bound.is_maximum()));
     return result;
 }
 
 StatusOr<std::vector<TabletRangePB>> compute_non_contributed_ranges(
         const std::vector<TabletRangePB>& sorted_disjoint_children) {
-    TabletRangePB unbounded;  // empty PB is treated as (-∞, +∞)
+    TabletRangePB unbounded; // empty PB is treated as (-∞, +∞)
     return compute_disjoint_gaps_within(unbounded, sorted_disjoint_children);
 }
 
-const TabletRangePB& effective_child_local_range(const RowsetMetadataPB& rowset,
-                                                 const TabletMetadataPB& ctx_metadata,
+const TabletRangePB& effective_child_local_range(const RowsetMetadataPB& rowset, const TabletMetadataPB& ctx_metadata,
                                                  const TabletRangePB& unbounded_singleton) {
     if (rowset.has_range()) return rowset.range();
     if (ctx_metadata.has_range()) return ctx_metadata.range();

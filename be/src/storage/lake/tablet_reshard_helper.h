@@ -68,8 +68,7 @@ StatusOr<std::vector<TabletRangePB>> compute_non_contributed_ranges(
 //   rowset.range if has_range, else ctx_metadata.range if has_range,
 //   else |unbounded_singleton|.
 // The caller owns |unbounded_singleton| so the returned reference outlives the call.
-const TabletRangePB& effective_child_local_range(const RowsetMetadataPB& rowset,
-                                                 const TabletMetadataPB& ctx_metadata,
+const TabletRangePB& effective_child_local_range(const RowsetMetadataPB& rowset, const TabletMetadataPB& ctx_metadata,
                                                  const TabletRangePB& unbounded_singleton);
 
 void update_rowset_data_stats(RowsetMetadataPB* rowset, int32_t split_count, int32_t split_index);

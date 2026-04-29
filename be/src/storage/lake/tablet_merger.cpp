@@ -350,8 +350,8 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
             // we record the pre-clip view (add_rowset clips to ctx tablet range).
             TabletRangePB initial_child_range;
             if (canonical_contribs != nullptr && !rowset.has_delete_predicate()) {
-                initial_child_range = tablet_reshard_helper::effective_child_local_range(
-                        rowset, ctx_meta, unbounded_range_singleton());
+                initial_child_range = tablet_reshard_helper::effective_child_local_range(rowset, ctx_meta,
+                                                                                         unbounded_range_singleton());
             }
             const int new_index = new_metadata->rowsets_size();
             RETURN_IF_ERROR(add_rowset(merge_contexts[min_child_index], rowset, new_metadata));
@@ -1092,9 +1092,9 @@ struct CanonicalGapSpec {
 // that seek to empty rowid windows. Bounded-by-merged-tablet-range is both
 // correct and lets us skip the segment open entirely when contributors fully
 // cover the merged tablet range (the no-compaction common case).
-StatusOr<std::vector<CanonicalGapSpec>> compute_synthesized_gap_specs(
-        TabletManager* tablet_manager, const TabletMetadataPB& new_metadata,
-        const CanonicalContribMap& canonical_contribs) {
+StatusOr<std::vector<CanonicalGapSpec>> compute_synthesized_gap_specs(TabletManager* tablet_manager,
+                                                                      const TabletMetadataPB& new_metadata,
+                                                                      const CanonicalContribMap& canonical_contribs) {
     std::vector<CanonicalGapSpec> result;
     for (const auto& [canonical_index, contrib] : canonical_contribs) {
         if (canonical_index < 0 || canonical_index >= new_metadata.rowsets_size()) {
@@ -1368,8 +1368,8 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
         // synthesized_gap_specs (and therefore union_buffer) is non-empty
         // here.
         DCHECK(!union_buffer.empty()) << "synthesized-only path with empty union_buffer";
-        RETURN_IF_ERROR(write_delvec_file_from_buffer(tablet_manager, new_metadata->id(), txn_id,
-                                                     Slice(union_buffer), &new_delvec_file));
+        RETURN_IF_ERROR(write_delvec_file_from_buffer(tablet_manager, new_metadata->id(), txn_id, Slice(union_buffer),
+                                                      &new_delvec_file));
         union_base_offset = 0;
     } else {
         // Routes 2 & 3.

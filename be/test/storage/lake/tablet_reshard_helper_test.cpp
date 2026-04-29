@@ -519,8 +519,7 @@ TEST_F(TabletReshardHelperTest, test_update_rowset_data_stats_skips_when_num_del
 // tablet_reshard_test.cpp without pulling in the heavy fixture.
 namespace {
 
-TabletRangePB make_range(std::optional<int> lower, bool lower_included, std::optional<int> upper,
-                         bool upper_included) {
+TabletRangePB make_range(std::optional<int> lower, bool lower_included, std::optional<int> upper, bool upper_included) {
     TabletRangePB pb;
     auto write_int = [](TuplePB* tuple_pb, int v) {
         DatumVariant variant(get_type_info(LogicalType::TYPE_INT), Datum(v));
@@ -627,8 +626,8 @@ TEST_F(TabletReshardHelperTest, test_sort_and_merge_adjacent_touching) {
 }
 
 TEST_F(TabletReshardHelperTest, test_sort_and_merge_adjacent_unbounded) {
-    auto result = sort_and_merge_adjacent_ranges(
-            {co_range(std::nullopt, 10), make_range(10, true, std::nullopt, false)});
+    auto result =
+            sort_and_merge_adjacent_ranges({co_range(std::nullopt, 10), make_range(10, true, std::nullopt, false)});
     ASSERT_TRUE(result.ok());
     ASSERT_EQ(1u, result.value().size());
     EXPECT_FALSE(result.value()[0].has_lower_bound());
@@ -683,8 +682,7 @@ TEST_F(TabletReshardHelperTest, test_compute_disjoint_gaps_within_no_children) {
 
 TEST_F(TabletReshardHelperTest, test_compute_non_contributed_ranges_full_coverage) {
     // Children = (-∞, +∞). Result empty.
-    auto result = compute_non_contributed_ranges(
-            {make_range(std::nullopt, false, std::nullopt, false)});
+    auto result = compute_non_contributed_ranges({make_range(std::nullopt, false, std::nullopt, false)});
     ASSERT_TRUE(result.ok());
     EXPECT_TRUE(result.value().empty());
 }

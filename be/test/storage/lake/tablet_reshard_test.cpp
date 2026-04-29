@@ -6346,9 +6346,8 @@ inline void set_int_range(TabletRangePB* range, int lower, int upper) {
 // Range conventions:
 //   - tablet range = [tablet_lower, tablet_upper)
 //   - rowset range = same as tablet (split clip semantics)
-inline std::shared_ptr<TabletMetadataPB> make_shared_child(int64_t tablet_id, int64_t base_version,
-                                                          uint32_t shared_id, KeysType keys_type,
-                                                          int tablet_lower, int tablet_upper) {
+inline std::shared_ptr<TabletMetadataPB> make_shared_child(int64_t tablet_id, int64_t base_version, uint32_t shared_id,
+                                                           KeysType keys_type, int tablet_lower, int tablet_upper) {
     auto meta = std::make_shared<TabletMetadataPB>();
     meta->set_id(tablet_id);
     meta->set_version(base_version);
@@ -6387,7 +6386,7 @@ inline std::shared_ptr<TabletMetadataPB> make_compacted_child(int64_t tablet_id,
 
     auto* rowset = meta->add_rowsets();
     rowset->set_id(compacted_id);
-    rowset->set_version(base_version + 1);  // compaction bumps version
+    rowset->set_version(base_version + 1); // compaction bumps version
     rowset->set_num_rows(10);
     rowset->set_data_size(100);
     rowset->add_segments(compacted_seg_name);
@@ -6492,18 +6491,18 @@ inline std::shared_ptr<TabletMetadataPB> make_pk_compacted_child(int64_t tablet_
         prepare_tablet_dirs(MERGED_TABLET);                                                                            \
         constexpr int kNumRows = 30;                                                                                   \
         constexpr int kRangeBoundaries[4] = {0, 10, 20, 30};                                                           \
-        uint64_t segment_size = write_two_column_segment(MERGED_TABLET, "shared_seg.dat", kNumRows,                    \
-                                                         [](int i) { return i * 10; });                               \
+        uint64_t segment_size =                                                                                        \
+                write_two_column_segment(MERGED_TABLET, "shared_seg.dat", kNumRows, [](int i) { return i * 10; });     \
         std::shared_ptr<TabletMetadataPB> metas[3];                                                                    \
         for (int i = 0; i < 3; ++i) {                                                                                  \
             const int lower = kRangeBoundaries[i];                                                                     \
             const int upper = kRangeBoundaries[i + 1];                                                                 \
             if (i == (COMPACTED_INDEX)) {                                                                              \
                 metas[i] = make_pk_compacted_child(child_ids[i], base_version, /*compacted_id=*/11, lower, upper,      \
-                                                   fmt::format("compacted_{}.dat", i));                              \
+                                                   fmt::format("compacted_{}.dat", i));                                \
             } else {                                                                                                   \
-                metas[i] = make_pk_shared_child_with_real_segment(child_ids[i], base_version, /*shared_id=*/10,        \
-                                                                  lower, upper, segment_size);                        \
+                metas[i] = make_pk_shared_child_with_real_segment(child_ids[i], base_version, /*shared_id=*/10, lower, \
+                                                                  upper, segment_size);                                \
             }                                                                                                          \
             EXPECT_OK(_tablet_manager->put_tablet_metadata(metas[i]));                                                 \
         }                                                                                                              \
@@ -6519,8 +6518,8 @@ inline std::shared_ptr<TabletMetadataPB> make_pk_compacted_child(int64_t tablet_
         txn_info.set_gtid(1);                                                                                          \
         std::unordered_map<int64_t, TabletMetadataPtr> tablet_metadatas;                                               \
         std::unordered_map<int64_t, TabletRangePB> tablet_ranges;                                                      \
-        ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version,              \
-                                                  new_version, txn_info, false, tablet_metadatas, tablet_ranges));     \
+        ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version, new_version, \
+                                                  txn_info, false, tablet_metadatas, tablet_ranges));                  \
         MERGED = tablet_metadatas.at(MERGED_TABLET);                                                                   \
         ASSERT_NE(MERGED, nullptr);                                                                                    \
         for (const auto& r : MERGED->rowsets()) {                                                                      \
@@ -6538,16 +6537,16 @@ inline std::shared_ptr<TabletMetadataPB> make_pk_compacted_child(int64_t tablet_
         }                                                                                                              \
     } while (0)
 
-#define ASSERT_SYNTHESIZED_GAP_DELVEC(MERGED, CANONICAL_RSSID)                                                          \
-    do {                                                                                                                \
-        ASSERT_TRUE((MERGED)->has_delvec_meta()) << "delvec_meta missing — Phase 0 did not synthesize gap delvec";     \
-        ASSERT_EQ(1, (MERGED)->delvec_meta().version_to_file_size())                                                    \
-                << "expected exactly one delvec file written by merge_delvecs";                                         \
-        auto delvec_it = (MERGED)->delvec_meta().delvecs().find(CANONICAL_RSSID);                                       \
-        ASSERT_NE(delvec_it, (MERGED)->delvec_meta().delvecs().end())                                                   \
-                << "delvec_meta has no entry for canonical rssid " << (CANONICAL_RSSID);                                \
-        EXPECT_GT(delvec_it->second.size(), 0u) << "synthesized delvec page is empty";                                  \
-        EXPECT_EQ(2, (MERGED)->version()) << "merged tablet version mismatch";                                          \
+#define ASSERT_SYNTHESIZED_GAP_DELVEC(MERGED, CANONICAL_RSSID)                                                     \
+    do {                                                                                                           \
+        ASSERT_TRUE((MERGED)->has_delvec_meta()) << "delvec_meta missing — Phase 0 did not synthesize gap delvec"; \
+        ASSERT_EQ(1, (MERGED)->delvec_meta().version_to_file_size())                                               \
+                << "expected exactly one delvec file written by merge_delvecs";                                    \
+        auto delvec_it = (MERGED)->delvec_meta().delvecs().find(CANONICAL_RSSID);                                  \
+        ASSERT_NE(delvec_it, (MERGED)->delvec_meta().delvecs().end())                                              \
+                << "delvec_meta has no entry for canonical rssid " << (CANONICAL_RSSID);                           \
+        EXPECT_GT(delvec_it->second.size(), 0u) << "synthesized delvec page is empty";                             \
+        EXPECT_EQ(2, (MERGED)->version()) << "merged tablet version mismatch";                                     \
     } while (0)
 
 // PR-2 §5.2.4: merge_sstables's shared_rssid path must project a delvec from
@@ -6898,8 +6897,7 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_non_pk_contiguous_still_dedups
 // rowset.range over tablet.range) miss rows from later contributors. PR-1
 // pushes the *effective* duplicate range (rowset.range || ctx.metadata.range
 // || unbounded) into update_canonical to fix this.
-TEST_F(LakeTabletReshardTest,
-       test_tablet_merging_canonical_range_extends_for_duplicate_without_rowset_range) {
+TEST_F(LakeTabletReshardTest, test_tablet_merging_canonical_range_extends_for_duplicate_without_rowset_range) {
     using namespace pr1_helpers;
     const int64_t base_version = 1;
     const int64_t new_version = 2;
@@ -6996,8 +6994,8 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_delete_predicate_dedup_unchang
         rowset->set_num_rows(0);
         rowset->set_data_size(0);
         auto* pred = rowset->mutable_delete_predicate();
-        pred->set_version(base_version);  // required field
-        pred->mutable_in_predicates();    // make has_delete_predicate true
+        pred->set_version(base_version); // required field
+        pred->mutable_in_predicates();   // make has_delete_predicate true
         return meta;
     };
 
