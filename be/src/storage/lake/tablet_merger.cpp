@@ -118,6 +118,27 @@ private:
     std::unordered_map<uint32_t, uint32_t> _shared_rssid_map;
 };
 
+// Tracks the contributing children's child-local ranges per canonical rowset
+// in new_metadata. PR-1 uses this for the post-merge_rowsets PK fail-fast
+// coverage check; PR-2 will reuse it to synthesize gap delvecs.
+//
+// Key: index of the canonical rowset in new_metadata->rowsets().
+// child_ranges: each entry is the contributing child's effective_child_local_range
+// (rowset.range, fallback ctx.metadata.range, fallback unbounded), captured BEFORE
+// update_canonical's union_range mutates the canonical's stored range — otherwise
+// the convex hull would swallow gaps and the coverage / gap detection would fail.
+struct CanonicalContribution {
+    std::vector<TabletRangePB> child_ranges;
+};
+using CanonicalContribMap = std::unordered_map<int, CanonicalContribution>;
+
+// Singleton unbounded TabletRangePB used as the final fallback in
+// effective_child_local_range when neither rowset nor ctx.metadata carries a range.
+const TabletRangePB& unbounded_range_singleton() {
+    static const TabletRangePB kUnbounded;
+    return kUnbounded;
+}
+
 struct DelvecSourceRef {
     const TabletMergeContext* ctx;
     DelvecPagePB page;
@@ -209,11 +230,22 @@ Status add_rowset(TabletMergeContext& ctx, const RowsetMetadataPB& rowset, Table
     return Status::OK();
 }
 
-Status update_canonical(RowsetMetadataPB* canonical_rowset, const RowsetMetadataPB& duplicate_rowset) {
-    if (canonical_rowset->has_range() && duplicate_rowset.has_range()) {
+Status update_canonical(RowsetMetadataPB* canonical_rowset, const TabletRangePB& duplicate_effective_range,
+                        const RowsetMetadataPB& duplicate_rowset) {
+    // Always extend the canonical range with the duplicate's *effective* range
+    // (rowset.range, fallback ctx.metadata.range, fallback unbounded — same chain
+    // as Rowset::get_seek_range()). The previous gate of
+    // `canonical_rowset->has_range() && duplicate_rowset.has_range()` silently
+    // dropped contributors whose rowset.range was unset but whose ctx tablet
+    // range filled the slice; the post-dedup canonical.range would then reflect
+    // only the first contributor and readers (which prefer rowset.range over
+    // tablet.range) would miss rows from later contributors.
+    if (canonical_rowset->has_range()) {
         ASSIGN_OR_RETURN(auto merged_range,
-                         tablet_reshard_helper::union_range(canonical_rowset->range(), duplicate_rowset.range()));
+                         tablet_reshard_helper::union_range(canonical_rowset->range(), duplicate_effective_range));
         canonical_rowset->mutable_range()->CopyFrom(merged_range);
+    } else {
+        canonical_rowset->mutable_range()->CopyFrom(duplicate_effective_range);
     }
     // Each merge input carries a proportional num_dels slice written by
     // tablet_splitter.cpp / tablet_reshard_helper.cpp with num_dels <= num_rows.
@@ -228,7 +260,9 @@ Status update_canonical(RowsetMetadataPB* canonical_rowset, const RowsetMetadata
     return Status::OK();
 }
 
-Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMetadataPB* new_metadata) {
+Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMetadataPB* new_metadata,
+                     CanonicalContribMap* canonical_contribs) {
+    const bool is_pk = is_primary_key(*new_metadata);
     int version_start_index = 0;
     int64_t current_version = -1;
 
@@ -248,6 +282,7 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
         if (min_child_index < 0) break;
 
         const auto& rowset = merge_contexts[min_child_index].current_rowset();
+        const auto& ctx_meta = *merge_contexts[min_child_index].metadata();
 
         // Version change: update version_start_index
         if (rowset.version() != current_version) {
@@ -255,13 +290,35 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
             version_start_index = new_metadata->rowsets_size();
         }
 
-        // Check for duplicate in [version_start_index, end)
+        // Search [version_start_index, end) for a dedup candidate. Decision:
+        //   - Delete-predicate dups: keep original unconditional skip path.
+        //   - Shared-segment / shared-del_file dups (the only other case
+        //     is_duplicate_rowset returns true on): PK always dedups; non-PK
+        //     dedups only when ranges are contiguous so that the convex-hull
+        //     range stored on the canonical does not span a gap left by a
+        //     compacted sibling.
         int canonical_index = -1;
         for (int i = version_start_index; i < new_metadata->rowsets_size(); ++i) {
-            if (is_duplicate_rowset(rowset, new_metadata->rowsets(i))) {
+            if (!is_duplicate_rowset(rowset, new_metadata->rowsets(i))) continue;
+
+            if (rowset.has_delete_predicate()) {
                 canonical_index = i;
                 break;
             }
+            if (is_pk) {
+                canonical_index = i;
+                break;
+            }
+            const auto& candidate_range = new_metadata->rowsets(i).range();
+            const auto& incoming_range =
+                    tablet_reshard_helper::effective_child_local_range(rowset, ctx_meta, unbounded_range_singleton());
+            if (tablet_reshard_helper::ranges_are_contiguous(candidate_range, incoming_range)) {
+                canonical_index = i;
+                break;
+            }
+            // Non-PK + non-contiguous: keep scanning. If no other candidate
+            // matches, fall through to add_rowset and treat as a separate
+            // shared rowset — each retains its own contiguous range.
         }
 
         if (canonical_index >= 0) {
@@ -274,12 +331,33 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
                     << canonical.del_files_size() << ")";
             if (!rowset.has_delete_predicate()) {
                 merge_contexts[min_child_index].update_shared_rssid_map(rowset, canonical);
-                RETURN_IF_ERROR(update_canonical(new_metadata->mutable_rowsets(canonical_index), rowset));
+                // Capture the duplicate's child-local effective range BEFORE
+                // update_canonical mutates canonical.range via union_range. The
+                // same effective range is also passed into update_canonical so
+                // that a rowset without its own .range() but with a ctx tablet
+                // range still extends the canonical range.
+                const auto& duplicate_effective_range = tablet_reshard_helper::effective_child_local_range(
+                        rowset, ctx_meta, unbounded_range_singleton());
+                if (canonical_contribs != nullptr) {
+                    (*canonical_contribs)[canonical_index].child_ranges.push_back(duplicate_effective_range);
+                }
+                RETURN_IF_ERROR(update_canonical(new_metadata->mutable_rowsets(canonical_index),
+                                                 duplicate_effective_range, rowset));
             }
             // predicate: just skip
         } else {
-            // First occurrence: output
+            // First occurrence: output. Capture child-local range first so that
+            // we record the pre-clip view (add_rowset clips to ctx tablet range).
+            TabletRangePB initial_child_range;
+            if (canonical_contribs != nullptr && !rowset.has_delete_predicate()) {
+                initial_child_range = tablet_reshard_helper::effective_child_local_range(
+                        rowset, ctx_meta, unbounded_range_singleton());
+            }
+            const int new_index = new_metadata->rowsets_size();
             RETURN_IF_ERROR(add_rowset(merge_contexts[min_child_index], rowset, new_metadata));
+            if (canonical_contribs != nullptr && !rowset.has_delete_predicate()) {
+                (*canonical_contribs)[new_index].child_ranges.push_back(std::move(initial_child_range));
+            }
         }
 
         merge_contexts[min_child_index].advance_rowset();
@@ -601,6 +679,15 @@ Status compute_row_windows_for_source_rowsets(TabletManager* tablet_manager, int
     *out_windows = std::move(deduped_windows);
 
     // Coverage validation: windows must be contiguous and cover [0, num_rows_in_target).
+    //
+    // Known limitation (PR-2): the synthesized gap delvec emitted by
+    // compute_synthesized_gap_specs masks rowids that no contributing child
+    // claims. DCG rebuild does not yet consult that bitmap, so a
+    // (compacted-child gap) × (DCG conflict on canonical R0) combination
+    // returns NotSupported here even though the gap rowids are intentionally
+    // masked. Tracked separately; current scheduling avoids the combo by
+    // requiring all children compacted before merge for any tablet with
+    // active partial-update DCGs.
     if ((*out_windows)[0].range.begin() != 0) {
         return Status::NotSupported(
                 fmt::format("DCG rebuild: row window coverage gap at the start (first.begin={}, expect 0)",
@@ -979,8 +1066,159 @@ Status merge_dcg_meta(TabletManager* tablet_manager, const std::vector<TabletMer
     return Status::OK();
 }
 
+// PR-2 Phase 0 output: per-target rowid bitmaps representing keys in the
+// shared physical segment that no contributing child claims. Read-path
+// consumers:
+//   - canonical R0's segment iterator already filters by canonical.range, so
+//     gap rowids outside the convex hull are no-ops for scans.
+//   - PersistentIndexSstable::multi_get filters by the projected delvec on
+//     the sstable PB, regardless of LSM block-sort order — this is what makes
+//     the first-child-compacts case (Codex round-2 finding) safe.
+struct CanonicalGapSpec {
+    uint32_t target_rssid;
+    Roaring gap_bits;
+};
+
+// Phase 0: for every PK canonical rowset that owns at least one shared
+// segment, mask the rowids whose key falls outside ⋃ contributors but inside
+// the merged tablet range.
+//
+// Bound = merged tablet range, not unbounded `(-∞, +∞)`. The plan's original
+// motivation for unbounded was to surface keys outside canonical.range (left
+// or right edges); but since each child's tablet.range is a sub-range of the
+// pre-split tablet, and merged_tablet.range = union of children's tablet
+// ranges, the shared physical segment never carries keys outside the merged
+// tablet range. The unbounded helper would just generate edge complements
+// that seek to empty rowid windows. Bounded-by-merged-tablet-range is both
+// correct and lets us skip the segment open entirely when contributors fully
+// cover the merged tablet range (the no-compaction common case).
+StatusOr<std::vector<CanonicalGapSpec>> compute_synthesized_gap_specs(
+        TabletManager* tablet_manager, const TabletMetadataPB& new_metadata,
+        const CanonicalContribMap& canonical_contribs) {
+    std::vector<CanonicalGapSpec> result;
+    for (const auto& [canonical_index, contrib] : canonical_contribs) {
+        if (canonical_index < 0 || canonical_index >= new_metadata.rowsets_size()) {
+            return Status::InternalError(
+                    fmt::format("compute_synthesized_gap_specs: invalid canonical_index {}", canonical_index));
+        }
+        const auto& canonical = new_metadata.rowsets(canonical_index);
+        // Same has_shared check as PR-1 fail-fast: shared_segments_size() alone
+        // is insufficient because metadata transforms can leave an all-false
+        // vector behind. We only synthesize gap bits when at least one segment
+        // is actually shared.
+        bool has_shared = false;
+        for (int i = 0; i < canonical.shared_segments_size(); ++i) {
+            if (canonical.shared_segments(i)) {
+                has_shared = true;
+                break;
+            }
+        }
+        if (!has_shared) continue;
+
+        ASSIGN_OR_RETURN(auto sorted_disjoint,
+                         tablet_reshard_helper::sort_and_merge_adjacent_ranges(contrib.child_ranges));
+        ASSIGN_OR_RETURN(auto non_contributed,
+                         tablet_reshard_helper::compute_disjoint_gaps_within(new_metadata.range(), sorted_disjoint));
+        if (non_contributed.empty()) continue;
+
+        const TabletSchemaPB* schema_pb = resolve_rowset_schema_pb(new_metadata, canonical);
+        if (schema_pb == nullptr) {
+            return Status::Corruption("compute_synthesized_gap_specs: schema not found for canonical rowset");
+        }
+        TabletSchemaCSPtr schema = TabletSchema::create(*schema_pb);
+
+        for (int seg_pos = 0; seg_pos < canonical.shared_segments_size(); ++seg_pos) {
+            if (!canonical.shared_segments(seg_pos)) continue;
+            uint32_t target_rssid = get_rssid(canonical, seg_pos);
+
+            FileInfo seg_file_info;
+            seg_file_info.path = tablet_manager->segment_location(new_metadata.id(), canonical.segments(seg_pos));
+            if (canonical.segment_size_size() > seg_pos) {
+                seg_file_info.size = canonical.segment_size(seg_pos);
+            }
+            if (canonical.bundle_file_offsets_size() > seg_pos) {
+                seg_file_info.bundle_file_offset = canonical.bundle_file_offsets(seg_pos);
+            }
+            if (canonical.segment_encryption_metas_size() > seg_pos) {
+                seg_file_info.encryption_meta = canonical.segment_encryption_metas(seg_pos);
+            }
+            ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(seg_file_info.path));
+            ASSIGN_OR_RETURN(auto base_segment,
+                             Segment::open(fs, seg_file_info, /*segment_id=*/0, schema,
+                                           /*footer_length_hint=*/nullptr, /*partial_rowset_footer=*/nullptr,
+                                           /*lake_io_opts=*/LakeIOOptions{}, tablet_manager));
+            const rowid_t num_rows = static_cast<rowid_t>(base_segment->num_rows());
+            if (num_rows == 0) continue;
+
+            Roaring gap_bits;
+            for (const auto& gap_range : non_contributed) {
+                ASSIGN_OR_RETURN(auto seek_range,
+                                 TabletRangeHelper::create_seek_range_from(gap_range, schema, /*mem_pool=*/nullptr));
+                LakeIOOptions io_opts{.fill_data_cache = false};
+                ASSIGN_OR_RETURN(auto rowid_range_opt,
+                                 segment_seek_range_to_rowid_range(base_segment, seek_range, io_opts));
+                if (!rowid_range_opt.has_value()) continue;
+                rowid_t lo = std::max<rowid_t>(rowid_range_opt->begin(), 0);
+                rowid_t hi = std::min<rowid_t>(rowid_range_opt->end(), num_rows);
+                if (lo >= hi) continue;
+                gap_bits.addRange(static_cast<uint64_t>(lo), static_cast<uint64_t>(hi));
+            }
+            if (!gap_bits.isEmpty()) {
+                result.push_back(CanonicalGapSpec{target_rssid, std::move(gap_bits)});
+            }
+        }
+    }
+    return result;
+}
+
+// Phase 2.5 of merge_delvecs: union each synthesized gap bitmap into the
+// corresponding target state. Mirrors the Phase 2 transitions but the source
+// is a synthesized Roaring rather than a child delvec page — so no
+// (file_name, offset) entry goes into seen_sources.
+//
+// Uses DelVector::union_with(Roaring) directly (no rowid-vector round-trip):
+// a compacted-away child's gap can span millions of rowids, and the legacy
+// path through std::vector<uint32_t> + DelVector::init(uint32_t*, size) +
+// union_delvec would re-enumerate every rowid into a vector twice.
+Status inject_synthesized_gaps_into_target_states(TabletManager* tablet_manager,
+                                                  const std::vector<CanonicalGapSpec>& specs, int64_t new_version,
+                                                  std::map<uint32_t, TargetDelvecState>* target_states) {
+    for (const auto& spec : specs) {
+        if (spec.gap_bits.isEmpty()) continue;
+        auto& state = (*target_states)[spec.target_rssid];
+
+        if (state.single_source.has_value() && !state.merged) {
+            // Promote single_source → merged: load the source delvec, OR in gap_bits.
+            DelVector dv_prev;
+            const auto& ref = *state.single_source;
+            LakeIOOptions io_opts;
+            RETURN_IF_ERROR(get_del_vec(tablet_manager, *ref.ctx->metadata(), ref.page, false, io_opts, &dv_prev));
+            auto merged_dv = std::make_unique<DelVector>();
+            if (dv_prev.roaring()) {
+                merged_dv->union_with(new_version, *dv_prev.roaring());
+            }
+            merged_dv->union_with(new_version, spec.gap_bits);
+            state.merged = std::move(merged_dv);
+            state.single_source.reset();
+        } else if (state.merged) {
+            state.merged->union_with(new_version, spec.gap_bits);
+        } else {
+            // Empty state: construct merged directly from gap_bits.
+            auto merged_dv = std::make_unique<DelVector>();
+            merged_dv->union_with(new_version, spec.gap_bits);
+            state.merged = std::move(merged_dv);
+        }
+    }
+    return Status::OK();
+}
+
 Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMergeContext>& merge_contexts,
-                     int64_t new_version, int64_t txn_id, TabletMetadataPB* new_metadata) {
+                     const CanonicalContribMap& canonical_contribs, int64_t new_version, int64_t txn_id,
+                     TabletMetadataPB* new_metadata) {
+    // Phase 0: synthesize gap delvec bits from canonical_contribs.
+    ASSIGN_OR_RETURN(auto synthesized_gap_specs,
+                     compute_synthesized_gap_specs(tablet_manager, *new_metadata, canonical_contribs));
+
     // Phase 1: Collect unique delvec files across all children
     std::vector<DelvecFileInfo> unique_delvec_files;
     std::unordered_map<std::string, size_t> file_name_to_index;
@@ -1008,7 +1246,10 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
         }
     }
 
-    if (unique_delvec_files.empty()) {
+    // Early-return only when there is no work at all: no source delvec files
+    // AND no synthesized gaps. PR-2: a clean PK table with no prior deletes
+    // can still need a synthesized gap delvec (Codex round-1 on the plan).
+    if (unique_delvec_files.empty() && synthesized_gap_specs.empty()) {
         return Status::OK();
     }
 
@@ -1090,6 +1331,14 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
         }
     }
 
+    // Phase 2.5: inject synthesized gap delvecs into target_states. Each spec's
+    // bitmap masks rowids in the shared physical segment whose key was
+    // contributed by no surviving child (e.g., a child that compacted away
+    // its copy of the shared rowset). Promotes any single_source state to
+    // merged so the bitmap can be unioned in.
+    RETURN_IF_ERROR(inject_synthesized_gaps_into_target_states(tablet_manager, synthesized_gap_specs, new_version,
+                                                               &target_states));
+
     // Phase 3: Serialize union results into union_buffer
     std::string union_buffer;
     std::map<uint32_t, UnionPageInfo> union_page_infos;
@@ -1104,14 +1353,33 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
         }
     }
 
-    // Phase 4: Write one file (old files concatenated + union_buffer appended)
+    // Phase 4: Write one file. Three routes depending on what contributed:
+    //   1. only synthesized (no source delvec files) → write_delvec_file_from_buffer
+    //      with the union_buffer at offset 0; sidesteps merge_delvec_files's
+    //      DCHECK on (empty old_files + non-empty extra_data).
+    //   2. only source files (no synthesized + empty union_buffer) → existing
+    //      merge_delvec_files with empty extra_data.
+    //   3. both → existing merge_delvec_files with extra_data populated.
     FileMetaPB new_delvec_file;
     std::vector<uint64_t> offsets;
     uint64_t union_base_offset = 0;
-    RETURN_IF_ERROR(merge_delvec_files(tablet_manager, unique_delvec_files, new_metadata->id(), txn_id,
-                                       &new_delvec_file, &offsets, Slice(union_buffer), &union_base_offset));
+    if (unique_delvec_files.empty()) {
+        // Route 1: synthesized-only. Phase 1's early-return guarantees that
+        // synthesized_gap_specs (and therefore union_buffer) is non-empty
+        // here.
+        DCHECK(!union_buffer.empty()) << "synthesized-only path with empty union_buffer";
+        RETURN_IF_ERROR(write_delvec_file_from_buffer(tablet_manager, new_metadata->id(), txn_id,
+                                                     Slice(union_buffer), &new_delvec_file));
+        union_base_offset = 0;
+    } else {
+        // Routes 2 & 3.
+        RETURN_IF_ERROR(merge_delvec_files(tablet_manager, unique_delvec_files, new_metadata->id(), txn_id,
+                                           &new_delvec_file, &offsets, Slice(union_buffer), &union_base_offset));
+    }
 
-    // Build base_offset_by_file_name
+    // Build base_offset_by_file_name. Empty for synthesized-only route since
+    // there are no source files to reference; merged-state targets always go
+    // through union_page_infos which is keyed by target rssid, not file name.
     std::unordered_map<std::string, uint64_t> base_offset_by_file_name;
     for (size_t i = 0; i < unique_delvec_files.size(); ++i) {
         base_offset_by_file_name[unique_delvec_files[i].delvec_file.name()] = offsets[i];
@@ -1211,13 +1479,21 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
                 uint64_t low = sst.max_rss_rowid() & 0xffffffffULL;
                 out->set_max_rss_rowid((static_cast<uint64_t>(mapped_rssid) << 32) | low);
 
-                // delvec projection via new_metadata->delvec_meta()
-                if (sst.has_delvec() && sst.delvec().size() > 0) {
-                    auto dv_it = new_metadata->delvec_meta().delvecs().find(mapped_rssid);
-                    if (dv_it == new_metadata->delvec_meta().delvecs().end()) {
-                        return Status::Corruption("Delvec page not found for sstable after merge");
-                    }
+                // delvec projection via new_metadata->delvec_meta(). PR-2:
+                // always look up the merged delvec_meta entry, regardless of
+                // whether the source sstable already had a delvec. Otherwise
+                // a synthesized gap delvec (created in merge_delvecs Phase 0
+                // for keys covered by no contributing child) would never
+                // reach the PK-index sstable PB and PersistentIndexSstable::
+                // multi_get could return stale rssids when the LSM block-sort
+                // order is inverted (e.g., first-child compaction).
+                auto dv_it = new_metadata->delvec_meta().delvecs().find(mapped_rssid);
+                if (dv_it != new_metadata->delvec_meta().delvecs().end() && dv_it->second.size() > 0) {
                     out->mutable_delvec()->CopyFrom(dv_it->second);
+                } else if (sst.has_delvec() && sst.delvec().size() > 0) {
+                    // The source carried a delvec but the merged delvec_meta
+                    // dropped/never-created the projection — corruption.
+                    return Status::Corruption("Delvec page not found for sstable after merge");
                 }
             } else {
                 // No shared_rssid (legacy format): accumulate rssid_offset so that a
@@ -1462,8 +1738,12 @@ StatusOr<MutableTabletMetadataPtr> merge_tablet(TabletManager* tablet_manager,
     }
     new_tablet_metadata->mutable_range()->CopyFrom(merged_range);
 
-    // Phase 2: Merge rowsets (version-driven k-way merge with dedup)
-    RETURN_IF_ERROR(merge_rowsets(merge_contexts, new_tablet_metadata.get()));
+    // Phase 2: Merge rowsets (version-driven k-way merge with dedup).
+    // canonical_contribs collects each canonical rowset's contributing children's
+    // child-local ranges; consumed by the PK fail-fast coverage check below
+    // (PR-1) and by future gap-delvec synthesis (PR-2).
+    CanonicalContribMap canonical_contribs;
+    RETURN_IF_ERROR(merge_rowsets(merge_contexts, new_tablet_metadata.get(), &canonical_contribs));
 
     // Phase 2.5: Merge schemas (must run before merge_dcg_meta, which needs
     // historical_schemas to locate rebuild schemas for shared-segment rebuild).
@@ -1474,8 +1754,8 @@ StatusOr<MutableTabletMetadataPtr> merge_tablet(TabletManager* tablet_manager,
                                    txn_info.txn_id(), new_tablet_metadata.get()));
 
     if (is_primary_key(*new_tablet_metadata)) {
-        RETURN_IF_ERROR(merge_delvecs(tablet_manager, merge_contexts, new_version, txn_info.txn_id(),
-                                      new_tablet_metadata.get()));
+        RETURN_IF_ERROR(merge_delvecs(tablet_manager, merge_contexts, canonical_contribs, new_version,
+                                      txn_info.txn_id(), new_tablet_metadata.get()));
     }
 
     RETURN_IF_ERROR(merge_sstables(tablet_manager, merge_contexts, new_tablet_metadata.get()));
