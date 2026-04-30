@@ -6669,6 +6669,38 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_pk_gap_delvec_last_child_compa
     ASSERT_EQ(2, merged->rowsets_size());
 }
 
+// PR-2 deeper assertion: load the merged delvec file and decode its Roaring
+// bitmap, verify the exact rowid set matches the compacted child's range. The
+// shared segment in BUILD_THREE_WAY_PK_GAP_MERGE has c0 = [0..30) so rowid==key
+// when the segment's short-key index resolves the seek range.
+//
+// compacted_index=0 → contributors cover [10,30) → gap [0,10) → masked rowids {0..9}
+// compacted_index=1 → contributors cover [0,10)∪[20,30) → gap [10,20) → masked rowids {10..19}
+// compacted_index=2 → contributors cover [0,20) → gap [20,30) → masked rowids {20..29}
+TEST_F(LakeTabletReshardTest, test_tablet_merging_pk_gap_delvec_rowid_content_matches_compacted_range) {
+    auto check = [&](int compacted_index, int64_t txn_id, uint32_t expected_lo, uint32_t expected_hi) {
+        BUILD_THREE_WAY_PK_GAP_MERGE(merged, canonical_rssid, merged_tablet, compacted_index, txn_id);
+        ASSERT_SYNTHESIZED_GAP_DELVEC(merged, canonical_rssid);
+
+        DelVector loaded;
+        LakeIOOptions io_opts;
+        // get_del_vec takes a const TabletMetadata&; *merged is already that type.
+        ASSERT_OK(get_del_vec(_tablet_manager.get(), *merged, canonical_rssid, /*fill_cache=*/false, io_opts, &loaded));
+        ASSERT_TRUE(loaded.roaring() != nullptr) << "loaded delvec empty for compacted_index=" << compacted_index;
+        const Roaring& bitmap = *loaded.roaring();
+
+        // Expected: exactly {expected_lo .. expected_hi - 1}.
+        Roaring expected;
+        expected.addRange(expected_lo, expected_hi);
+        EXPECT_EQ(expected.cardinality(), bitmap.cardinality())
+                << "cardinality mismatch for compacted_index=" << compacted_index;
+        EXPECT_TRUE(bitmap == expected) << "bitmap mismatch for compacted_index=" << compacted_index;
+    };
+    check(/*compacted_index=*/0, /*txn_id=*/1101, /*expected_lo=*/0, /*expected_hi=*/10);
+    check(/*compacted_index=*/1, /*txn_id=*/1102, /*expected_lo=*/10, /*expected_hi=*/20);
+    check(/*compacted_index=*/2, /*txn_id=*/1103, /*expected_lo=*/20, /*expected_hi=*/30);
+}
+
 // PR-2 contiguous: all children retain the shared rowset → contributors cover
 // the merged tablet range → no synthesized gap delvec generated, no delvec
 // file written. Phase 0 returns empty without opening any segment.

@@ -55,6 +55,20 @@ bvar::Adder<int64_t> g_tablet_merge_dcg_rebuild_total("tablet_merge_dcg_rebuild_
 bvar::Adder<int64_t> g_tablet_merge_dcg_rebuild_fallback_not_supported_total(
         "tablet_merge_dcg_rebuild_fallback_not_supported_total");
 
+// PR-2 (split-compaction-merge) counters.
+//   gap_delvec_total: incremented once per merge that actually emitted at least
+//     one synthesized gap delvec spec (i.e., contributors did not fully cover
+//     the merged tablet range for some PK shared canonical rowset).
+//   non_pk_skip_dedup_total: incremented once per non-PK skip-dedup branch
+//     hit in merge_rowsets — useful for telemetry on how often non-PK split-
+//     compaction-merge surfaces non-contiguous canonical contributors.
+//   synthesized_only_delvec_total: incremented when merge_delvecs Phase 4
+//     routed through write_delvec_file_from_buffer because no source children
+//     carried any delvec but Phase 0 produced gap specs.
+bvar::Adder<int64_t> g_tablet_merge_gap_delvec_total("tablet_merge_gap_delvec_total");
+bvar::Adder<int64_t> g_tablet_merge_non_pk_skip_dedup_total("tablet_merge_non_pk_skip_dedup_total");
+bvar::Adder<int64_t> g_tablet_merge_synthesized_only_delvec_total("tablet_merge_synthesized_only_delvec_total");
+
 } // namespace
 
 namespace starrocks::lake {
@@ -298,6 +312,7 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
         //     range stored on the canonical does not span a gap left by a
         //     compacted sibling.
         int canonical_index = -1;
+        bool non_pk_skip_dedup_fired = false;
         for (int i = version_start_index; i < new_metadata->rowsets_size(); ++i) {
             if (!is_duplicate_rowset(rowset, new_metadata->rowsets(i))) continue;
 
@@ -319,6 +334,13 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
             // Non-PK + non-contiguous: keep scanning. If no other candidate
             // matches, fall through to add_rowset and treat as a separate
             // shared rowset — each retains its own contiguous range.
+            non_pk_skip_dedup_fired = true;
+        }
+        if (canonical_index < 0 && non_pk_skip_dedup_fired) {
+            // At least one is_duplicate_rowset hit was rejected due to
+            // non-contiguous ranges and no later candidate accepted it →
+            // the rowset is added as a sibling of an existing shared rowset.
+            g_tablet_merge_non_pk_skip_dedup_total << 1;
         }
 
         if (canonical_index >= 0) {
@@ -1218,6 +1240,9 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
     // Phase 0: synthesize gap delvec bits from canonical_contribs.
     ASSIGN_OR_RETURN(auto synthesized_gap_specs,
                      compute_synthesized_gap_specs(tablet_manager, *new_metadata, canonical_contribs));
+    if (!synthesized_gap_specs.empty()) {
+        g_tablet_merge_gap_delvec_total << 1;
+    }
 
     // Phase 1: Collect unique delvec files across all children
     std::vector<DelvecFileInfo> unique_delvec_files;
@@ -1371,6 +1396,7 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
         RETURN_IF_ERROR(write_delvec_file_from_buffer(tablet_manager, new_metadata->id(), txn_id, Slice(union_buffer),
                                                       &new_delvec_file));
         union_base_offset = 0;
+        g_tablet_merge_synthesized_only_delvec_total << 1;
     } else {
         // Routes 2 & 3.
         RETURN_IF_ERROR(merge_delvec_files(tablet_manager, unique_delvec_files, new_metadata->id(), txn_id,
