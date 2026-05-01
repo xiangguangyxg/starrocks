@@ -5054,6 +5054,16 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_sort_uses_signed_comp
 // on multi-cycle SPLIT/MERGE: a single fileset's sstables can span a wide
 // max_rss_rowid range because filesets accumulate via append() across
 // multiple memtable flushes (persistent_index_sstable_fileset.cpp:96-115).
+//
+// Long-term contract: the merged metadata must satisfy BOTH (I1)
+// signed-monotone non-decreasing max_rss_rowid AND (I2) every output
+// fileset_id appears in exactly one contiguous run. When a single source
+// fileset_id's sstables would have to interleave with foreign-fileset_id
+// sstables to satisfy I1, merge_sstables splits the source FID into multiple
+// output FIDs by re-assigning fresh fileset_id (UniqueId::gen_uid) to each
+// run that comes after a foreign-FID interruption — the later run is by
+// physical layout already a separate logical fileset and cannot share
+// PersistentIndexSstableFileset state with the earlier run.
 TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_keep_same_fileset_id_contiguous) {
     const int64_t base_version = 1;
     const int64_t new_version = 2;
@@ -5144,7 +5154,15 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_keep_same_fileset_id_
     auto merged = tablet_metadatas.at(merged_tablet);
     ASSERT_EQ(5, merged->sstable_meta().sstables_size());
 
-    // Build a list of (fileset_id_bytes, position) and verify same-id is contiguous.
+    // I1: signed-monotone non-decreasing max_rss_rowid across the merged metadata.
+    int64_t prev_max = std::numeric_limits<int64_t>::min();
+    for (const auto& sst : merged->sstable_meta().sstables()) {
+        const int64_t cur = static_cast<int64_t>(sst.max_rss_rowid());
+        EXPECT_LE(prev_max, cur) << "post-merge sstables must be in non-decreasing int64 max_rss_rowid order";
+        prev_max = cur;
+    }
+
+    // I2: every output fileset_id appears in exactly one contiguous run.
     std::vector<std::pair<std::string, int>> id_runs; // <fileset_id_bytes, run_idx>
     int run_idx = -1;
     std::string last_id;
@@ -5161,8 +5179,6 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_keep_same_fileset_id_
         }
         id_runs.emplace_back(id_bytes, run_idx);
     }
-
-    // Each fileset_id should appear in exactly one contiguous run.
     std::map<std::string, std::set<int>> id_to_runs;
     for (const auto& [id, run] : id_runs) {
         id_to_runs[id].insert(run);
@@ -5172,10 +5188,187 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_keep_same_fileset_id_
                                    << " non-contiguous runs in merged metadata — Bug F regression";
     }
 
-    // Block-sort by min(max_rss_rowid) means F_X (min=100) precedes F_A (min=200).
+    // child_b's lone F_A sstable carries fa_high200.sst. Because child_b is the
+    // SECOND merge context, its rssid_offset = compute_rssid_offset(base_after_A,
+    // child_b) = 500 - 2 = 498, so the projection lifts F_A's max_rss high from
+    // 200 to 698. After the signed-monotone sort, F_A lands AFTER all four F_X
+    // sstables (whose projection is a no-op since child_a is first → offset=0):
+    //   pos 0..3 : F_X high=100/250/300/400 (contiguous, retains original FID-X)
+    //   pos 4    : F_A high=698 (post-projection)
+    // F_X stays contiguous in this layout without any FID reassignment.
     EXPECT_EQ("fx_high100.sst", merged->sstable_meta().sstables(0).filename());
+    EXPECT_EQ("fx_high250.sst", merged->sstable_meta().sstables(1).filename());
+    EXPECT_EQ("fx_high300.sst", merged->sstable_meta().sstables(2).filename());
     EXPECT_EQ("fx_high400.sst", merged->sstable_meta().sstables(3).filename());
     EXPECT_EQ("fa_high200.sst", merged->sstable_meta().sstables(4).filename());
+
+    // F_X kept the original fileset_id (its run was uninterrupted in the
+    // sorted layout), and F_A kept its original id too (single sstable run).
+    auto fid_pair = [](const PUniqueId& f) { return std::make_pair(f.hi(), f.lo()); };
+    EXPECT_EQ(std::make_pair(static_cast<int64_t>(0x1111111111111111LL), static_cast<int64_t>(0x2222222222222222LL)),
+              fid_pair(merged->sstable_meta().sstables(0).fileset_id()));
+    EXPECT_EQ(std::make_pair(static_cast<int64_t>(0x3333333333333333LL), static_cast<int64_t>(0x4444444444444444LL)),
+              fid_pair(merged->sstable_meta().sstables(4).fileset_id()));
+}
+
+// Reproduces the run3 11306 fact pattern observed on tablet reshard: a single
+// inherited fileset_id (FID-X) carried by the cycle-2 MERGE flush sstable
+// (low max_rss), plus several per-child flush_pk_memtable outputs that
+// inherited FID-X via PersistentIndexSstableFileset::append() (high max_rss),
+// with foreign-FID compaction outputs interleaved at intermediate max_rss.
+// The fix must keep each output fileset_id contiguous AND keep the global
+// max_rss_rowid sequence signed-monotone non-decreasing.
+TEST_F(LakeTabletReshardTest, test_tablet_merging_sstables_split_inherited_fileset_on_interleave) {
+    const int64_t base_version = 1;
+    const int64_t new_version = 2;
+    const int64_t child_a = next_id();
+    const int64_t child_b = next_id();
+    const int64_t merged_tablet = next_id();
+
+    prepare_tablet_dirs(child_a);
+    prepare_tablet_dirs(child_b);
+    prepare_tablet_dirs(merged_tablet);
+
+    // FID-X carries one early sstable (high=225) and three late per-child-flush
+    // sstables (high=724/725/726) that inherited FID-X via append(). FID-A,
+    // FID-B, FID-C, FID-D each carry one foreign sstable at high=226/393/570/715
+    // — exactly the run3 11306 layout.
+    PUniqueId fid_x;
+    fid_x.set_hi(0x5111111111111111LL);
+    fid_x.set_lo(0x5222222222222222LL);
+    PUniqueId fid_a;
+    fid_a.set_hi(0x6111111111111111LL);
+    fid_a.set_lo(0x6222222222222222LL);
+    PUniqueId fid_b;
+    fid_b.set_hi(0x7111111111111111LL);
+    fid_b.set_lo(0x7222222222222222LL);
+    PUniqueId fid_c;
+    fid_c.set_hi(0x4111111111111111LL);
+    fid_c.set_lo(0x4222222222222222LL);
+    PUniqueId fid_d;
+    fid_d.set_hi(0x3111111111111111LL);
+    fid_d.set_lo(0x3222222222222222LL);
+
+    auto add_sst = [](TabletMetadataPB* meta, const std::string& filename, uint64_t high, uint64_t low,
+                      const PUniqueId& fid) {
+        auto* sst = meta->mutable_sstable_meta()->add_sstables();
+        sst->set_filename(filename);
+        sst->set_filesize(128);
+        sst->set_max_rss_rowid((high << 32) | low);
+        sst->mutable_fileset_id()->CopyFrom(fid);
+    };
+
+    auto meta_a = std::make_shared<TabletMetadataPB>();
+    meta_a->set_id(child_a);
+    meta_a->set_version(base_version);
+    meta_a->set_next_rowset_id(800);
+    set_primary_key_schema(meta_a.get(), 1001);
+    auto* rowset_a = meta_a->add_rowsets();
+    rowset_a->set_id(1);
+    rowset_a->set_version(1);
+    rowset_a->set_num_rows(10);
+    rowset_a->set_data_size(100);
+    rowset_a->add_segments("seg_a.dat");
+    rowset_a->add_segment_size(100);
+    // Source-iteration order in child_a: the early FID-X sstable, then foreign
+    // compaction outputs and the per-child flush sstables also tagged FID-X.
+    add_sst(meta_a.get(), "fx_high225.sst", 225, 0, fid_x);
+    add_sst(meta_a.get(), "fa_high226.sst", 226, 0, fid_a);
+    add_sst(meta_a.get(), "fb_high393.sst", 393, 0, fid_b);
+    add_sst(meta_a.get(), "fc_high570.sst", 570, 0, fid_c);
+    add_sst(meta_a.get(), "fd_high715.sst", 715, 0, fid_d);
+    add_sst(meta_a.get(), "fx_high724.sst", 724, 0, fid_x);
+    add_sst(meta_a.get(), "fx_high725.sst", 725, 0, fid_x);
+    add_sst(meta_a.get(), "fx_high726.sst", 726, 0, fid_x);
+
+    auto meta_b = std::make_shared<TabletMetadataPB>();
+    meta_b->set_id(child_b);
+    meta_b->set_version(base_version);
+    meta_b->set_next_rowset_id(800);
+    set_primary_key_schema(meta_b.get(), 1001);
+    auto* rowset_b = meta_b->add_rowsets();
+    rowset_b->set_id(2);
+    rowset_b->set_version(1);
+    rowset_b->set_num_rows(10);
+    rowset_b->set_data_size(100);
+    rowset_b->add_segments("seg_b.dat");
+    rowset_b->add_segment_size(100);
+
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(meta_a));
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(meta_b));
+
+    ReshardingTabletInfoPB resharding_tablet;
+    auto& merging_info = *resharding_tablet.mutable_merging_tablet_info();
+    merging_info.add_old_tablet_ids(child_a);
+    merging_info.add_old_tablet_ids(child_b);
+    merging_info.set_new_tablet_id(merged_tablet);
+
+    TxnInfoPB txn_info;
+    txn_info.set_txn_id(1);
+    txn_info.set_commit_time(1);
+    txn_info.set_gtid(1);
+
+    std::unordered_map<int64_t, TabletMetadataPtr> tablet_metadatas;
+    std::unordered_map<int64_t, TabletRangePB> tablet_ranges;
+    ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version, new_version,
+                                              txn_info, false, tablet_metadatas, tablet_ranges));
+
+    auto merged = tablet_metadatas.at(merged_tablet);
+    ASSERT_EQ(8, merged->sstable_meta().sstables_size());
+
+    // I1: signed-monotone non-decreasing max_rss_rowid across the merged metadata.
+    int64_t prev_max = std::numeric_limits<int64_t>::min();
+    for (const auto& sst : merged->sstable_meta().sstables()) {
+        const int64_t cur = static_cast<int64_t>(sst.max_rss_rowid());
+        EXPECT_LE(prev_max, cur);
+        prev_max = cur;
+    }
+
+    // Sort by max_rss_rowid produces the layout:
+    //   0: fx_high225  (FID-X, kept)
+    //   1: fa_high226  (FID-A, kept)
+    //   2: fb_high393  (FID-B, kept)
+    //   3: fc_high570  (FID-C, kept)
+    //   4: fd_high715  (FID-D, kept)
+    //   5: fx_high724  (FID-X re-encounter — fresh FID)
+    //   6: fx_high725  (continues fresh-FID run)
+    //   7: fx_high726  (continues fresh-FID run)
+    EXPECT_EQ("fx_high225.sst", merged->sstable_meta().sstables(0).filename());
+    EXPECT_EQ("fa_high226.sst", merged->sstable_meta().sstables(1).filename());
+    EXPECT_EQ("fb_high393.sst", merged->sstable_meta().sstables(2).filename());
+    EXPECT_EQ("fc_high570.sst", merged->sstable_meta().sstables(3).filename());
+    EXPECT_EQ("fd_high715.sst", merged->sstable_meta().sstables(4).filename());
+    EXPECT_EQ("fx_high724.sst", merged->sstable_meta().sstables(5).filename());
+    EXPECT_EQ("fx_high725.sst", merged->sstable_meta().sstables(6).filename());
+    EXPECT_EQ("fx_high726.sst", merged->sstable_meta().sstables(7).filename());
+
+    // I2: every output fileset_id appears in exactly one contiguous run.
+    std::map<std::pair<int64_t, int64_t>, std::vector<int>> fid_to_positions;
+    for (int i = 0; i < merged->sstable_meta().sstables_size(); ++i) {
+        const auto& f = merged->sstable_meta().sstables(i).fileset_id();
+        fid_to_positions[{f.hi(), f.lo()}].push_back(i);
+    }
+    for (const auto& [fid, positions] : fid_to_positions) {
+        for (size_t k = 1; k < positions.size(); ++k) {
+            EXPECT_EQ(positions[k - 1] + 1, positions[k])
+                    << "fileset_id non-contiguous in merged metadata — Bug F regression";
+        }
+    }
+
+    // The early FID-X (pos 0) keeps its original id; the late re-encounter run
+    // (pos 5..7) must have been re-assigned to a fresh id distinct from FID-X
+    // and from any of the foreign FIDs.
+    auto fid_pair = [](const PUniqueId& f) { return std::make_pair(f.hi(), f.lo()); };
+    const auto pos0_fid = fid_pair(merged->sstable_meta().sstables(0).fileset_id());
+    const auto pos5_fid = fid_pair(merged->sstable_meta().sstables(5).fileset_id());
+    EXPECT_EQ(std::make_pair(fid_x.hi(), fid_x.lo()), pos0_fid);
+    EXPECT_NE(pos0_fid, pos5_fid) << "non-contiguous re-encounter must be reassigned";
+    EXPECT_NE(std::make_pair(fid_a.hi(), fid_a.lo()), pos5_fid);
+    EXPECT_NE(std::make_pair(fid_b.hi(), fid_b.lo()), pos5_fid);
+    EXPECT_NE(std::make_pair(fid_c.hi(), fid_c.lo()), pos5_fid);
+    EXPECT_NE(std::make_pair(fid_d.hi(), fid_d.lo()), pos5_fid);
+    EXPECT_EQ(pos5_fid, fid_pair(merged->sstable_meta().sstables(6).fileset_id()));
+    EXPECT_EQ(pos5_fid, fid_pair(merged->sstable_meta().sstables(7).fileset_id()));
 }
 
 // Two PK parents (not cloud-native, so flush_parent_for_merge is a pass-through)

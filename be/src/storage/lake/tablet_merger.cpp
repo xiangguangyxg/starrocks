@@ -26,6 +26,7 @@
 
 #include "base/hash/crc32c.h"
 #include "base/testutil/sync_point.h"
+#include "base/uid_util.h"
 #include "column/column_helper.h"
 #include "common/config_rowset_fwd.h"
 #include "fs/fs_factory.h"
@@ -1553,76 +1554,96 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
         }
     }
 
-    // The merge above appends sstables in source-child iteration order. The post-projection
-    // max_rss_rowid is what LakePersistentIndex::commit() and the size-tiered compaction
-    // strategy use to enforce the index-wide ordering invariant. If different children
-    // contributed sstables whose projected (rssid<<32|rowid) values interleave — for
-    // example, when a tombstone-bearing delete-only sstable in one child has its low
-    // word saturated near UINT32_MAX and a freshly-written sstable in the next child
-    // has a smaller projected high word — the source-order output would carry the
-    // disorder forward and any later commit/compaction on the merged tablet would
-    // refuse to publish with "sstables are not ordered". Reorder defensively here so
-    // the merged metadata always satisfies the invariant.
+    // The merge above appends projected sstables in source-child iteration order.
+    // Two invariants must hold on the emitted sstable_meta:
+    //   (I1) Global signed-monotone non-decreasing max_rss_rowid. LakePersistentIndex::commit
+    //        (lake_persistent_index.cpp:907-911) fetches max_rss_rowid into an int64_t
+    //        and rejects last > cur with "sstables are not ordered". The signed
+    //        comparison matters when the encoded (rssid<<32|rowid) sets the high bit
+    //        (rssid >= 2^31 or memtable_max set to (rowset_id<<32|UINT32_MAX) per
+    //        persistent_index_memtable.cpp:110) — unsigned ordering would be the
+    //        reverse of signed against any low-rssid sibling.
+    //   (I2) Same fileset_id sstables are contiguous in metadata order.
+    //        LakePersistentIndex::init (lake_persistent_index.cpp:131-145) groups
+    //        sstables into PersistentIndexSstableFileset by consecutive equal
+    //        fileset_id. lake_persistent_index_size_tiered_compaction_strategy.cpp:83-87
+    //        rejects non-contiguous reuse with "inconsistent fileset_id in sstables",
+    //        and apply_opcompaction's contiguous-range find_if
+    //        (lake_persistent_index.cpp:865-885) erases the wrong span otherwise.
     //
-    // Constraint: a single naive sort by max_rss_rowid alone breaks a separate invariant
-    // that LakePersistentIndex::init() and apply_opcompaction rely on — sstables sharing
-    // the same fileset_id must be contiguous in metadata order. Same fileset_id sstables
-    // can span a wide max_rss_rowid range (a fileset accretes via append() across
-    // multiple memtable flushes, persistent_index_sstable_fileset.cpp:96), and other
-    // fileset_ids' sstables can fall within that range. A flat sort by max_rss_rowid
-    // would interleave them, splitting one logical fileset into multiple physical
-    // filesets in init()'s grouping (which keys on adjacent fileset_id) and confusing
-    // apply_opcompaction's contiguous-range find_if (lake_persistent_index.cpp:838).
+    // Source of conflict between I1 and I2: PersistentIndexSstableFileset::append()
+    // (persistent_index_sstable_fileset.cpp:96-115) lets a freshly-flushed sstable
+    // inherit an existing fileset's _fileset_id whenever the new sstable's key range
+    // strictly extends the existing range. In a multi-cycle SPLIT/MERGE flow,
+    // flush_pk_memtable on each merge context can add a per-child sstable that
+    // inherits the same source FID-X from a long-lived shared sstable. After
+    // projection these per-child flushes spread across a wide max_rss_rowid range
+    // intermixed with other-FID compaction outputs, so a single sort by max_rss_rowid
+    // necessarily produces multiple non-contiguous runs of FID-X.
     //
-    // Approach: bucket source-order entries into contiguous-fileset_id blocks, sort
-    // blocks by their first element's max_rss_rowid, and emit. This:
-    //   * Keeps same-fileset_id sstables together (init / apply_opcompaction invariant).
-    //   * Within a block, preserves source order — already monotonic in max_rss_rowid
-    //     per source child since the projection paths preserve relative order
-    //     (rssid_offset path adds a constant; shared_rssid path collapses to a single
-    //     mapped_rssid with low word in range order).
-    //   * Across blocks, orders by first-element max_rss_rowid — the sort key the flat
-    //     sort would have used. Cross-block monotonicity matches the original PR's
-    //     intent for cross-source ordering.
-    //
-    // Compare as `int64_t` rather than `uint64_t` to match the downstream check:
-    // LakePersistentIndex::commit() (lake_persistent_index.cpp:880-881) fetches
-    // max_rss_rowid into an `int64_t` and does a signed `>` comparison. When the
-    // encoded (rssid<<32|rowid) sets the high bit — e.g. an ingest_sst entry with
-    // rssid >= 2^31, or a delete-only sstable whose memtable max_rss_rowid was set to
-    // (rowset_id<<32|UINT32_MAX) (persistent_index_memtable.cpp:110, 131) — unsigned
-    // ordering is the reverse of signed ordering against any low-rssid sibling.
-    // Sstables without an explicit fileset_id are not part of any logical fileset
-    // group (they predate fileset_id, or are test fixtures). Treat each as its own
-    // singleton block so block-sort orders them by max_rss_rowid like the original
-    // flat sort would. When both sides have a fileset_id, only consider them in the
-    // same block if the ids match.
-    auto same_block_as_predecessor = [](const PersistentIndexSstablePB& prev, const PersistentIndexSstablePB& cur) {
-        if (!prev.has_fileset_id() || !cur.has_fileset_id()) return false;
-        return prev.fileset_id().hi() == cur.fileset_id().hi() && prev.fileset_id().lo() == cur.fileset_id().lo();
-    };
-
-    struct SstableBlock {
-        std::vector<PersistentIndexSstablePB> sstables;
-        int64_t sort_key = 0;
-    };
-    std::vector<SstableBlock> blocks;
-    blocks.reserve(dest->size());
+    // Long-term resolution: stable_sort by signed max_rss_rowid (satisfies I1), then
+    // walk the sorted output and detect when a fileset_id reappears after at least
+    // one other-FID sstable has closed its earlier run. Any such later run cannot
+    // share a logical fileset with the earlier one — there is at least one foreign
+    // sstable physically between them in metadata, so init() / pick_compaction_candidates
+    // / apply_opcompaction would have to treat them as separate filesets anyway.
+    // Assign a fresh fileset_id (UniqueId::gen_uid) to each later run so I2 is
+    // satisfied without sacrificing I1. Sstables with no fileset_id remain
+    // singletons and close any open run; they are not grouped with anything.
+    std::vector<PersistentIndexSstablePB> sorted;
+    sorted.reserve(dest->size());
     for (const auto& sst : *dest) {
-        if (blocks.empty() || !same_block_as_predecessor(blocks.back().sstables.back(), sst)) {
-            blocks.emplace_back();
-            blocks.back().sort_key = static_cast<int64_t>(sst.max_rss_rowid());
-        }
-        blocks.back().sstables.push_back(sst);
+        sorted.emplace_back(sst);
     }
-    std::stable_sort(blocks.begin(), blocks.end(),
-                     [](const SstableBlock& a, const SstableBlock& b) { return a.sort_key < b.sort_key; });
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](const PersistentIndexSstablePB& a, const PersistentIndexSstablePB& b) {
+                         return static_cast<int64_t>(a.max_rss_rowid()) < static_cast<int64_t>(b.max_rss_rowid());
+                     });
+
+    std::unordered_set<UniqueId> closed_orig_fids;
+    UniqueId current_run_orig;
+    UniqueId current_run_emitted;
+    bool has_run = false;
+    for (auto& sst : sorted) {
+        if (!sst.has_fileset_id()) {
+            // No fileset_id (legacy / standalone): cannot be grouped. Close any
+            // open run so a same-FID sstable after this one will be treated as
+            // a non-contiguous reuse.
+            if (has_run) {
+                closed_orig_fids.insert(current_run_orig);
+                has_run = false;
+            }
+            continue;
+        }
+        UniqueId orig(sst.fileset_id());
+        if (has_run && orig == current_run_orig) {
+            // Continuation of the current run: emit with this run's FID
+            // (which may be the original or a freshly-assigned one).
+            sst.mutable_fileset_id()->CopyFrom(current_run_emitted.to_proto());
+            continue;
+        }
+        // Run boundary.
+        if (has_run) {
+            closed_orig_fids.insert(current_run_orig);
+        }
+        UniqueId emitted;
+        if (closed_orig_fids.count(orig) > 0) {
+            // Re-encounter of a fileset_id whose earlier run was closed by an
+            // intervening other-FID sstable. Break the inheritance with a
+            // fresh FID so this run is its own logical fileset.
+            emitted = UniqueId::gen_uid();
+        } else {
+            emitted = orig;
+        }
+        sst.mutable_fileset_id()->CopyFrom(emitted.to_proto());
+        current_run_orig = orig;
+        current_run_emitted = emitted;
+        has_run = true;
+    }
 
     dest->Clear();
-    for (const auto& block : blocks) {
-        for (const auto& sst : block.sstables) {
-            *dest->Add() = sst;
-        }
+    for (auto& sst : sorted) {
+        *dest->Add() = std::move(sst);
     }
 
     return Status::OK();
