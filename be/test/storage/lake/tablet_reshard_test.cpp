@@ -8724,4 +8724,266 @@ TEST(SplitFamilyInferenceTest, mix_orphan_and_family) {
     EXPECT_EQ(0u, result.child_to_family[2]);
 }
 
+// =============================================================================
+// Fast-path v2 — RssidProjectionPlan build (commit 2)
+//
+// These tests exercise lake::detail::build_rssid_projection_plan directly.
+// The plan is "passive" in this commit (no caller wires it through
+// merge_rowsets / map_rssid yet); commit 4 will.
+// =============================================================================
+
+namespace {
+
+// Convenience helper: run inference + plan build in one call, returning the
+// plan. Used by all RssidProjectionPlanTest tests that don't care about the
+// inferred families themselves.
+lake::detail::RssidProjectionPlan build_plan_for(SplitFamilyTestBuilder& builder) {
+    auto inputs = builder.snapshot();
+    auto families_or = lake::detail::infer_split_families(inputs);
+    CHECK_OK(families_or.status());
+    auto plan_or = lake::detail::build_rssid_projection_plan(inputs, *families_or);
+    CHECK_OK(plan_or.status());
+    return std::move(*plan_or);
+}
+
+} // namespace
+
+// Empty input → empty plan, no families, no occupied entries.
+TEST(RssidProjectionPlanTest, empty_input) {
+    SplitFamilyTestBuilder builder;
+    auto plan = build_plan_for(builder);
+    EXPECT_TRUE(plan.explicit_rssid_map.empty());
+    EXPECT_TRUE(plan.family_legacy_sstable_offset.empty());
+    EXPECT_TRUE(plan.occupied_rssids.empty());
+    EXPECT_TRUE(plan.unsafe_families.empty());
+}
+
+// Two-child family with a shared-ancestor rowset, no collisions.
+// explicit_rssid_map records both rowset.id and segment positions.
+TEST(RssidProjectionPlanTest, family_canonical_projection_emitted) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/8);
+    // Shared rowset id=3 with two segments → segment_idx layout [0, 1].
+    // canonical_offset = 0 (canonical = ctx[0]).
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a", "seg_b"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a", "seg_b"});
+    auto plan = build_plan_for(builder);
+
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    ASSERT_EQ(1u, plan.family_legacy_sstable_offset.size());
+    EXPECT_EQ(0, plan.family_legacy_sstable_offset.at(0u));
+
+    // Both children's (3, 4) entries point to canonical-offset finals.
+    // (rs.id=3 → final 3; lifted segment 0 = 3+0=3, lifted segment 1 = 3+1=4 → finals 3, 4.)
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({0u, 3u}));
+    EXPECT_EQ(4u, plan.explicit_rssid_map.at({0u, 4u}));
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({1u, 3u}));
+    EXPECT_EQ(4u, plan.explicit_rssid_map.at({1u, 4u}));
+
+    // Occupancy: finals 3, 4 are claimed by the family.
+    ASSERT_EQ(2u, plan.occupied_rssids.size());
+    EXPECT_EQ(0u, plan.occupied_rssids.at(3u).family_id);
+    EXPECT_EQ(0u, plan.occupied_rssids.at(4u).family_id);
+}
+
+// Family canonical_offset != 0: the explicit map's finals shift by it,
+// and family_legacy_sstable_offset records it for the fast-path.
+TEST(RssidProjectionPlanTest, family_with_nonzero_canonical_offset) {
+    SplitFamilyTestBuilder builder;
+    // child 0 has rowsets so phase-1-style next_rowset_id pushes the
+    // canonical offset upward when child 1 is the canonical (per the
+    // SplitFamilyInferenceInput.rssid_offset). Here we pass canonical_offset=10
+    // directly via builder.add_empty_child. Tests don't run phase 1; they
+    // just feed the offset.
+    builder.add_empty_child(/*rssid_offset=*/10);
+    builder.add_empty_child(/*rssid_offset=*/15);
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    auto plan = build_plan_for(builder);
+
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    EXPECT_EQ(10, plan.family_legacy_sstable_offset.at(0u));
+    // rs.id=3 → final 3+10=13; segment 0 lifted=3 → final 13.
+    EXPECT_EQ(13u, plan.explicit_rssid_map.at({0u, 3u}));
+    EXPECT_EQ(13u, plan.explicit_rssid_map.at({1u, 3u}));
+}
+
+// Child-local (non-shared) rowset → does NOT enter explicit_rssid_map even
+// if its ctx is a family member. Goes through natural offset; occupancy
+// records it under the family_id of the ctx, but explicit_rssid_map stays
+// silent so commit 4's map_rssid will fall through to the natural-offset
+// path for it.
+TEST(RssidProjectionPlanTest, child_local_rowsets_not_in_explicit_map) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/8);
+    // Family edge via a shared sstable filename; rowsets diverge.
+    builder.add_legacy_shared_sstable(0, "shared.sst");
+    builder.add_legacy_shared_sstable(1, "shared.sst");
+    // Child-local rowset on ctx 1.
+    builder.add_child_local_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    auto plan = build_plan_for(builder);
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    EXPECT_EQ(0u, plan.explicit_rssid_map.count({1u, 3u}));
+}
+
+// Two physically-distinct rowsets want the same final rssid → both
+// involved families are marked unsafe.
+TEST(RssidProjectionPlanTest, cross_family_collision_marks_both_unsafe) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0); // family A canonical
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/0); // family B canonical
+    builder.add_empty_child(/*rssid_offset=*/0);
+    // Family A: ctx 0 + ctx 1 share a rowset that lands at final=5.
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/5, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/5, /*version=*/2, {"seg_a"});
+    // Family B: ctx 2 + ctx 3 share a DIFFERENT physical rowset that ALSO
+    // wants final=5 (same id, but seg_b vs seg_a → different physical key).
+    builder.add_shared_ancestor_rowset(2, /*rowset_id=*/5, /*version=*/3, {"seg_b"});
+    builder.add_shared_ancestor_rowset(3, /*rowset_id=*/5, /*version=*/3, {"seg_b"});
+    auto plan = build_plan_for(builder);
+    // Both families A and B claim final=5 with different physical keys →
+    // both marked unsafe; explicit_rssid_map drops them; family_legacy_
+    // sstable_offset stays empty.
+    EXPECT_EQ(2u, plan.unsafe_families.size());
+    EXPECT_TRUE(plan.unsafe_families.contains(0u));
+    EXPECT_TRUE(plan.unsafe_families.contains(1u));
+    EXPECT_TRUE(plan.explicit_rssid_map.empty());
+    EXPECT_TRUE(plan.family_legacy_sstable_offset.empty());
+}
+
+// Same physical rowset across family members deduplicates in occupied_rssids.
+// The family stays safe and the explicit_rssid_map records all member ctx
+// entries.
+TEST(RssidProjectionPlanTest, same_physical_dedup_is_safe) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/8);
+    builder.add_empty_child(/*rssid_offset=*/16);
+    for (uint32_t child_index : {0u, 1u, 2u}) {
+        builder.add_shared_ancestor_rowset(child_index, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    }
+    auto plan = build_plan_for(builder);
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    EXPECT_EQ(0, plan.family_legacy_sstable_offset.at(0u));
+    // All 3 children's (3, 3) entries point to canonical-offset final 3.
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({0u, 3u}));
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({1u, 3u}));
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({2u, 3u}));
+}
+
+// Sparse segment_idx layout ({0, 2}) is preserved by the projection. The
+// occupancy claims rssid 3 and 5 (= 3+0, 3+2), NOT rssid 4 (which would
+// belong to a hypothetical compacted-out segment_idx=1).
+TEST(RssidProjectionPlanTest, sparse_segment_idx_projection) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/8);
+    auto add_sparse_rowset = [&](uint32_t child_index) {
+        auto* rowset = builder.metadata_of(child_index)->add_rowsets();
+        rowset->set_id(3);
+        rowset->set_version(2);
+        rowset->add_segments("seg_0");
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(true);
+        rowset->add_segments("seg_2");
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(true);
+        rowset->add_segment_metas()->set_segment_idx(0);
+        rowset->add_segment_metas()->set_segment_idx(2);
+    };
+    add_sparse_rowset(0);
+    add_sparse_rowset(1);
+    auto plan = build_plan_for(builder);
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({0u, 3u})); // rs.id
+    EXPECT_EQ(3u, plan.explicit_rssid_map.at({0u, 3u})); // segment_idx=0 → lifted 3
+    EXPECT_EQ(5u, plan.explicit_rssid_map.at({0u, 5u})); // segment_idx=2 → lifted 5
+    // Final 4 was never claimed.
+    EXPECT_EQ(0u, plan.occupied_rssids.count(4u));
+    // Finals 3 and 5 are claimed.
+    EXPECT_EQ(1u, plan.occupied_rssids.count(3u));
+    EXPECT_EQ(1u, plan.occupied_rssids.count(5u));
+}
+
+// Orphan-vs-family collision: an orphan ctx's child-local rowset projects
+// (via natural offset) to the same final as a family's canonical
+// projection. The family is marked unsafe; the orphan stays untouched.
+TEST(RssidProjectionPlanTest, orphan_vs_family_collision_marks_family_unsafe) {
+    SplitFamilyTestBuilder builder;
+    // ctx 0 + ctx 1 form family A (via filename edge).
+    // ctx 2 is an orphan with a child-local rowset that lifts to 5
+    // through natural offset = 5 (rs.id 0 + offset 5).
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_legacy_shared_sstable(0, "shared.sst");
+    builder.add_legacy_shared_sstable(1, "shared.sst");
+    // Family A's shared-ancestor rowset id=5, canonical_offset=0, claims final 5.
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/5, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/5, /*version=*/2, {"seg_a"});
+    // Orphan ctx 2: a child-local rowset id=0 + offset 5 → final 5, with a
+    // DIFFERENT physical key (different segment filename).
+    builder.add_child_local_rowset(2, /*rowset_id=*/0, /*version=*/3, {"seg_b"});
+    auto plan = build_plan_for(builder);
+    // Family A marked unsafe; orphan family is kNoFamily so nothing else
+    // gets added to unsafe_families.
+    EXPECT_EQ(1u, plan.unsafe_families.size());
+    EXPECT_TRUE(plan.unsafe_families.contains(0u));
+    EXPECT_TRUE(plan.explicit_rssid_map.empty());
+    EXPECT_TRUE(plan.family_legacy_sstable_offset.empty());
+}
+
+// Boundary case: a shared-ancestor rowset with rowset.id() == UINT32_MAX
+// and any non-zero segment_idx would overflow uint32 if we naively added
+// id + segment_idx without checking. The plan must mark the family unsafe
+// so commit 4's map_rssid falls through to natural-offset / v1 path.
+TEST(RssidProjectionPlanTest, segment_rssid_overflow_marks_family_unsafe) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/0);
+    auto add_overflow_rowset = [&](uint32_t child_index) {
+        auto* rowset = builder.metadata_of(child_index)->add_rowsets();
+        rowset->set_id(std::numeric_limits<uint32_t>::max());
+        rowset->set_version(2);
+        rowset->add_segments("seg_0");
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(true);
+        rowset->add_segments("seg_1");
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(true);
+        rowset->add_segment_metas()->set_segment_idx(0); // lifted = UINT32_MAX, OK
+        rowset->add_segment_metas()->set_segment_idx(1); // lifted = UINT32_MAX + 1 → overflow
+    };
+    add_overflow_rowset(0);
+    add_overflow_rowset(1);
+    auto plan = build_plan_for(builder);
+    ASSERT_EQ(1u, plan.unsafe_families.size());
+    EXPECT_TRUE(plan.unsafe_families.contains(0u)) << "rowset.id()+segment_idx overflow must mark the family unsafe, "
+                                                      "not record a wrapped low rssid";
+    EXPECT_TRUE(plan.family_legacy_sstable_offset.empty());
+}
+
+// Delete-only and no-segments rowsets still claim rowset.id() in
+// occupied_rssids (they own the rsid as a watermark even with no segments).
+// Two delete-only rowsets at the same version with the same id are the
+// "same physical" → safe dedup; at different versions → collision.
+TEST(RssidProjectionPlanTest, delete_only_rowset_id_occupancy_dedup) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_legacy_shared_sstable(0, "shared.sst");
+    builder.add_legacy_shared_sstable(1, "shared.sst");
+    builder.add_delete_only_rowset(0, /*rowset_id=*/3, /*version=*/2);
+    builder.add_delete_only_rowset(1, /*rowset_id=*/3, /*version=*/2);
+    auto plan = build_plan_for(builder);
+    // Family A is safe (no collision; delete-only rowsets dedup at id 3).
+    EXPECT_TRUE(plan.unsafe_families.empty());
+    // Final 3 is claimed under family A. The delete-only path uses natural
+    // offset (canonical_offset == 0 here, so result is the same).
+    EXPECT_EQ(1u, plan.occupied_rssids.count(3u));
+}
+
 } // namespace starrocks

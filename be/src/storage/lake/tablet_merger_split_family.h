@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/statusor.h"
@@ -120,6 +123,81 @@ struct InferredSplitFamilies {
 // assigned in ascending canonical_child_index order; canonical_child_index
 // is always the smallest child_index in the family.
 StatusOr<InferredSplitFamilies> infer_split_families(const std::vector<SplitFamilyInferenceInput>& inputs);
+
+// Hash for the (child_index, source_rssid) key in
+// RssidProjectionPlan::explicit_rssid_map. Folds the two uint32 halves
+// into a single uint64 so the hash uses both fields independently.
+struct SourceRssidKeyHash {
+    size_t operator()(const std::pair<uint32_t, uint32_t>& key) const noexcept {
+        return std::hash<uint64_t>{}((static_cast<uint64_t>(key.first) << 32) | key.second);
+    }
+};
+
+// Concrete projection plan: for each (child_index, source_rssid) the plan
+// records the final rssid the merge will assign in the merged tablet's id
+// space. Consumed by ctx.map_rssid() (commit 4) and the v2 fast-path
+// (commit 5). For now, this commit only BUILDS the plan; no caller
+// consumes it.
+struct RssidProjectionPlan {
+    using SourceRssidKey = std::pair<uint32_t, uint32_t>; // (child_index, source_rssid)
+
+    // (child_index, source_rssid) → final_rssid for shared-ancestor rowsets
+    // in safe families. Populated for both the rowset.id() key (covers
+    // add_rowset's first map_rssid call and rowset-level metadata such as
+    // delvec keys) and every get_rssid(rowset, segment_position) key
+    // (covers data-entry remap with sparse segment_idx layouts).
+    std::unordered_map<SourceRssidKey, uint32_t, SourceRssidKeyHash> explicit_rssid_map;
+
+    // family_id → accumulated rssid_offset to write into emitted legacy
+    // sstable PBs by the v2 fast-path. Recorded only for safe families.
+    std::unordered_map<uint32_t, int64_t> family_legacy_sstable_offset;
+
+    // Occupancy table for collision detection during plan build. Each
+    // entry records which physical rowset claimed a given final rssid AND
+    // which family that rowset belonged to (or kNoFamily if it came from
+    // an orphan ctx). The plan's consumers do NOT read this map at runtime;
+    // it is exposed for tests and diagnostics.
+    struct Occupancy {
+        RowsetPhysicalKey key;
+        uint32_t family_id; // == InferredSplitFamilies::kNoFamily for orphan
+    };
+    std::unordered_map<uint32_t, Occupancy> occupied_rssids;
+
+    // family_ids that hit a collision during plan build. The fast-path
+    // (commit 5) treats every sstable in an unsafe family as a fallback
+    // rebuild; merge_rowsets (commit 4) skips the explicit projection for
+    // member rowsets and lets v1 first-emitter natural assignment take over.
+    std::unordered_set<uint32_t> unsafe_families;
+};
+
+// Build the projection plan from the merge inputs and the inferred
+// families. Algorithm (per ~/workspace/doc/legacy_sstable_fastpath_v2.md
+// §"build_rssid_projection_plan"):
+//
+//   Step 1: For every (ctx, rowset, key_position) — where key_position is
+//           rowset.id() OR each get_rssid(rowset, segment_position):
+//             offset = (rowset is shared-ancestor in a family)
+//                       ? family.canonical_rssid_offset
+//                       : ctx.rssid_offset
+//             record_occupancy(key_position + offset, RowsetPhysicalKey(rowset), family_id)
+//
+//           record_occupancy compares against any prior claim on the same
+//           final rssid:
+//             - empty           → claim it
+//             - same physical   → safe dedup, no-op
+//             - different       → mark BOTH involved families unsafe (the
+//                                 current family and the prior occupant's
+//                                 family, if any)
+//
+//   Step 2: For every safe family, populate explicit_rssid_map for every
+//           shared-ancestor rowset's rowset.id() AND every segment position.
+//           Record family_legacy_sstable_offset[family_id] for the fast-
+//           path's PB emit step (commit 5).
+//
+// Boundary protection: if any final rssid arithmetic overflows uint32_t,
+// the affected family is marked unsafe.
+StatusOr<RssidProjectionPlan> build_rssid_projection_plan(const std::vector<SplitFamilyInferenceInput>& inputs,
+                                                          const InferredSplitFamilies& families);
 
 } // namespace detail
 
