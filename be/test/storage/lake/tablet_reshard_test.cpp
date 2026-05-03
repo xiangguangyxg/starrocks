@@ -6525,6 +6525,123 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_range_
     EXPECT_TRUE(out_sst.has_fileset_id()) << "rebuild always assigns a fresh fileset_id";
 }
 
+// Regression for fast-path v2 commit 3 (per-child orphan scoping): two
+// children that family inference classifies as kNoFamily — their legacy
+// shared sstables have distinct filenames (no filename edge) and their
+// rowsets are child-local (shared_segments=false → not shared-ancestor,
+// no rowset edge). Both children's source rssid space overlaps at
+// rssid=1.
+//
+// Without per-child orphan scoping, the single shared orphan map's
+// first-emitter rule lets ctx_a's mapping {1 → 1} survive into ctx_b's
+// rebuild lookup. ctx_b's entries would then translate to rssid=1
+// (ctx_a's rowset) instead of rssid=2 (ctx_b's rowset, post-Phase-1
+// id space lift) — silent PK corruption.
+//
+// With per-child orphan scoping (orphan_by_child), ctx_b's rebuild
+// consumes orphan_by_child[1] which contains only ctx_b.map_rssid(1) = 2.
+// The rebuilt sstable's max_rss_rowid (projected via watermark map)
+// reflects this isolation directly, so the test asserts on the emitted
+// PB's high word.
+TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_orphan_per_child_lookup_isolation) {
+    const int64_t base_version = 1;
+    const int64_t new_version = 2;
+    const int64_t child_a = next_id();
+    const int64_t child_b = next_id();
+    const int64_t merged_tablet = next_id();
+
+    prepare_tablet_dirs(child_a);
+    prepare_tablet_dirs(child_b);
+    prepare_tablet_dirs(merged_tablet);
+
+    const std::string legacy_a_filename = "orphan_legacy_a.sst";
+    const std::string legacy_b_filename = "orphan_legacy_b.sst";
+    const auto legacy_a_path = _tablet_manager->sst_location(child_a, legacy_a_filename);
+    const auto legacy_b_path = _tablet_manager->sst_location(child_b, legacy_b_filename);
+    const uint64_t legacy_a_filesize = write_legacy_pk_sstable(legacy_a_path, {{"ka", /*rssid=*/1, /*rowid=*/0}});
+    const uint64_t legacy_b_filesize = write_legacy_pk_sstable(legacy_b_path, {{"kb", /*rssid=*/1, /*rowid=*/0}});
+
+    auto make_child = [&](int64_t tablet_id, const std::string& seg_name, const std::string& legacy_filename,
+                          uint64_t legacy_filesize) {
+        auto meta = std::make_shared<TabletMetadataPB>();
+        meta->set_id(tablet_id);
+        meta->set_version(base_version);
+        meta->set_next_rowset_id(2);
+        set_primary_key_schema(meta.get(), 1001);
+        // Child-local rowset (shared_segments=false): not a shared-ancestor,
+        // so the rowset edge in family inference does not fire across
+        // children.
+        auto* rowset = meta->add_rowsets();
+        rowset->set_id(1);
+        rowset->set_version(1);
+        rowset->set_num_rows(10);
+        rowset->set_data_size(100);
+        rowset->add_segments(seg_name);
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(false);
+        // Legacy ancestor-inherited sstable. Distinct filenames across
+        // children → filename edge does not fire either, so both ctxs
+        // remain kNoFamily.
+        auto* sst = meta->mutable_sstable_meta()->add_sstables();
+        sst->set_filename(legacy_filename);
+        sst->set_filesize(legacy_filesize);
+        sst->set_shared(true);
+        sst->set_max_rss_rowid((static_cast<uint64_t>(1) << 32) | 0);
+        return meta;
+    };
+
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(
+            make_child(child_a, "a_local_seg.dat", legacy_a_filename, legacy_a_filesize)));
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(
+            make_child(child_b, "b_local_seg.dat", legacy_b_filename, legacy_b_filesize)));
+
+    ReshardingTabletInfoPB resharding_tablet;
+    auto& merging_info = *resharding_tablet.mutable_merging_tablet_info();
+    merging_info.add_old_tablet_ids(child_a);
+    merging_info.add_old_tablet_ids(child_b);
+    merging_info.set_new_tablet_id(merged_tablet);
+
+    TxnInfoPB txn_info;
+    txn_info.set_txn_id(7);
+    std::unordered_map<int64_t, TabletMetadataPtr> tablet_metadatas;
+    std::unordered_map<int64_t, TabletRangePB> tablet_ranges;
+    ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version, new_version,
+                                              txn_info, false, tablet_metadatas, tablet_ranges));
+
+    auto merged = tablet_metadatas.at(merged_tablet);
+    // Two child-local rowsets, no dedup expected.
+    ASSERT_EQ(2, merged->rowsets_size());
+    ASSERT_EQ(2, merged->sstable_meta().sstables_size());
+    const auto& sstables = merged->sstable_meta().sstables();
+
+    // ctx_a: canonical_offset = 0, fast-path succeeds → emit byte-identical
+    // to source PB (keeps original filename, max_rss_rowid.high = 1).
+    int fastpath_idx = -1;
+    int rebuild_idx = -1;
+    for (int i = 0; i < sstables.size(); ++i) {
+        if (sstables.Get(i).filename() == legacy_a_filename) {
+            fastpath_idx = i;
+        } else {
+            rebuild_idx = i;
+        }
+    }
+    ASSERT_NE(-1, fastpath_idx) << "ctx_a's legacy sstable should be fast-pathed (canonical_offset=0)";
+    ASSERT_NE(-1, rebuild_idx) << "ctx_b's legacy sstable should be rebuilt (canonical_offset!=0)";
+
+    EXPECT_EQ(static_cast<uint64_t>(1) << 32, sstables.Get(fastpath_idx).max_rss_rowid())
+            << "ctx_a fast-path output should be byte-identical to source";
+
+    // The pollution-bug regression assertion: with a SHARED orphan map,
+    // ctx_a populates {rssid=1 → final=1} first; ctx_b's lookup hits that
+    // stale entry and the rebuild emits max_rss_rowid.high = 1. Per-child
+    // orphan scoping gives ctx_b its own map containing {1 → 2} (= ctx_b's
+    // rssid_offset 1 + source rssid 1).
+    EXPECT_EQ(static_cast<uint64_t>(2) << 32, sstables.Get(rebuild_idx).max_rss_rowid())
+            << "ctx_b's rebuild must consult orphan_by_child[1], not a polluted shared orphan map";
+    EXPECT_FALSE(sstables.Get(rebuild_idx).shared()) << "rebuild emits non-shared";
+    EXPECT_TRUE(sstables.Get(rebuild_idx).has_fileset_id()) << "rebuild assigns a fresh fileset_id";
+}
+
 // TODO(round-3 follow-up): test_tablet_merging_legacy_sstable_rebuild_filters_outside_tablet_range
 // This test would set up real INT-typed PK columns + tablet ranges with
 // PrimaryKeyEncoder-encoded sstable keys to verify the rebuild's tablet-range

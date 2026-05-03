@@ -40,6 +40,7 @@
 #include "storage/lake/meta_file.h"
 #include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/lake/tablet_merger_split_family.h"
 #include "storage/lake/tablet_range_helper.h"
 #include "storage/lake/tablet_reshard_helper.h"
 #include "storage/lake/update_manager.h"
@@ -1519,31 +1520,155 @@ Status merge_delvecs(TabletManager* tablet_manager, const std::vector<TabletMerg
 // max_rss_rowid.high to the current rowset id at flush time, which can be a
 // delete-only rowset id with no segments. Must NOT be used for data-entry
 // remap.
+// Per-family + per-orphan-child layout for the legacy rssid lookup
+// tables. v2 commit 3: previously a single global pair of maps covered
+// every ctx, which silently mishandled multi-family merges with
+// overlapping source rssids (cross-family pollution: family B's lookup
+// of lifted=5 would return family A's mapping if A landed in the global
+// map first). The same pollution shape exists between orphan
+// (kNoFamily) ctxs, since each orphan child has its own independent
+// child-local id space. The new layout scopes one PerFamilyMaps per
+// inferred family AND one PerFamilyMaps per orphan child_index, so
+// unrelated lookups can never collide.
+//
+// In single-ctx / single-family / single-orphan scenarios — every
+// existing PR #72219 + v1 test — the layout degenerates to a single
+// scoped map (the family's, or that one orphan child's) populated with
+// all the same entries the v1 global layout produced. The "behavior
+// preserving" claim of the v2 plan (commit 3) holds modulo the
+// cross-scope pollution fix that is, by itself, an improvement.
+//
+// Each PerFamilyMaps half follows the same first-emitter-wins rule as v1:
+//   data_rssid_map      — keyed by per-segment lifted rssid via
+//                         get_rssid(rs, seg_pos). Sparse-aware, excludes
+//                         delete-only rowsets, used by data-entry remap.
+//   watermark_rssid_map — superset that ALSO records rs.id() for
+//                         delete-only rowsets. Used only for projecting
+//                         src_pb.max_rss_rowid; must NOT be used for
+//                         data-entry remap (per-id ghost would slip
+//                         through).
 struct LegacyRssidLookupMaps {
-    std::unordered_map<uint32_t, uint32_t> data_rssid_map;
-    std::unordered_map<uint32_t, uint32_t> watermark_rssid_map;
+    struct PerFamilyMaps {
+        std::unordered_map<uint32_t, uint32_t> data_rssid_map;
+        std::unordered_map<uint32_t, uint32_t> watermark_rssid_map;
+    };
+
+    // family_id → maps populated from that family's member ctxs only.
+    std::unordered_map<uint32_t, PerFamilyMaps> per_family;
+    // child_index → maps populated from THAT specific orphan ctx only.
+    // Each orphan ctx (kNoFamily) gets its own scoped entry so two
+    // unrelated orphan children with overlapping source rssids do not
+    // pollute each other — orphan ctxs each have an independent
+    // child-local id space, so a global orphan map would be susceptible
+    // to the same first-emitter-wins pollution that the per-family
+    // structure was designed to prevent for family ctxs.
+    std::unordered_map<size_t, PerFamilyMaps> orphan_by_child;
 };
 
-StatusOr<LegacyRssidLookupMaps> build_legacy_rssid_lookup_maps(const std::vector<TabletMergeContext>& merge_contexts) {
+// Resolve the right PerFamilyMaps for an sstable whose canonical_ctx (=
+// dedup-winner) has the given (family_id, child_index). Family ctxs
+// share their family map; orphan ctxs (kNoFamily) each get their own
+// child-scoped map so unrelated orphan children with overlapping source
+// rssids stay isolated.
+//
+// On miss this returns Status::InternalError rather than an empty map.
+// build_legacy_rssid_lookup_maps pre-creates an entry for every family
+// and every orphan child_index, so a miss can only mean a programmer
+// bug upstream. Falling back to an empty map would silently make every
+// rebuild drop every entry (data_rssid_map empty → all entries dropped
+// → projected_pb empty → caller deletes the sstable from merged
+// metadata) — a programmer bug would manifest as PK data loss. Surface
+// it as a hard error instead so the merge fails loudly.
+StatusOr<const LegacyRssidLookupMaps::PerFamilyMaps*> lookup_maps_for_ctx(const LegacyRssidLookupMaps& maps,
+                                                                          uint32_t family_id, size_t child_index) {
+    if (family_id != detail::InferredSplitFamilies::kNoFamily) {
+        auto iter = maps.per_family.find(family_id);
+        if (iter == maps.per_family.end()) {
+            return Status::InternalError(
+                    fmt::format("LegacyRssidLookupMaps: missing per_family entry (family_id={}, child_index={})",
+                                family_id, child_index));
+        }
+        return &iter->second;
+    }
+    auto orphan_iter = maps.orphan_by_child.find(child_index);
+    if (orphan_iter == maps.orphan_by_child.end()) {
+        return Status::InternalError(
+                fmt::format("LegacyRssidLookupMaps: missing orphan_by_child entry (child_index={})", child_index));
+    }
+    return &orphan_iter->second;
+}
+
+StatusOr<LegacyRssidLookupMaps> build_legacy_rssid_lookup_maps(const std::vector<TabletMergeContext>& merge_contexts,
+                                                               const detail::InferredSplitFamilies& families) {
+    if (families.child_to_family.size() != merge_contexts.size()) {
+        return Status::InvalidArgument(fmt::format(
+                "InferredSplitFamilies.child_to_family size {} != merge_contexts size {}; the families must be built "
+                "from the same contexts",
+                families.child_to_family.size(), merge_contexts.size()));
+    }
+    // Validate every child_to_family entry is either kNoFamily or a real
+    // family id so the population loop's find()-based lookups can rely on
+    // pre-created entries (and the lookup helper never silently skips a
+    // bad family id by treating it as orphan).
+    for (size_t child_index = 0; child_index < families.child_to_family.size(); ++child_index) {
+        const uint32_t family_id = families.child_to_family[child_index];
+        if (family_id != detail::InferredSplitFamilies::kNoFamily && family_id >= families.families.size()) {
+            return Status::InvalidArgument(
+                    fmt::format("InferredSplitFamilies.child_to_family[{}]={} is out of range (families.size={})",
+                                child_index, family_id, families.families.size()));
+        }
+    }
+
     LegacyRssidLookupMaps lookup_maps;
-    for (const auto& ctx : merge_contexts) {
+    // Pre-create one PerFamilyMaps per inferred family so consumers can
+    // assume the entry exists when they look up a non-orphan family.
+    lookup_maps.per_family.reserve(families.families.size());
+    for (uint32_t family_id = 0; family_id < families.families.size(); ++family_id) {
+        lookup_maps.per_family.emplace(family_id, LegacyRssidLookupMaps::PerFamilyMaps{});
+    }
+    // Pre-create one PerFamilyMaps per orphan child_index so consumers
+    // can assume the entry exists for every kNoFamily ctx.
+    for (size_t child_index = 0; child_index < merge_contexts.size(); ++child_index) {
+        if (families.child_to_family[child_index] == detail::InferredSplitFamilies::kNoFamily) {
+            lookup_maps.orphan_by_child.emplace(child_index, LegacyRssidLookupMaps::PerFamilyMaps{});
+        }
+    }
+
+    for (size_t child_index = 0; child_index < merge_contexts.size(); ++child_index) {
+        const auto& ctx = merge_contexts[child_index];
+        const uint32_t family_id = families.child_to_family[child_index];
+        // find()-based lookup with DCHECK avoids the silent insertion
+        // operator[] would do if the pre-create invariant ever broke.
+        LegacyRssidLookupMaps::PerFamilyMaps* target_ptr = nullptr;
+        if (family_id == detail::InferredSplitFamilies::kNoFamily) {
+            auto iter = lookup_maps.orphan_by_child.find(child_index);
+            DCHECK(iter != lookup_maps.orphan_by_child.end())
+                    << "orphan_by_child[" << child_index << "] not pre-created";
+            target_ptr = &iter->second;
+        } else {
+            auto iter = lookup_maps.per_family.find(family_id);
+            DCHECK(iter != lookup_maps.per_family.end()) << "per_family[" << family_id << "] not pre-created";
+            target_ptr = &iter->second;
+        }
+        auto& target = *target_ptr;
+
         for (const auto& rowset : ctx.metadata()->rowsets()) {
             // Watermark map: rowset id (catches delete-only rowsets).
-            if (lookup_maps.watermark_rssid_map.find(rowset.id()) == lookup_maps.watermark_rssid_map.end()) {
+            if (target.watermark_rssid_map.find(rowset.id()) == target.watermark_rssid_map.end()) {
                 ASSIGN_OR_RETURN(uint32_t final_rssid, ctx.map_rssid(rowset.id()));
-                lookup_maps.watermark_rssid_map.emplace(rowset.id(), final_rssid);
+                target.watermark_rssid_map.emplace(rowset.id(), final_rssid);
             }
             // Data + watermark maps: per-segment rssids.
             for (int segment_position = 0; segment_position < rowset.segments_size(); ++segment_position) {
                 uint32_t lifted_rssid = get_rssid(rowset, segment_position);
-                if (lookup_maps.data_rssid_map.find(lifted_rssid) == lookup_maps.data_rssid_map.end()) {
+                if (target.data_rssid_map.find(lifted_rssid) == target.data_rssid_map.end()) {
                     ASSIGN_OR_RETURN(uint32_t final_rssid, ctx.map_rssid(lifted_rssid));
-                    lookup_maps.data_rssid_map.emplace(lifted_rssid, final_rssid);
+                    target.data_rssid_map.emplace(lifted_rssid, final_rssid);
                     // Watermark map: only record if not already present from
                     // an earlier ctx's rowset.id(). The "first emitter wins" rule
                     // matches merge_rowsets (the canonical's id is the rowset
                     // it encountered first by version + child_index).
-                    lookup_maps.watermark_rssid_map.emplace(lifted_rssid, final_rssid);
+                    target.watermark_rssid_map.emplace(lifted_rssid, final_rssid);
                 }
             }
         }
@@ -1775,7 +1900,7 @@ StatusOr<bool> remap_legacy_entry_or_drop(IndexValuesWithVerPB* values_pb, int32
 StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexSstablePB& src_pb,
                                                           const TabletMergeContext& canonical_ctx,
                                                           const TabletMetadataPB& new_metadata,
-                                                          const LegacyRssidLookupMaps& rssid_lookup_maps,
+                                                          const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps,
                                                           PersistentIndexSstablePB* out_pb) {
     constexpr uint32_t kFastPathMaxRssidSpan = 8192;
 
@@ -1892,7 +2017,8 @@ StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexS
 Status rebuild_legacy_shared_sstable(TabletManager* tablet_manager, int64_t merged_tablet_id,
                                      const PersistentIndexSstablePB& src_pb, const TabletMetadataPtr& src_metadata,
                                      const TabletMetadataPB& new_metadata,
-                                     const LegacyRssidLookupMaps& rssid_lookup_maps, PersistentIndexSstablePB* out_pb) {
+                                     const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps,
+                                     PersistentIndexSstablePB* out_pb) {
     out_pb->Clear();
     RETURN_IF_ERROR(validate_legacy_shared_sstable_form(src_pb));
 
@@ -2033,7 +2159,7 @@ Status emit_legacy_shared_sstable_via_fastpath_or_rebuild(TabletManager* tablet_
                                                           const TabletMergeContext& canonical_ctx,
                                                           const TabletMetadataPtr& src_metadata,
                                                           const TabletMetadataPB& new_metadata,
-                                                          const LegacyRssidLookupMaps& rssid_lookup_maps,
+                                                          const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps,
                                                           PersistentIndexSstablePB* out_pb) {
     ASSIGN_OR_RETURN(bool fastpath_succeeded, try_fastpath_project_legacy_shared_sstable(
                                                       src_pb, canonical_ctx, new_metadata, rssid_lookup_maps, out_pb));
@@ -2216,13 +2342,25 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
     // reuse them for both the fast-path and the rebuild fallback.
     bool rssid_lookup_maps_initialized = false;
     LegacyRssidLookupMaps rssid_lookup_maps;
+    detail::InferredSplitFamilies inferred_families;
     auto ensure_rssid_lookup_maps = [&]() -> Status {
         if (rssid_lookup_maps_initialized) return Status::OK();
-        ASSIGN_OR_RETURN(rssid_lookup_maps, build_legacy_rssid_lookup_maps(merge_contexts));
+        // Family inference and lookup-map population must consume the same
+        // merge_contexts snapshot so per-ctx child_index → family_id mapping
+        // remains in lockstep with per-ctx contributions to the per-family
+        // PerFamilyMaps.
+        std::vector<detail::SplitFamilyInferenceInput> inference_inputs;
+        inference_inputs.reserve(merge_contexts.size());
+        for (const auto& ctx : merge_contexts) {
+            inference_inputs.push_back({ctx.metadata(), ctx.rssid_offset()});
+        }
+        ASSIGN_OR_RETURN(inferred_families, detail::infer_split_families(inference_inputs));
+        ASSIGN_OR_RETURN(rssid_lookup_maps, build_legacy_rssid_lookup_maps(merge_contexts, inferred_families));
         rssid_lookup_maps_initialized = true;
         return Status::OK();
     };
-    for (auto& ctx : merge_contexts) {
+    for (size_t child_index = 0; child_index < merge_contexts.size(); ++child_index) {
+        auto& ctx = merge_contexts[child_index];
         // Flush the tablet's PK-index memtable into sstables so that the
         // inherited sstable_meta covers all live data of its rowsets. Covers
         // the case where a child accumulated post-split DML that never
@@ -2259,11 +2397,17 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
             if (sst.shared() && !sst.has_shared_rssid()) {
                 // The current ctx is the dedup-winner by construction
                 // (shared_dedup_sources only emplaces on first sighting),
-                // so it serves as the canonical_ctx for this sstable.
+                // so it serves as the canonical_ctx for this sstable. Its
+                // family_id (orphan-aware) selects the PerFamilyMaps used
+                // for both the fast-path's source/destination rssid checks
+                // and the rebuild path's per-entry remap.
                 RETURN_IF_ERROR(ensure_rssid_lookup_maps());
+                const uint32_t family_id = inferred_families.child_to_family[child_index];
+                ASSIGN_OR_RETURN(const auto* family_maps_ptr,
+                                 lookup_maps_for_ctx(rssid_lookup_maps, family_id, child_index));
                 PersistentIndexSstablePB projected_pb;
                 RETURN_IF_ERROR(emit_legacy_shared_sstable_via_fastpath_or_rebuild(
-                        tablet_manager, new_metadata->id(), sst, ctx, ctx.metadata(), *new_metadata, rssid_lookup_maps,
+                        tablet_manager, new_metadata->id(), sst, ctx, ctx.metadata(), *new_metadata, *family_maps_ptr,
                         &projected_pb));
                 // Empty projected_pb → fast-path was unsafe AND rebuild
                 // dropped every entry; the shared_dedup_sources entry keeps
