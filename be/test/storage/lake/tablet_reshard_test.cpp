@@ -6002,6 +6002,104 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_rebuild_tombsto
     EXPECT_EQ(5u, out_high) << "tombstone-only file must inherit projected source watermark, not 0";
 }
 
+// Stacked-offset tombstone-only watermark.
+//
+// Convention: PersistentIndexSstablePB.max_rss_rowid.high is the EFFECTIVE
+// max rssid in the source child's id space (post-projection — already
+// includes any accumulated src_pb.rssid_offset). project_non_shared_legacy_
+// sstable + cross-sstable invariants in lake_persistent_index.cpp all read
+// max_rss_rowid as effective.
+//
+// The previous implementation of project_source_max_rss_rowid added
+// src_pb.rssid_offset() AGAIN to max_rss_rowid.high, which works for
+// fresh sstables (rssid_offset == 0) but double-shifts for any stacked-
+// offset src. Per-entry update_max_encoded_rss_rowid_from masked the
+// resulting watermark miss for non-tombstone files, but tombstone-only
+// files (no per-entry override) emitted max_rss_rowid.high == 0,
+// breaking the cross-sstable ordering invariant on subsequent merges.
+//
+// This test pins the fixed convention: a tombstone-only sstable carrying
+// a stacked rssid_offset still gets its source watermark mapped through
+// to the merged tablet's effective max — without the spurious second
+// shift.
+TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_rebuild_stacked_offset_tombstone_only_watermark) {
+    const int64_t base_version = 1;
+    const int64_t new_version = 2;
+    const int64_t child_a = next_id();
+    const int64_t child_b = next_id();
+    const int64_t merged_tablet = next_id();
+
+    prepare_tablet_dirs(child_a);
+    prepare_tablet_dirs(child_b);
+    prepare_tablet_dirs(merged_tablet);
+
+    // All entries are tombstones. Source sstable has rssid_offset = 3 (a
+    // prior projection had stacked it) and max_rss_rowid.high = 5 (= the
+    // effective max in source child's id space). Both children expose
+    // rowset id=5 alive on the shared sstable so the merged tablet's
+    // watermark map records key 5 → final 5.
+    const uint32_t kTombstoneSentinel = std::numeric_limits<uint32_t>::max();
+    const std::string legacy_filename = "stacked_tombstone_only.sst";
+    const auto legacy_path = _tablet_manager->sst_location(child_a, legacy_filename);
+    const uint64_t legacy_filesize =
+            write_legacy_pk_sstable(legacy_path, {{"k_dead_a", kTombstoneSentinel, kTombstoneSentinel},
+                                                  {"k_dead_b", kTombstoneSentinel, kTombstoneSentinel}});
+
+    auto make_child = [&](int64_t tablet_id) {
+        auto meta = std::make_shared<TabletMetadataPB>();
+        meta->set_id(tablet_id);
+        meta->set_version(base_version);
+        meta->set_next_rowset_id(6);
+        set_primary_key_schema(meta.get(), 1001);
+        auto* rowset = meta->add_rowsets();
+        rowset->set_id(5);
+        rowset->set_version(1);
+        rowset->set_num_rows(10);
+        rowset->set_data_size(100);
+        rowset->add_segments("shared_seg.dat");
+        rowset->add_segment_size(100);
+        rowset->add_shared_segments(true);
+        auto* sst = meta->mutable_sstable_meta()->add_sstables();
+        sst->set_filename(legacy_filename);
+        sst->set_filesize(legacy_filesize);
+        sst->set_shared(true);
+        sst->set_rssid_offset(3); // stacked: a prior projection accumulated 3.
+        // Effective max in source child's id space. 5 is also the merged
+        // tablet's watermark key — pre-fix code looked up watermark[5+3=8]
+        // and missed; post-fix looks up watermark[5] directly and hits.
+        sst->set_max_rss_rowid((static_cast<uint64_t>(5) << 32) | kTombstoneSentinel);
+        return meta;
+    };
+
+    auto meta_a = make_child(child_a);
+    auto meta_b = make_child(child_b);
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(meta_a));
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(meta_b));
+
+    ReshardingTabletInfoPB resharding_tablet;
+    auto& merging_info = *resharding_tablet.mutable_merging_tablet_info();
+    merging_info.add_old_tablet_ids(child_a);
+    merging_info.add_old_tablet_ids(child_b);
+    merging_info.set_new_tablet_id(merged_tablet);
+
+    TxnInfoPB txn_info;
+    txn_info.set_txn_id(1);
+    txn_info.set_commit_time(1);
+    txn_info.set_gtid(1);
+
+    std::unordered_map<int64_t, TabletMetadataPtr> tablet_metadatas;
+    std::unordered_map<int64_t, TabletRangePB> tablet_ranges;
+    ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version, new_version,
+                                              txn_info, false, tablet_metadatas, tablet_ranges));
+
+    auto merged = tablet_metadatas.at(merged_tablet);
+    ASSERT_EQ(1, merged->sstable_meta().sstables_size());
+    const auto& out_sst = merged->sstable_meta().sstables(0);
+    const uint32_t out_high = static_cast<uint32_t>(out_sst.max_rss_rowid() >> 32);
+    EXPECT_EQ(5u, out_high) << "stacked-offset tombstone-only file: source effective max 5 → merged final 5; "
+                               "double-shift bug would have produced 0 here";
+}
+
 // Round-3 (Codex high #2 follow-up): the watermark helper must resolve a
 // delete-only rowset id (segments_size==0) — memtable's flush watermark
 // embeds the live rowset id at flush time, which can be a delete-only

@@ -1601,16 +1601,29 @@ Status validate_legacy_shared_sstable_form(const PersistentIndexSstablePB& src_p
 // cannot be done (out-of-range lifted high, or watermark map miss). Lets the
 // rebuilt file inherit a sensible max even when it ends up tombstone-only or
 // when its source max points at a delete-only rowset.
+// Convention: PersistentIndexSstablePB.max_rss_rowid.high is the EFFECTIVE
+// (post-projection) max rssid in the SOURCE child's id space — i.e. it
+// already includes any accumulated src_pb.rssid_offset. Cross-sstable
+// invariants in lake_persistent_index.cpp (the I1 ordering check at
+// apply_opcompaction line 875-886, the _memtable seed at line 146-160,
+// the post-compaction validation at line 686-689) all read max_rss_rowid
+// as effective rssid, and project_non_shared_legacy_sstable already shifts
+// max_rss_rowid.high by ctx.rssid_offset to maintain that convention.
+//
+// Therefore the source rssid offset must NOT be added again here; doing
+// so would double-shift for any stacked-offset src (anything that has
+// gone through one round of project_non_shared). The lookup key is just
+// source_max_rssid_high directly — it is the source child's effective
+// max rssid, exactly the key shape watermark_rssid_map records.
 std::optional<uint64_t> project_source_max_rss_rowid(
-        const PersistentIndexSstablePB& src_pb, int32_t source_rssid_offset,
+        const PersistentIndexSstablePB& src_pb, int32_t /*source_rssid_offset*/,
         const std::unordered_map<uint32_t, uint32_t>& watermark_rssid_map) {
     const uint64_t source_max_rowid_low = src_pb.max_rss_rowid() & 0xffffffffULL;
     const int64_t source_max_rssid_high = static_cast<int64_t>(src_pb.max_rss_rowid() >> 32);
-    const int64_t lifted_max_rssid = source_max_rssid_high + source_rssid_offset;
-    if (lifted_max_rssid < 0 || lifted_max_rssid > std::numeric_limits<uint32_t>::max()) {
+    if (source_max_rssid_high < 0 || source_max_rssid_high > std::numeric_limits<uint32_t>::max()) {
         return std::nullopt;
     }
-    auto entry = watermark_rssid_map.find(static_cast<uint32_t>(lifted_max_rssid));
+    auto entry = watermark_rssid_map.find(static_cast<uint32_t>(source_max_rssid_high));
     if (entry == watermark_rssid_map.end()) {
         return std::nullopt;
     }
