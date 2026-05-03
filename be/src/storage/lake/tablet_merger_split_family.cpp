@@ -1,0 +1,202 @@
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "storage/lake/tablet_merger_split_family.h"
+
+#include <algorithm>
+#include <unordered_map>
+#include <utility>
+
+#include "storage/lake/meta_file.h"
+
+namespace starrocks::lake::detail {
+
+namespace {
+
+// Helper: fold one identifying field into the rolling hash. Uses Boost's
+// hash_combine-style mixer so the rolling hash distributes the fields
+// independently rather than xor-ing into trivial collisions.
+template <typename T>
+inline void fold_into_hash(size_t& hash, const T& value) {
+    hash ^= std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+}
+
+// Standard union-find with the smallest member always rising to the root.
+// This makes find(x) deterministically return the minimum child_index in
+// x's family, which is exactly what canonical_child_index needs.
+class UnionFind {
+public:
+    explicit UnionFind(uint32_t n) : _parent(n) {
+        for (uint32_t i = 0; i < n; ++i) _parent[i] = i;
+    }
+
+    uint32_t find(uint32_t x) {
+        while (_parent[x] != x) {
+            _parent[x] = _parent[_parent[x]]; // path compression
+            x = _parent[x];
+        }
+        return x;
+    }
+
+    void unite(uint32_t x, uint32_t y) {
+        const uint32_t root_x = find(x);
+        const uint32_t root_y = find(y);
+        if (root_x == root_y) return;
+        // The smaller root absorbs the larger root, so the canonical
+        // (smallest) child stays at the family's root after every union.
+        if (root_x < root_y) {
+            _parent[root_y] = root_x;
+        } else {
+            _parent[root_x] = root_y;
+        }
+    }
+
+private:
+    std::vector<uint32_t> _parent;
+};
+
+} // namespace
+
+size_t RowsetPhysicalKeyHash::operator()(const RowsetPhysicalKey& key) const noexcept {
+    size_t hash = std::hash<int64_t>{}(key.version);
+    for (const auto& segment : key.segments) {
+        fold_into_hash(hash, segment);
+    }
+    for (const auto offset : key.bundle_file_offsets) {
+        fold_into_hash(hash, offset);
+    }
+    for (const auto flag : key.shared_segments_flags) {
+        // std::hash<bool> exists but is trivial; cast to int8 first so
+        // false / true don't collide with adjacent integer fields.
+        fold_into_hash(hash, static_cast<int8_t>(flag));
+    }
+    for (const auto idx : key.segment_idx_layout) {
+        fold_into_hash(hash, idx);
+    }
+    return hash;
+}
+
+RowsetPhysicalKey make_rowset_physical_key(const RowsetMetadataPB& rowset_meta) {
+    RowsetPhysicalKey key;
+    key.version = rowset_meta.version();
+    key.segments.assign(rowset_meta.segments().begin(), rowset_meta.segments().end());
+    key.shared_segments_flags.assign(rowset_meta.shared_segments().begin(), rowset_meta.shared_segments().end());
+
+    // Normalize bundle_file_offsets and segment_idx_layout to ALWAYS have one
+    // entry per segment, falling back to documented defaults when the PB
+    // omits them. Without this, two physically-equivalent rowsets where one
+    // copy has the field populated (e.g., `bundle_file_offsets = [0, 0]`)
+    // and the other has it absent (`bundle_file_offsets = []`) would hash
+    // and compare unequal — a false-negative family inference that loses the
+    // canonical projection. PB defaults match production read semantics:
+    // bundle_file_offsets default to 0 per segment, and segment_idx falls
+    // back to positional index per get_segment_idx() in meta_file.cpp.
+    const int segments_count = rowset_meta.segments_size();
+    key.bundle_file_offsets.reserve(segments_count);
+    key.segment_idx_layout.reserve(segments_count);
+    for (int segment_pos = 0; segment_pos < segments_count; ++segment_pos) {
+        const int64_t bundle_offset =
+                segment_pos < rowset_meta.bundle_file_offsets_size() ? rowset_meta.bundle_file_offsets(segment_pos) : 0;
+        key.bundle_file_offsets.push_back(bundle_offset);
+        key.segment_idx_layout.push_back(static_cast<int32_t>(get_segment_idx(rowset_meta, segment_pos)));
+    }
+    return key;
+}
+
+bool is_shared_ancestor_rowset(const RowsetMetadataPB& rowset_meta) {
+    if (rowset_meta.segments_size() == 0) return false;
+    if (rowset_meta.shared_segments_size() != rowset_meta.segments_size()) return false;
+    for (int i = 0; i < rowset_meta.shared_segments_size(); ++i) {
+        if (!rowset_meta.shared_segments(i)) return false;
+    }
+    return true;
+}
+
+StatusOr<InferredSplitFamilies> infer_split_families(const std::vector<SplitFamilyInferenceInput>& inputs) {
+    InferredSplitFamilies result;
+    const auto child_count = static_cast<uint32_t>(inputs.size());
+    result.child_to_family.assign(child_count, InferredSplitFamilies::kNoFamily);
+    if (child_count == 0) {
+        return result;
+    }
+
+    UnionFind union_find(child_count);
+
+    // Edge (1): legacy `shared && !has_shared_rssid` sstable filename.
+    // Two children that reference the same legacy file must come from the
+    // same SPLIT family (the file is bytes-immutable; SPLIT marks shared
+    // copies but doesn't rewrite anything).
+    std::unordered_map<std::string, uint32_t> filename_to_first_child;
+    for (uint32_t child_index = 0; child_index < child_count; ++child_index) {
+        const auto& metadata = inputs[child_index].metadata;
+        if (metadata == nullptr || !metadata->has_sstable_meta()) continue;
+        for (const auto& sstable : metadata->sstable_meta().sstables()) {
+            if (!sstable.shared() || sstable.has_shared_rssid()) continue;
+            auto [iter, inserted] = filename_to_first_child.emplace(sstable.filename(), child_index);
+            if (!inserted) {
+                union_find.unite(iter->second, child_index);
+            }
+        }
+    }
+
+    // Edge (2): full physical identity of a shared-ancestor rowset. Both
+    // children must satisfy is_shared_ancestor_rowset() — delete-only and
+    // child-local rowsets are filtered out so two physically-matching but
+    // unrelated rowsets cannot create a false union.
+    std::unordered_map<RowsetPhysicalKey, uint32_t, RowsetPhysicalKeyHash> rowset_key_to_first_child;
+    for (uint32_t child_index = 0; child_index < child_count; ++child_index) {
+        const auto& metadata = inputs[child_index].metadata;
+        if (metadata == nullptr) continue;
+        for (const auto& rowset : metadata->rowsets()) {
+            if (!is_shared_ancestor_rowset(rowset)) continue;
+            auto key = make_rowset_physical_key(rowset);
+            auto [iter, inserted] = rowset_key_to_first_child.emplace(std::move(key), child_index);
+            if (!inserted) {
+                union_find.unite(iter->second, child_index);
+            }
+        }
+    }
+
+    // Materialize families. members_by_root[r] ends up holding every child
+    // whose union-find root is r. Because UnionFind always promotes the
+    // smaller index to the root, members_by_root[r] is non-empty only when
+    // r is the smallest member of its family — which is exactly the
+    // canonical child.
+    std::vector<std::vector<uint32_t>> members_by_root(child_count);
+    for (uint32_t child_index = 0; child_index < child_count; ++child_index) {
+        members_by_root[union_find.find(child_index)].push_back(child_index);
+    }
+    for (uint32_t root_child_index = 0; root_child_index < child_count; ++root_child_index) {
+        auto& members = members_by_root[root_child_index];
+        if (members.size() < 2) {
+            // size 0 → not a root (its members were absorbed into a smaller root).
+            // size 1 → standalone child with no edges; leave as kNoFamily.
+            continue;
+        }
+        InferredSplitFamilies::Family family;
+        family.member_child_indexes = std::move(members);
+        // member_child_indexes is already in ascending order because we
+        // pushed children in iteration order (child_index 0..N-1).
+        family.canonical_child_index = family.member_child_indexes.front();
+        family.canonical_rssid_offset = inputs[family.canonical_child_index].rssid_offset;
+        const auto family_id = static_cast<uint32_t>(result.families.size());
+        for (const auto member : family.member_child_indexes) {
+            result.child_to_family[member] = family_id;
+        }
+        result.families.push_back(std::move(family));
+    }
+    return result;
+}
+
+} // namespace starrocks::lake::detail

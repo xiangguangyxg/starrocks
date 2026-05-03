@@ -40,6 +40,7 @@
 #include "storage/lake/meta_file.h"
 #include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/lake/tablet_merger_split_family.h"
 #include "storage/lake/tablet_range_helper.h"
 #include "storage/lake/tablet_reshard_helper.h"
 #include "storage/lake/transactions.h"
@@ -8330,6 +8331,397 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_delete_predicate_dedup_unchang
     // Both predicate rowsets dedup'd to single one (unconditional skip path).
     ASSERT_EQ(1, merged->rowsets_size());
     EXPECT_TRUE(merged->rowsets(0).has_delete_predicate());
+}
+
+// =============================================================================
+// Fast-path v2 — split family inference (commit 1)
+//
+// These tests exercise lake::detail::infer_split_families directly, without
+// running an end-to-end merge. The helper is "passive" in this commit (no
+// caller wires it through merge_rowsets / map_rssid yet); commits 4-5 will.
+// =============================================================================
+
+namespace {
+
+// Lightweight fixture that builds mutable metadata + offsets, then snapshots
+// them as immutable SplitFamilyInferenceInput records when infer_split_
+// families is invoked. Splitting the mutable build phase from the const
+// input phase matches how production constructs TabletMetadataPtr (=
+// shared_ptr<const TabletMetadataPB>).
+struct SplitFamilyTestBuilder {
+    std::vector<std::pair<std::shared_ptr<TabletMetadataPB>, int64_t>> mutable_children;
+
+    uint32_t add_empty_child(int64_t rssid_offset) {
+        mutable_children.emplace_back(std::make_shared<TabletMetadataPB>(), rssid_offset);
+        return static_cast<uint32_t>(mutable_children.size() - 1);
+    }
+
+    // Add a legacy `shared && !has_shared_rssid` PK sstable (used by the
+    // filename edge).
+    void add_legacy_shared_sstable(uint32_t child_index, const std::string& filename) {
+        auto* sstable = mutable_children[child_index].first->mutable_sstable_meta()->add_sstables();
+        sstable->set_filename(filename);
+        sstable->set_filesize(1);
+        sstable->set_shared(true);
+        // !has_shared_rssid is the default — leave shared_rssid unset.
+    }
+
+    // Add a shared-ancestor rowset (segments_size > 0, all shared_segments
+    // true) with the given physical fingerprint. Used by the rowset-
+    // identity edge.
+    void add_shared_ancestor_rowset(uint32_t child_index, uint32_t rowset_id, int64_t version,
+                                    const std::vector<std::string>& segments) {
+        auto* rowset = mutable_children[child_index].first->add_rowsets();
+        rowset->set_id(rowset_id);
+        rowset->set_version(version);
+        rowset->set_num_rows(10);
+        rowset->set_data_size(100);
+        for (const auto& segment : segments) {
+            rowset->add_segments(segment);
+            rowset->add_segment_size(100);
+            rowset->add_shared_segments(true);
+            auto* segment_meta = rowset->add_segment_metas();
+            segment_meta->set_segment_idx(static_cast<uint32_t>(rowset->segment_metas_size() - 1));
+        }
+    }
+
+    // Add a child-local (NOT shared) rowset. The rowset-identity edge must
+    // ignore these even when the physical fingerprint matches a shared-
+    // ancestor on another child.
+    void add_child_local_rowset(uint32_t child_index, uint32_t rowset_id, int64_t version,
+                                const std::vector<std::string>& segments) {
+        auto* rowset = mutable_children[child_index].first->add_rowsets();
+        rowset->set_id(rowset_id);
+        rowset->set_version(version);
+        rowset->set_num_rows(10);
+        rowset->set_data_size(100);
+        for (const auto& segment : segments) {
+            rowset->add_segments(segment);
+            rowset->add_segment_size(100);
+            rowset->add_shared_segments(false);
+            auto* segment_meta = rowset->add_segment_metas();
+            segment_meta->set_segment_idx(static_cast<uint32_t>(rowset->segment_metas_size() - 1));
+        }
+    }
+
+    // Add a delete-only rowset (segments_size == 0). The rowset-identity
+    // edge must ignore these too.
+    void add_delete_only_rowset(uint32_t child_index, uint32_t rowset_id, int64_t version) {
+        auto* rowset = mutable_children[child_index].first->add_rowsets();
+        rowset->set_id(rowset_id);
+        rowset->set_version(version);
+        rowset->mutable_delete_predicate(); // mark as a delete predicate; no segments
+    }
+
+    std::vector<lake::detail::SplitFamilyInferenceInput> snapshot() const {
+        std::vector<lake::detail::SplitFamilyInferenceInput> inputs;
+        inputs.reserve(mutable_children.size());
+        for (const auto& [metadata, rssid_offset] : mutable_children) {
+            inputs.push_back({metadata, rssid_offset});
+        }
+        return inputs;
+    }
+
+    // Helper for tests that need to write directly into a child's metadata.
+    TabletMetadataPB* metadata_of(uint32_t child_index) { return mutable_children[child_index].first.get(); }
+};
+
+} // namespace
+
+// Empty input → empty result.
+TEST(SplitFamilyInferenceTest, empty_input) {
+    SplitFamilyTestBuilder builder;
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    EXPECT_TRUE(result.child_to_family.empty());
+    EXPECT_TRUE(result.families.empty());
+}
+
+// Single child with no edges → kNoFamily, no families produced.
+TEST(SplitFamilyInferenceTest, single_child_no_edges) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.child_to_family.size());
+    EXPECT_EQ(lake::detail::InferredSplitFamilies::kNoFamily, result.child_to_family[0]);
+    EXPECT_TRUE(result.families.empty());
+}
+
+// Two children share a legacy `shared && !has_shared_rssid` sstable → one
+// family, canonical = child 0.
+TEST(SplitFamilyInferenceTest, filename_edge_unions_two_children) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_legacy_shared_sstable(0, "shared.sst");
+    builder.add_legacy_shared_sstable(1, "shared.sst");
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    const auto& family = result.families.front();
+    EXPECT_EQ(0u, family.canonical_child_index);
+    EXPECT_EQ(0, family.canonical_rssid_offset);
+    EXPECT_THAT(family.member_child_indexes, ::testing::ElementsAre(0u, 1u));
+    EXPECT_EQ(0u, result.child_to_family[0]);
+    EXPECT_EQ(0u, result.child_to_family[1]);
+}
+
+// Two children share an exact-match shared-ancestor rowset → one family,
+// canonical = child 0.
+TEST(SplitFamilyInferenceTest, rowset_edge_unions_two_children) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a", "seg_b"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a", "seg_b"});
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_EQ(0u, result.families.front().canonical_child_index);
+    EXPECT_EQ(0, result.families.front().canonical_rssid_offset);
+}
+
+// Two children with rowsets that LOOK identical except for segment_idx
+// layout (one inherited contiguous {0,1}, the other has a sparse {0,2}
+// after middle compaction) — they are NOT physically identical and must
+// not be unioned.
+TEST(SplitFamilyInferenceTest, rowset_edge_segment_idx_layout_must_match) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    auto* rowset_a = builder.metadata_of(0)->add_rowsets();
+    rowset_a->set_id(3);
+    rowset_a->set_version(2);
+    rowset_a->add_segments("seg_a");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_segments("seg_b");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_segment_metas()->set_segment_idx(0);
+    rowset_a->add_segment_metas()->set_segment_idx(1);
+    auto* rowset_b = builder.metadata_of(1)->add_rowsets();
+    rowset_b->set_id(3);
+    rowset_b->set_version(2);
+    rowset_b->add_segments("seg_a");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    rowset_b->add_segments("seg_b");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    rowset_b->add_segment_metas()->set_segment_idx(0);
+    rowset_b->add_segment_metas()->set_segment_idx(2); // sparse!
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    EXPECT_TRUE(result.families.empty()) << "different segment_idx layouts must not union";
+    EXPECT_EQ(lake::detail::InferredSplitFamilies::kNoFamily, result.child_to_family[0]);
+    EXPECT_EQ(lake::detail::InferredSplitFamilies::kNoFamily, result.child_to_family[1]);
+}
+
+// Delete-only rowsets (segments_size == 0) must NOT participate in the
+// rowset-identity edge — two delete-only rowsets with empty vectors would
+// otherwise falsely match each other.
+TEST(SplitFamilyInferenceTest, delete_only_rowsets_excluded_from_edge) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_delete_only_rowset(0, /*rowset_id=*/3, /*version=*/2);
+    builder.add_delete_only_rowset(1, /*rowset_id=*/3, /*version=*/2);
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    EXPECT_TRUE(result.families.empty()) << "delete-only rowsets must not produce family edges";
+}
+
+// Child-local rowsets (shared_segments NOT all true) must not produce edges
+// even when the physical fingerprint matches.
+TEST(SplitFamilyInferenceTest, child_local_rowsets_excluded_from_edge) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_child_local_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    builder.add_child_local_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    EXPECT_TRUE(result.families.empty()) << "child-local rowsets must not produce family edges";
+}
+
+// Three children unioned via filename edge into one family. canonical is
+// the smallest member regardless of which two children matched first.
+TEST(SplitFamilyInferenceTest, three_children_one_family_via_filename) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_empty_child(/*rssid_offset=*/10);
+    builder.add_legacy_shared_sstable(0, "f.sst");
+    builder.add_legacy_shared_sstable(1, "f.sst");
+    builder.add_legacy_shared_sstable(2, "f.sst");
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_EQ(0u, result.families.front().canonical_child_index);
+    EXPECT_EQ(0, result.families.front().canonical_rssid_offset);
+    EXPECT_THAT(result.families.front().member_child_indexes, ::testing::ElementsAre(0u, 1u, 2u));
+}
+
+// Two disjoint families on the same merge: child{0,1} share file_a;
+// child{2,3} share file_b. Each family gets its own canonical.
+TEST(SplitFamilyInferenceTest, two_disjoint_families) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_empty_child(/*rssid_offset=*/10);
+    builder.add_empty_child(/*rssid_offset=*/15);
+    builder.add_legacy_shared_sstable(0, "file_a.sst");
+    builder.add_legacy_shared_sstable(1, "file_a.sst");
+    builder.add_legacy_shared_sstable(2, "file_b.sst");
+    builder.add_legacy_shared_sstable(3, "file_b.sst");
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(2u, result.families.size());
+    // Families are emitted in ascending canonical_child_index order.
+    EXPECT_EQ(0u, result.families[0].canonical_child_index);
+    EXPECT_EQ(0, result.families[0].canonical_rssid_offset);
+    EXPECT_THAT(result.families[0].member_child_indexes, ::testing::ElementsAre(0u, 1u));
+    EXPECT_EQ(2u, result.families[1].canonical_child_index);
+    EXPECT_EQ(10, result.families[1].canonical_rssid_offset);
+    EXPECT_THAT(result.families[1].member_child_indexes, ::testing::ElementsAre(2u, 3u));
+    EXPECT_EQ(0u, result.child_to_family[0]);
+    EXPECT_EQ(0u, result.child_to_family[1]);
+    EXPECT_EQ(1u, result.child_to_family[2]);
+    EXPECT_EQ(1u, result.child_to_family[3]);
+}
+
+// Filename edge AND rowset-identity edge can BOTH apply to the same pair —
+// the union-find handles re-unions trivially.
+TEST(SplitFamilyInferenceTest, both_edges_apply_to_same_pair) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_legacy_shared_sstable(0, "f.sst");
+    builder.add_legacy_shared_sstable(1, "f.sst");
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_THAT(result.families.front().member_child_indexes, ::testing::ElementsAre(0u, 1u));
+}
+
+// Edge-only-via-rowset case: filename does not match (sstables compacted
+// away on one side) but the underlying shared rowset still proves the
+// family relationship.
+TEST(SplitFamilyInferenceTest, family_inferred_via_rowset_only) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_legacy_shared_sstable(0, "side_a.sst"); // no overlap
+    builder.add_legacy_shared_sstable(1, "side_b.sst");
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_EQ(0u, result.families.front().canonical_child_index);
+}
+
+// Edge-only-via-filename case: the rowsets diverged (one side compacted
+// the rowset away) but the legacy sstable is still common.
+TEST(SplitFamilyInferenceTest, family_inferred_via_filename_only) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    builder.add_legacy_shared_sstable(0, "f.sst");
+    builder.add_legacy_shared_sstable(1, "f.sst");
+    // Different rowsets on each side; should NOT contribute an edge but
+    // should also not break the filename-driven union.
+    builder.add_shared_ancestor_rowset(0, /*rowset_id=*/3, /*version=*/2, {"seg_a"});
+    builder.add_shared_ancestor_rowset(1, /*rowset_id=*/4, /*version=*/2, {"seg_b"});
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_THAT(result.families.front().member_child_indexes, ::testing::ElementsAre(0u, 1u));
+}
+
+// Two children carry the same physical rowset, but one has segment_metas
+// fully populated (segment_idx = positional index) while the other has
+// segment_metas absent. The PB read path falls back to positional index
+// when segment_metas is missing, so both metadata variants describe the
+// same physical layout — they MUST union into one family. (Codex round-1
+// catch: without normalization, the keys differ and family inference
+// silently misses the legacy fast-path.)
+TEST(SplitFamilyInferenceTest, rowset_edge_normalizes_absent_segment_metas) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    auto* rowset_a = builder.metadata_of(0)->add_rowsets();
+    rowset_a->set_id(3);
+    rowset_a->set_version(2);
+    rowset_a->add_segments("seg_a");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_segments("seg_b");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_segment_metas()->set_segment_idx(0);
+    rowset_a->add_segment_metas()->set_segment_idx(1);
+    auto* rowset_b = builder.metadata_of(1)->add_rowsets();
+    rowset_b->set_id(3);
+    rowset_b->set_version(2);
+    rowset_b->add_segments("seg_a");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    rowset_b->add_segments("seg_b");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    // segment_metas intentionally absent — read path falls back to
+    // positional index, which equals A's explicit (0, 1).
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size()) << "default positional segment_idx must equal explicit (0, 1) layout";
+}
+
+// Same family-defining physical rowset, but one child has bundle_file_
+// offsets explicitly set to (0, 0) while the other has the field absent.
+// PB defaults to 0 per segment when absent, so the two variants describe
+// the same physical placement and must union into one family.
+TEST(SplitFamilyInferenceTest, rowset_edge_normalizes_absent_bundle_file_offsets) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);
+    builder.add_empty_child(/*rssid_offset=*/5);
+    auto* rowset_a = builder.metadata_of(0)->add_rowsets();
+    rowset_a->set_id(3);
+    rowset_a->set_version(2);
+    rowset_a->add_segments("seg_a");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_segments("seg_b");
+    rowset_a->add_segment_size(100);
+    rowset_a->add_shared_segments(true);
+    rowset_a->add_bundle_file_offsets(0);
+    rowset_a->add_bundle_file_offsets(0);
+    rowset_a->add_segment_metas()->set_segment_idx(0);
+    rowset_a->add_segment_metas()->set_segment_idx(1);
+    auto* rowset_b = builder.metadata_of(1)->add_rowsets();
+    rowset_b->set_id(3);
+    rowset_b->set_version(2);
+    rowset_b->add_segments("seg_a");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    rowset_b->add_segments("seg_b");
+    rowset_b->add_segment_size(100);
+    rowset_b->add_shared_segments(true);
+    // bundle_file_offsets absent — PB default 0 per segment, equal to A's
+    // explicit (0, 0).
+    rowset_b->add_segment_metas()->set_segment_idx(0);
+    rowset_b->add_segment_metas()->set_segment_idx(1);
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size()) << "absent bundle_file_offsets must equal explicit (0, 0) layout";
+}
+
+// Mix of orphan + family children. The orphan stays kNoFamily; the family
+// records the right canonical_child_index.
+TEST(SplitFamilyInferenceTest, mix_orphan_and_family) {
+    SplitFamilyTestBuilder builder;
+    builder.add_empty_child(/*rssid_offset=*/0);  // orphan
+    builder.add_empty_child(/*rssid_offset=*/5);  // family member
+    builder.add_empty_child(/*rssid_offset=*/10); // family member
+    builder.add_legacy_shared_sstable(1, "f.sst");
+    builder.add_legacy_shared_sstable(2, "f.sst");
+    ASSIGN_OR_ABORT(auto result, lake::detail::infer_split_families(builder.snapshot()));
+    ASSERT_EQ(1u, result.families.size());
+    EXPECT_EQ(1u, result.families.front().canonical_child_index);
+    EXPECT_EQ(5, result.families.front().canonical_rssid_offset);
+    EXPECT_EQ(lake::detail::InferredSplitFamilies::kNoFamily, result.child_to_family[0]);
+    EXPECT_EQ(0u, result.child_to_family[1]);
+    EXPECT_EQ(0u, result.child_to_family[2]);
 }
 
 } // namespace starrocks
