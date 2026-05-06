@@ -130,6 +130,28 @@ public:
     int64_t rssid_offset() const { return _rssid_offset; }
     void set_rssid_offset(int64_t offset) { _rssid_offset = offset; }
 
+    uint32_t child_index() const { return _child_index; }
+    void set_child_index(uint32_t child_index) { _child_index = child_index; }
+
+    // Wire the v2 family-canonical projection plan onto this ctx. The plan is
+    // built once at the top of merge_tablet (PK-gated) and read by the
+    // commit-5 legacy-sstable fast-path via plan.family_legacy_sstable_offset
+    // and the per-family LegacyRssidLookupMaps. Commit 4 deliberately does
+    // NOT consult plan.explicit_rssid_map from map_rssid: doing so would
+    // change rowset id assignment in the corner case where a filename-only
+    // family's canonical child has compacted away a shared-ancestor rowset
+    // that a later child still carries, and project_non_shared_legacy_sstable
+    // still applies a single ctx.rssid_offset shift — the two would
+    // disagree. v1 first-emitter / shared_rssid_map remains the source of
+    // truth for rowset id assignment until commit 5 lands the fast-path
+    // change with matching guards.
+    //
+    // The plan must outlive this ctx (typically a stack local in
+    // merge_tablet). Null when the PK gate is off — non-PK merges leave the
+    // pointer null and the plan is never built.
+    void set_projection_plan(const detail::RssidProjectionPlan* plan) { _projection_plan = plan; }
+    const detail::RssidProjectionPlan* projection_plan() const { return _projection_plan; }
+
     // Maps an original rssid to the final output rssid.
     // If the rssid was deduped, returns the canonical rssid from shared_rssid_map;
     // otherwise applies the default offset mapping with overflow check.
@@ -167,6 +189,11 @@ private:
     TabletMetadataPtr _metadata;
     int64_t _rssid_offset = 0;
     int _current_rowset_index = 0;
+    uint32_t _child_index = 0;
+    // Non-owning pointer to the v2 family-canonical projection plan, set
+    // by merge_tablet for PK + cloud-native merges. Lifetime guaranteed
+    // by merge_tablet's stack frame.
+    const detail::RssidProjectionPlan* _projection_plan = nullptr;
     // Dedup-produced rssid remap table.
     // key: original rssid in this child metadata
     // value: canonical rowset's actual rssid in the final output
@@ -2573,6 +2600,39 @@ StatusOr<MutableTabletMetadataPtr> merge_tablet(TabletManager* tablet_manager,
                          tablet_reshard_helper::union_range(merged_range, merge_contexts[i].metadata()->range()));
     }
     new_tablet_metadata->mutable_range()->CopyFrom(merged_range);
+
+    // Phase 1.5 (plumbing): build the v2 family-canonical projection plan
+    // once Phase 1 has populated rssid_offset, and wire (_child_index,
+    // _projection_plan) onto every TabletMergeContext. Commit 4 lands the
+    // plan + plumbing only; the actual consumer is commit 5's legacy-
+    // sstable fast-path, which reads plan.family_legacy_sstable_offset and
+    // the per-family LegacyRssidLookupMaps to emit non-zero accumulated
+    // offsets without disagreeing with the rowset-level projection.
+    //
+    // map_rssid intentionally does NOT consult plan.explicit_rssid_map yet
+    // (see TabletMergeContext::set_projection_plan for the rationale). v1
+    // first-emitter / shared_rssid_map remains the source of truth for
+    // rowset id assignment. Behavior change in this commit: zero.
+    //
+    // Scope gate: PK + cloud-native. We are already in the lake-mode merge
+    // path (cloud-native is implicit), so the only runtime gate is the PK
+    // schema check on the merged metadata. Non-PK tables skip the build
+    // entirely and leave the plan pointer null.
+    detail::InferredSplitFamilies inferred_families;
+    detail::RssidProjectionPlan projection_plan;
+    if (is_primary_key(*new_tablet_metadata)) {
+        std::vector<detail::SplitFamilyInferenceInput> inference_inputs;
+        inference_inputs.reserve(merge_contexts.size());
+        for (const auto& ctx : merge_contexts) {
+            inference_inputs.push_back({ctx.metadata(), ctx.rssid_offset()});
+        }
+        ASSIGN_OR_RETURN(inferred_families, detail::infer_split_families(inference_inputs));
+        ASSIGN_OR_RETURN(projection_plan, detail::build_rssid_projection_plan(inference_inputs, inferred_families));
+        for (size_t i = 0; i < merge_contexts.size(); ++i) {
+            merge_contexts[i].set_child_index(static_cast<uint32_t>(i));
+            merge_contexts[i].set_projection_plan(&projection_plan);
+        }
+    }
 
     // Phase 2: Merge rowsets (version-driven k-way merge with dedup).
     // canonical_contribs collects each canonical rowset's contributing children's
