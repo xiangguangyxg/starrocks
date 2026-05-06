@@ -280,6 +280,23 @@ private:
     std::unordered_map<uint32_t, uint32_t> _shared_rssid_map;
 };
 
+// PersistentIndexSstablePB::max_rss_rowid encodes (rssid << 32) | rowid.
+// Helpers below name that encoding so callers don't open-code the shift
+// or mask. The "rss_rowid" naming matches the PB field; "high" / "low"
+// disambiguate which 32-bit half is being referenced.
+constexpr int kRssRowidHighShift = 32;
+constexpr uint64_t kRssRowidLowMask = 0xFFFFFFFFULL;
+
+inline uint32_t extract_rss_rowid_high(uint64_t encoded) {
+    return static_cast<uint32_t>(encoded >> kRssRowidHighShift);
+}
+inline uint64_t extract_rss_rowid_low(uint64_t encoded) {
+    return encoded & kRssRowidLowMask;
+}
+inline uint64_t encode_rss_rowid(uint32_t rssid_high, uint64_t rowid_low) {
+    return (static_cast<uint64_t>(rssid_high) << kRssRowidHighShift) | rowid_low;
+}
+
 // Tracks the contributing children's child-local ranges per canonical rowset
 // in new_metadata. PR-1 uses this for the post-merge_rowsets PK fail-fast
 // coverage check; PR-2 will reuse it to synthesize gap delvecs.
@@ -1853,16 +1870,13 @@ Status validate_legacy_shared_sstable_form(const PersistentIndexSstablePB& src_p
 std::optional<uint64_t> project_source_max_rss_rowid(
         const PersistentIndexSstablePB& src_pb, int32_t /*source_rssid_offset*/,
         const std::unordered_map<uint32_t, uint32_t>& watermark_rssid_map) {
-    const uint64_t source_max_rowid_low = src_pb.max_rss_rowid() & 0xffffffffULL;
-    const int64_t source_max_rssid_high = static_cast<int64_t>(src_pb.max_rss_rowid() >> 32);
-    if (source_max_rssid_high < 0 || source_max_rssid_high > std::numeric_limits<uint32_t>::max()) {
-        return std::nullopt;
-    }
-    auto entry = watermark_rssid_map.find(static_cast<uint32_t>(source_max_rssid_high));
+    const uint64_t source_max_rowid_low = extract_rss_rowid_low(src_pb.max_rss_rowid());
+    const uint32_t source_max_rssid_high = extract_rss_rowid_high(src_pb.max_rss_rowid());
+    auto entry = watermark_rssid_map.find(source_max_rssid_high);
     if (entry == watermark_rssid_map.end()) {
         return std::nullopt;
     }
-    return (static_cast<uint64_t>(entry->second) << 32) | source_max_rowid_low;
+    return encode_rss_rowid(entry->second, source_max_rowid_low);
 }
 
 // Walk |values_pb|'s non-tombstone entries and update |*max_encoded| /
@@ -1872,7 +1886,7 @@ void update_max_encoded_rss_rowid_from(const IndexValuesWithVerPB& values_pb, ui
     for (int i = 0; i < values_pb.values_size(); ++i) {
         const auto& index_value = values_pb.values(i);
         if (is_index_tombstone(index_value)) continue;
-        const uint64_t encoded = (static_cast<uint64_t>(index_value.rssid()) << 32) | index_value.rowid();
+        const uint64_t encoded = encode_rss_rowid(index_value.rssid(), index_value.rowid());
         if (!*initialized || encoded > *max_encoded) {
             *max_encoded = encoded;
             *initialized = true;
@@ -2074,8 +2088,8 @@ StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexS
         g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
         return false;
     }
-    const int64_t source_lifted_max =
-            static_cast<int64_t>(src_pb.max_rss_rowid() >> 32); // already in source-effective space
+    // max_rss_rowid.high is already in source-effective space (post-PR0).
+    const int64_t source_lifted_max = static_cast<int64_t>(extract_rss_rowid_high(src_pb.max_rss_rowid()));
     const int64_t source_lifted_lower = static_cast<int64_t>(src_pb.rssid_offset()) + 1; // skip stored rssid 0
     if (source_lifted_max < source_lifted_lower) {
         g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
@@ -2118,8 +2132,8 @@ StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexS
     // other field copy through unchanged.
     out_pb->CopyFrom(src_pb);
     out_pb->set_rssid_offset(static_cast<int32_t>(accumulated_offset));
-    const uint64_t low = src_pb.max_rss_rowid() & 0xFFFFFFFFULL;
-    out_pb->set_max_rss_rowid((static_cast<uint64_t>(static_cast<uint32_t>(new_lifted_max)) << 32) | low);
+    out_pb->set_max_rss_rowid(
+            encode_rss_rowid(static_cast<uint32_t>(new_lifted_max), extract_rss_rowid_low(src_pb.max_rss_rowid())));
     return true;
 }
 
@@ -2385,10 +2399,10 @@ Status rebuild_non_shared_legacy_sstable(TabletManager* tablet_manager, int64_t 
     // post-merge watermark. Per-entry update_max_encoded_rss_rowid_from
     // only widens this initial value as non-tombstone entries are
     // written.
-    const uint32_t source_max_high = static_cast<uint32_t>(src_pb.max_rss_rowid() >> 32);
+    const uint32_t source_max_high = extract_rss_rowid_high(src_pb.max_rss_rowid());
     ASSIGN_OR_RETURN(uint32_t projected_max_high, ctx.map_rssid(source_max_high));
-    const uint64_t source_low = src_pb.max_rss_rowid() & 0xFFFFFFFFULL;
-    uint64_t max_encoded_rss_rowid = (static_cast<uint64_t>(projected_max_high) << 32) | source_low;
+    uint64_t max_encoded_rss_rowid =
+            encode_rss_rowid(projected_max_high, extract_rss_rowid_low(src_pb.max_rss_rowid()));
     bool max_encoded_initialized = true;
 
     uint64_t kept_entry_count = 0;
@@ -2447,8 +2461,7 @@ Status project_modern_shared_rssid_sstable(const PersistentIndexSstablePB& sst, 
     ASSIGN_OR_RETURN(auto mapped_rssid, ctx.map_rssid(sst.shared_rssid()));
     out->set_shared_rssid(mapped_rssid);
     out->set_rssid_offset(0); // shared_rssid is post-projection; clear to avoid double-transform on read
-    const uint64_t low = sst.max_rss_rowid() & 0xffffffffULL;
-    out->set_max_rss_rowid((static_cast<uint64_t>(mapped_rssid) << 32) | low);
+    out->set_max_rss_rowid(encode_rss_rowid(mapped_rssid, extract_rss_rowid_low(sst.max_rss_rowid())));
 
     auto delvec_entry = new_metadata->delvec_meta().delvecs().find(mapped_rssid);
     if (delvec_entry != new_metadata->delvec_meta().delvecs().end() && delvec_entry->second.size() > 0) {
@@ -2478,15 +2491,15 @@ Status project_non_shared_legacy_sstable(const PersistentIndexSstablePB& sst, co
                             sst.rssid_offset(), ctx.rssid_offset(), accumulated_offset));
     }
     out->set_rssid_offset(static_cast<int32_t>(accumulated_offset));
-    const uint64_t low = sst.max_rss_rowid() & 0xffffffffULL;
-    const int64_t high = static_cast<int64_t>(sst.max_rss_rowid() >> 32);
+    const int64_t high = static_cast<int64_t>(extract_rss_rowid_high(sst.max_rss_rowid()));
     const int64_t new_high = high + ctx.rssid_offset();
     if (new_high < 0 || new_high > std::numeric_limits<uint32_t>::max()) {
         return Status::Corruption(
                 fmt::format("rssid high overflow in merge projection: high={} ctx_offset={} new_high={}", high,
                             ctx.rssid_offset(), new_high));
     }
-    out->set_max_rss_rowid((static_cast<uint64_t>(new_high) << 32) | low);
+    out->set_max_rss_rowid(
+            encode_rss_rowid(static_cast<uint32_t>(new_high), extract_rss_rowid_low(sst.max_rss_rowid())));
     out->clear_delvec();
     return Status::OK();
 }
@@ -2653,7 +2666,8 @@ Status emit_non_shared_legacy_sstable_into_dest(TabletManager* tablet_manager, c
                                                 const TabletMetadataPB& new_metadata,
                                                 const std::vector<uint32_t>& ctx_disagreement_keys,
                                                 ::google::protobuf::RepeatedPtrField<PersistentIndexSstablePB>* dest) {
-    const auto lifted_range = clamp_lifted_range_to_uint32(src_pb.rssid_offset(), src_pb.max_rss_rowid() >> 32);
+    const auto lifted_range =
+            clamp_lifted_range_to_uint32(src_pb.rssid_offset(), extract_rss_rowid_high(src_pb.max_rss_rowid()));
     const bool needs_rebuild = lifted_range.valid() && !ctx_disagreement_keys.empty() &&
                                TabletMergeContext::mapping_disagrees_with_natural_in_range(
                                        ctx_disagreement_keys, lifted_range.lower, lifted_range.upper);
@@ -2801,11 +2815,11 @@ void update_next_rowset_id(TabletMetadataPB* metadata) {
     // is strictly greater than every projected sstable rssid.
     if (metadata->has_sstable_meta()) {
         for (const auto& sst : metadata->sstable_meta().sstables()) {
-            uint64_t projected_high = sst.max_rss_rowid() >> 32;
-            // Clamp the projected high to uint32 range; rssids are uint32 elsewhere
-            // and any saturated high word would already break the rssid encoding.
+            const uint32_t projected_high = extract_rss_rowid_high(sst.max_rss_rowid());
+            // Saturated UINT32_MAX would already break the rssid encoding, so
+            // bumping past it is meaningless — leave max_end alone there.
             if (projected_high < std::numeric_limits<uint32_t>::max()) {
-                max_end = std::max(max_end, static_cast<uint32_t>(projected_high) + 1);
+                max_end = std::max(max_end, projected_high + 1);
             }
         }
     }
