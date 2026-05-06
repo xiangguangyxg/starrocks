@@ -110,6 +110,18 @@ bvar::Adder<int64_t> g_tablet_merge_legacy_sstable_fastpath_fallback_merged_delv
         "tablet_merge_legacy_sstable_fastpath_fallback_merged_delvec_nonempty");
 bvar::Adder<int64_t> g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid(
         "tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid");
+// v2 fast-path: the source sstable's filename did not resolve to any
+// inferred split family. With v1 the fast-path required canonical_ctx ==
+// ctx[0] (zero canonical offset); v2 generalizes to any safe family but
+// must distinguish kNoFamily — those sstables fall back to rebuild.
+bvar::Adder<int64_t> g_tablet_merge_legacy_sstable_fastpath_fallback_no_family(
+        "tablet_merge_legacy_sstable_fastpath_fallback_no_family");
+// v2 fast-path: the source sstable's family was marked unsafe by the
+// projection plan (Step 1 cross-family or sparse-segment collision).
+// Fast-path cannot project an unsafe family without risking a rssid
+// collision in the merged tablet.
+bvar::Adder<int64_t> g_tablet_merge_legacy_sstable_fastpath_fallback_unsafe_family(
+        "tablet_merge_legacy_sstable_fastpath_fallback_unsafe_family");
 
 } // namespace
 
@@ -1910,45 +1922,65 @@ StatusOr<bool> remap_legacy_entry_or_drop(IndexValuesWithVerPB* values_pb, int32
 }
 
 // Try to project an ancestor-inherited shared PK sstable (shared=true,
-// !has_shared_rssid) without reading the source file. The full design,
+// !has_shared_rssid) without reading the source file. The full v2 design,
 // including why each safety check exists, lives in
-// ~/workspace/doc/legacy_sstable_fastpath.md.
+// ~/workspace/doc/legacy_sstable_fastpath_v2.md.
 //
-// Returns true with out_pb filled when every safety check passes — the
-// projection is then byte-for-byte identical to src_pb. Returns false when
-// any check fails; the caller must fall back to rebuild_legacy_shared_
-// sstable. Each fallback path increments a dedicated counter so production
-// can break down why fast-path missed.
+// v2 differences from v1:
+//   - The C0 / C0' zero-offset gates are gone. Any safe family — even one
+//     where canonical_ctx.rssid_offset() != 0 or src_pb already carries a
+//     non-zero rssid_offset — can be projected as long as the family's
+//     plan offset accumulates cleanly.
+//   - Family resolution: the caller resolves family_id from the dedup-
+//     winner's child_index. kNoFamily and unsafe families fall back.
+//   - canonical_offset is read from plan.family_legacy_sstable_offset
+//     (set by build_rssid_projection_plan, == family.canonical_rssid_offset
+//     for safe families).
+//   - The dense walk verifies data_rssid_map[lifted_rssid] ==
+//     lifted_rssid + canonical_offset (not == lifted_rssid). The delvec
+//     check uses the FINAL rssid (lifted + canonical_offset), which is
+//     how delvec_meta.delvecs is keyed post-merge_delvecs.
+//   - Emit accumulates: out_pb.rssid_offset = src_pb.rssid_offset +
+//     canonical_offset; out_pb.max_rss_rowid.high = source_lifted_max +
+//     canonical_offset.
 //
-// The walk over [1, lifted_max_rssid] uses uint32_t directly (the span is
-// capped to 8192 well below UINT32_MAX), and the merged-delvec check at
-// each id reuses the loop's rssid_key — every entry in data_rssid_map that
-// passes the canonical-projection check has data_entry->second == rssid_key.
+// Returns true with out_pb filled when every safety check passes. Returns
+// false when any check fails; the caller falls back to
+// rebuild_legacy_shared_sstable. Each fallback path increments a dedicated
+// counter so production can break down why fast-path missed.
 StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexSstablePB& src_pb,
-                                                          const TabletMergeContext& canonical_ctx,
+                                                          const TabletMergeContext& canonical_ctx, uint32_t family_id,
+                                                          const detail::RssidProjectionPlan& plan,
                                                           const TabletMetadataPB& new_metadata,
                                                           const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps,
                                                           PersistentIndexSstablePB* out_pb) {
     constexpr uint32_t kFastPathMaxRssidSpan = 8192;
 
-    // Zero-offset gates: a non-zero source offset would force projection
-    // arithmetic on the output, and a non-zero canonical offset would mean
-    // the dedup-winner is not ctx[0] — both break the byte-for-byte copy
-    // invariant that lets a follow-up rebuild round skip double-shifting
-    // max_rss_rowid.high.
-    if (src_pb.rssid_offset() != 0) {
-        g_tablet_merge_legacy_sstable_fastpath_fallback_source_offset_nonzero << 1;
+    // No family or unsafe family → fallback. These two gates replace v1's
+    // zero-offset gates as the fundamental safety contract.
+    if (family_id == detail::InferredSplitFamilies::kNoFamily) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_no_family << 1;
         return false;
     }
-    if (canonical_ctx.rssid_offset() != 0) {
-        g_tablet_merge_legacy_sstable_fastpath_fallback_canonical_offset_nonzero << 1;
+    if (plan.unsafe_families.count(family_id) > 0) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_unsafe_family << 1;
         return false;
     }
+    auto family_offset_it = plan.family_legacy_sstable_offset.find(family_id);
+    if (family_offset_it == plan.family_legacy_sstable_offset.end()) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_no_family << 1;
+        return false;
+    }
+    const int64_t canonical_offset = family_offset_it->second;
+    (void)canonical_ctx; // canonical_ctx remains in the signature for future
+                         // consumers (e.g. tablet-range filtering); v2 reads
+                         // the canonical offset from the plan instead of
+                         // canonical_ctx.rssid_offset() to keep family-canonical
+                         // and ctx-natural distinct.
 
-    // Form / range / fileset_id gates: keep the same legality contract that
-    // rebuild relies on, plus the fileset_id invariant that a downstream
-    // PersistentIndexSstableFileset::init(vector) DCHECK requires for any
-    // ranged sstable.
+    // Form / range / fileset_id gates: identical legality contract to v1.
+    // Rebuild's PersistentIndexSstableFileset::init(vector) DCHECK requires
+    // a fileset_id on any ranged sstable, so the fast-path must too.
     if (!validate_legacy_shared_sstable_form(src_pb).ok()) {
         g_tablet_merge_legacy_sstable_fastpath_fallback_invalid_form << 1;
         return false;
@@ -1962,42 +1994,61 @@ StatusOr<bool> try_fastpath_project_legacy_shared_sstable(const PersistentIndexS
         return false;
     }
 
-    // Stored rssid 0 is impossible because rs.id ≥ 1 (next_rowset_id
-    // invariant), so the data walk starts at 1. lifted_max_rssid fits in
-    // uint32 by construction (uint64 >> 32 ≤ UINT32_MAX) and is bounded by
-    // kFastPathMaxRssidSpan.
-    const uint64_t lifted_max_rssid_64 = src_pb.max_rss_rowid() >> 32;
-    if (lifted_max_rssid_64 < 1 || lifted_max_rssid_64 > kFastPathMaxRssidSpan) {
+    // Boundary / overflow checks. accumulated_offset must fit in int32 so
+    // it can be written back to the PB; new_lifted_max must fit in uint32
+    // so the high word is well-defined.
+    const int64_t accumulated_offset = static_cast<int64_t>(src_pb.rssid_offset()) + canonical_offset;
+    if (accumulated_offset < std::numeric_limits<int32_t>::min() ||
+        accumulated_offset > std::numeric_limits<int32_t>::max()) {
         g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
         return false;
     }
-    const auto lifted_max_rssid = static_cast<uint32_t>(lifted_max_rssid_64);
+    const int64_t source_lifted_max =
+            static_cast<int64_t>(src_pb.max_rss_rowid() >> 32); // already in source-effective space
+    const int64_t source_lifted_lower = static_cast<int64_t>(src_pb.rssid_offset()) + 1; // skip stored rssid 0
+    if (source_lifted_max < source_lifted_lower) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
+        return false;
+    }
+    if (source_lifted_max - source_lifted_lower + 1 > kFastPathMaxRssidSpan) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
+        return false;
+    }
+    const int64_t new_lifted_max = source_lifted_max + canonical_offset;
+    if (new_lifted_max < 0 || new_lifted_max > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        g_tablet_merge_legacy_sstable_fastpath_fallback_coverage_span_invalid << 1;
+        return false;
+    }
 
-    // For every rssid the file may reference, require both:
-    //   (a) data_rssid_map maps it to itself — i.e. every contributing
-    //       merge_context's first-emitter for that rowset is the canonical
-    //       ctx (= no partial-child compaction);
-    //   (b) the merged tablet's per-rssid delvec is empty — fast-path can't
-    //       physically drop entries.
-    // Both conditions reuse rssid_key directly; data_entry->second equals
-    // rssid_key once (a) has passed.
+    // Dense walk of [source_lifted_lower, source_lifted_max] in source-
+    // effective (canonical_ctx-local) space. For each lifted_rssid, expect:
+    //   data_rssid_map[lifted_rssid] == lifted_rssid + canonical_offset
+    // and the merged delvec at the FINAL rssid is empty (fast-path can't
+    // physically drop entries).
+    const auto& family_data_map = rssid_lookup_maps.data_rssid_map;
     const auto& merged_delvecs = new_metadata.delvec_meta().delvecs();
-    for (uint32_t rssid_key = 1; rssid_key <= lifted_max_rssid; ++rssid_key) {
-        auto data_entry = rssid_lookup_maps.data_rssid_map.find(rssid_key);
-        if (data_entry == rssid_lookup_maps.data_rssid_map.end() || data_entry->second != rssid_key) {
+    for (int64_t lifted_rssid_64 = source_lifted_lower; lifted_rssid_64 <= source_lifted_max; ++lifted_rssid_64) {
+        const auto lifted_rssid = static_cast<uint32_t>(lifted_rssid_64);
+        const auto expected_final = static_cast<uint32_t>(lifted_rssid_64 + canonical_offset);
+        auto data_entry = family_data_map.find(lifted_rssid);
+        if (data_entry == family_data_map.end() || data_entry->second != expected_final) {
             g_tablet_merge_legacy_sstable_fastpath_fallback_partial_compaction << 1;
             return false;
         }
-        auto delvec_entry = merged_delvecs.find(rssid_key);
+        auto delvec_entry = merged_delvecs.find(expected_final);
         if (delvec_entry != merged_delvecs.end() && delvec_entry->second.size() > 0) {
             g_tablet_merge_legacy_sstable_fastpath_fallback_merged_delvec_nonempty << 1;
             return false;
         }
     }
 
-    // All checks passed. With zero offsets, the source PB IS the correct
-    // projection — emit it byte-for-byte.
+    // Emit projected PB. PB.rssid_offset accumulates; max_rss_rowid.high
+    // (in effective space) shifts by canonical_offset. low word and every
+    // other field copy through unchanged.
     out_pb->CopyFrom(src_pb);
+    out_pb->set_rssid_offset(static_cast<int32_t>(accumulated_offset));
+    const uint64_t low = src_pb.max_rss_rowid() & 0xFFFFFFFFULL;
+    out_pb->set_max_rss_rowid((static_cast<uint64_t>(static_cast<uint32_t>(new_lifted_max)) << 32) | low);
     return true;
 }
 
@@ -2181,15 +2232,14 @@ Status rebuild_legacy_shared_sstable(TabletManager* tablet_manager, int64_t merg
 // falls back to rebuild_legacy_shared_sstable. An empty out_pb after this
 // call means rebuild dropped every entry — the caller should NOT emit it
 // to the merged sstable_meta.
-Status emit_legacy_shared_sstable_via_fastpath_or_rebuild(TabletManager* tablet_manager, int64_t merged_tablet_id,
-                                                          const PersistentIndexSstablePB& src_pb,
-                                                          const TabletMergeContext& canonical_ctx,
-                                                          const TabletMetadataPtr& src_metadata,
-                                                          const TabletMetadataPB& new_metadata,
-                                                          const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps,
-                                                          PersistentIndexSstablePB* out_pb) {
-    ASSIGN_OR_RETURN(bool fastpath_succeeded, try_fastpath_project_legacy_shared_sstable(
-                                                      src_pb, canonical_ctx, new_metadata, rssid_lookup_maps, out_pb));
+Status emit_legacy_shared_sstable_via_fastpath_or_rebuild(
+        TabletManager* tablet_manager, int64_t merged_tablet_id, const PersistentIndexSstablePB& src_pb,
+        const TabletMergeContext& canonical_ctx, const TabletMetadataPtr& src_metadata,
+        const TabletMetadataPB& new_metadata, uint32_t family_id, const detail::RssidProjectionPlan& plan,
+        const LegacyRssidLookupMaps::PerFamilyMaps& rssid_lookup_maps, PersistentIndexSstablePB* out_pb) {
+    ASSIGN_OR_RETURN(bool fastpath_succeeded,
+                     try_fastpath_project_legacy_shared_sstable(src_pb, canonical_ctx, family_id, plan, new_metadata,
+                                                                rssid_lookup_maps, out_pb));
     if (fastpath_succeeded) {
         g_tablet_merge_legacy_sstable_fastpath_total << 1;
         return Status::OK();
@@ -2432,10 +2482,18 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
                 const uint32_t family_id = inferred_families.child_to_family[child_index];
                 ASSIGN_OR_RETURN(const auto* family_maps_ptr,
                                  lookup_maps_for_ctx(rssid_lookup_maps, family_id, child_index));
+                // Resolve the v2 projection plan from the canonical_ctx so
+                // we don't have to plumb merge_tablet's stack local through
+                // every callsite. ctx is the dedup-winner (commit 3) so its
+                // projection_plan() pointer is the single shared plan when
+                // the PK gate fired in merge_tablet.
+                const detail::RssidProjectionPlan empty_plan{};
+                const detail::RssidProjectionPlan* plan_ptr = ctx.projection_plan();
+                const auto& plan = (plan_ptr != nullptr) ? *plan_ptr : empty_plan;
                 PersistentIndexSstablePB projected_pb;
                 RETURN_IF_ERROR(emit_legacy_shared_sstable_via_fastpath_or_rebuild(
-                        tablet_manager, new_metadata->id(), sst, ctx, ctx.metadata(), *new_metadata, *family_maps_ptr,
-                        &projected_pb));
+                        tablet_manager, new_metadata->id(), sst, ctx, ctx.metadata(), *new_metadata, family_id, plan,
+                        *family_maps_ptr, &projected_pb));
                 // Empty projected_pb → fast-path was unsafe AND rebuild
                 // dropped every entry; the shared_dedup_sources entry keeps
                 // same-filename siblings from re-running this work.

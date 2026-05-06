@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <set>
 
 #include "base/path/filesystem_util.h"
 #include "base/testutil/assert.h"
@@ -6385,7 +6386,12 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_nonzer
 // sstable). Even if everything else is clean, fast-path falls back unconditionally
 // to avoid an emitted PB whose accumulated offset would later get double-shifted
 // by a subsequent rebuild.
-TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_nonzero_src_offset_falls_back) {
+// v2 update: source PB carrying a non-zero rssid_offset (= a stacked-merge
+// legacy sstable) used to fall back to rebuild under v1's C0 zero-offset
+// gate. v2 drops C0, so the fast-path now accumulates the source offset
+// into the emitted PB (out.rssid_offset = src.rssid_offset +
+// canonical_offset) and shifts max_rss_rowid.high accordingly.
+TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_v2_src_offset_hit) {
     const int64_t base_version = 1;
     const int64_t new_version = 2;
     const int64_t child_a = next_id();
@@ -6398,8 +6404,11 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_nonzer
 
     const std::string legacy_filename = "fastpath_nonzero_src.sst";
     const auto legacy_path = _tablet_manager->sst_location(child_a, legacy_filename);
+    // Stored rssids must be >= 1 (rs.id >= 1 invariant). The dense walk
+    // skips effective rssid below src.rssid_offset+1 because there is no
+    // valid stored rssid 0 in production sstables.
     const uint64_t legacy_filesize =
-            write_legacy_pk_sstable(legacy_path, {{"k1", /*rssid=*/0, /*rowid=*/0}, {"k2", /*rssid=*/1, /*rowid=*/0}});
+            write_legacy_pk_sstable(legacy_path, {{"k1", /*rssid=*/1, /*rowid=*/0}, {"k2", /*rssid=*/2, /*rowid=*/0}});
 
     auto make_child = [&](int64_t tablet_id) {
         auto meta = std::make_shared<TabletMetadataPB>();
@@ -6422,9 +6431,9 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_nonzer
         sst->set_filesize(legacy_filesize);
         sst->set_shared(true);
         // Non-zero src rssid_offset: prior merge already shifted stored ids
-        // into this child's id space. Stored 0/1 lift to 1/2.
+        // by 1, so stored 1/2 lift to effective 2/3 in this child's space.
         sst->set_rssid_offset(1);
-        sst->set_max_rss_rowid((static_cast<uint64_t>(2) << 32) | 0);
+        sst->set_max_rss_rowid((static_cast<uint64_t>(3) << 32) | 0);
         return meta;
     };
 
@@ -6447,9 +6456,17 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_nonzer
     auto merged = tablet_metadatas.at(merged_tablet);
     ASSERT_EQ(1, merged->sstable_meta().sstables_size());
     const auto& out_sst = merged->sstable_meta().sstables(0);
-    EXPECT_NE(legacy_filename, out_sst.filename()) << "C0 fail → fallback rebuild";
-    EXPECT_FALSE(out_sst.shared());
-    EXPECT_TRUE(out_sst.has_fileset_id());
+    // Fast-path signature: original filename preserved, shared=true, no
+    // new fileset_id minted. canonical_offset is 0 (canonical = ctx[0],
+    // rssid_offset = 0) so accumulated == 1, and max_rss_rowid.high
+    // shifts from 3 to 3 + 0 = 3.
+    EXPECT_EQ(legacy_filename, out_sst.filename())
+            << "v2 fast-path keeps source filename even with non-zero src offset";
+    EXPECT_TRUE(out_sst.shared());
+    EXPECT_FALSE(out_sst.has_shared_rssid());
+    EXPECT_EQ(1, out_sst.rssid_offset()) << "accumulated = src.rssid_offset(1) + canonical_offset(0)";
+    EXPECT_EQ((static_cast<uint64_t>(3) << 32) | 0, out_sst.max_rss_rowid())
+            << "max_rss_rowid.high shifts by canonical_offset (0 here)";
 }
 
 // C2': source PB has range but no fileset_id. PersistentIndexSstableFileset::
@@ -6543,6 +6560,10 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_range_
 // The rebuilt sstable's max_rss_rowid (projected via watermark map)
 // reflects this isolation directly, so the test asserts on the emitted
 // PB's high word.
+//
+// Note: v2 commit 5's fast-path requires a resolved family_id !=
+// kNoFamily, so orphan ctxs always fall through to rebuild here — that
+// is what exercises the per-child orphan map fix from commit 3.
 TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_orphan_per_child_lookup_isolation) {
     const int64_t base_version = 1;
     const int64_t new_version = 2;
@@ -6614,32 +6635,140 @@ TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_orphan_per_chil
     ASSERT_EQ(2, merged->sstable_meta().sstables_size());
     const auto& sstables = merged->sstable_meta().sstables();
 
-    // ctx_a: canonical_offset = 0, fast-path succeeds → emit byte-identical
-    // to source PB (keeps original filename, max_rss_rowid.high = 1).
-    int fastpath_idx = -1;
-    int rebuild_idx = -1;
-    for (int i = 0; i < sstables.size(); ++i) {
-        if (sstables.Get(i).filename() == legacy_a_filename) {
-            fastpath_idx = i;
-        } else {
-            rebuild_idx = i;
-        }
-    }
-    ASSERT_NE(-1, fastpath_idx) << "ctx_a's legacy sstable should be fast-pathed (canonical_offset=0)";
-    ASSERT_NE(-1, rebuild_idx) << "ctx_b's legacy sstable should be rebuilt (canonical_offset!=0)";
+    // Both ctxs are kNoFamily (no edges), so v2 fast-path falls through to
+    // rebuild for both legacy sstables. Each rebuild consults its own
+    // per-child orphan PerFamilyMaps (orphan_by_child[child_index]). Both
+    // emitted PBs therefore wear the rebuild signature: !shared, fresh
+    // fileset_id, new (UUID) filename. They differ in max_rss_rowid.high:
+    //   ctx_a (rssid_offset=0): orphan_by_child[0][1] = 1, high = 1.
+    //   ctx_b (rssid_offset=1): orphan_by_child[1][1] = 2, high = 2.
+    EXPECT_FALSE(sstables.Get(0).shared());
+    EXPECT_FALSE(sstables.Get(1).shared());
+    EXPECT_TRUE(sstables.Get(0).has_fileset_id());
+    EXPECT_TRUE(sstables.Get(1).has_fileset_id());
+    EXPECT_NE(legacy_a_filename, sstables.Get(0).filename());
+    EXPECT_NE(legacy_a_filename, sstables.Get(1).filename());
+    EXPECT_NE(legacy_b_filename, sstables.Get(0).filename());
+    EXPECT_NE(legacy_b_filename, sstables.Get(1).filename());
 
-    EXPECT_EQ(static_cast<uint64_t>(1) << 32, sstables.Get(fastpath_idx).max_rss_rowid())
-            << "ctx_a fast-path output should be byte-identical to source";
-
-    // The pollution-bug regression assertion: with a SHARED orphan map,
-    // ctx_a populates {rssid=1 → final=1} first; ctx_b's lookup hits that
-    // stale entry and the rebuild emits max_rss_rowid.high = 1. Per-child
-    // orphan scoping gives ctx_b its own map containing {1 → 2} (= ctx_b's
-    // rssid_offset 1 + source rssid 1).
-    EXPECT_EQ(static_cast<uint64_t>(2) << 32, sstables.Get(rebuild_idx).max_rss_rowid())
+    // The pollution-bug regression assertion: collect the high words of
+    // both rebuilt PBs and verify they are {1, 2}, not {1, 1}. The latter
+    // would mean ctx_a's first-emitter mapping {rssid=1 → final=1}
+    // polluted ctx_b's rebuild lookup; per-child orphan scoping prevents
+    // that.
+    std::set<uint64_t> rebuilt_highs{sstables.Get(0).max_rss_rowid() >> 32, sstables.Get(1).max_rss_rowid() >> 32};
+    EXPECT_EQ((std::set<uint64_t>{1, 2}), rebuilt_highs)
             << "ctx_b's rebuild must consult orphan_by_child[1], not a polluted shared orphan map";
-    EXPECT_FALSE(sstables.Get(rebuild_idx).shared()) << "rebuild emits non-shared";
-    EXPECT_TRUE(sstables.Get(rebuild_idx).has_fileset_id()) << "rebuild assigns a fresh fileset_id";
+}
+
+// v2 fast-path headline win: canonical_ctx for the family carries a
+// non-zero rssid_offset (it is NOT ctx[0]) yet the family-canonical
+// projection still produces a byte-mappable shift. Under v1 this hit the
+// C0' canonical-offset-nonzero gate and fell back to rebuild. Under v2
+// the family's safe canonical_offset accumulates into the emitted PB.
+//
+// Setup:
+//   ctx_a (= ctx[0]): unrelated child-local rowset, no edge to b/c.
+//   ctx_b (= ctx[1]): shared-ancestor rowsets {1, 2} + legacy sstable.
+//   ctx_c (= ctx[2]): same shared-ancestor rowsets + same legacy sstable.
+// Family inference unions ctx_b + ctx_c via either edge; ctx_a stays
+// kNoFamily. canonical_child_index = 1 (smallest member of {1, 2}), so
+// canonical_rssid_offset = ctx_b.rssid_offset = 1 (Phase 1 lifts ctx_b's
+// id space by ctx_a's contribution of 1 rowset).
+TEST_F(LakeTabletReshardTest, test_tablet_merging_legacy_sstable_fastpath_v2_canonical_offset_hit) {
+    const int64_t base_version = 1;
+    const int64_t new_version = 2;
+    const int64_t child_a = next_id();
+    const int64_t child_b = next_id();
+    const int64_t child_c = next_id();
+    const int64_t merged_tablet = next_id();
+
+    prepare_tablet_dirs(child_a);
+    prepare_tablet_dirs(child_b);
+    prepare_tablet_dirs(child_c);
+    prepare_tablet_dirs(merged_tablet);
+
+    const std::string legacy_filename = "fastpath_v2_canonical.sst";
+    // The legacy sstable file lives only on ctx_b's storage; ctx_c's PB
+    // points at the same logical filename (shared sstable file). For the
+    // fast-path that is byte-mapped, the source file isn't actually read,
+    // so single-side write is fine.
+    const auto legacy_path = _tablet_manager->sst_location(child_b, legacy_filename);
+    const uint64_t legacy_filesize =
+            write_legacy_pk_sstable(legacy_path, {{"k1", /*rssid=*/1, /*rowid=*/0}, {"k2", /*rssid=*/2, /*rowid=*/0}});
+
+    auto meta_a = std::make_shared<TabletMetadataPB>();
+    meta_a->set_id(child_a);
+    meta_a->set_version(base_version);
+    meta_a->set_next_rowset_id(2);
+    set_primary_key_schema(meta_a.get(), 1001);
+    auto* rs_a = meta_a->add_rowsets();
+    rs_a->set_id(1);
+    rs_a->set_version(1);
+    rs_a->set_num_rows(10);
+    rs_a->set_data_size(100);
+    rs_a->add_segments("seg_a_local.dat");
+    rs_a->add_segment_size(100);
+    rs_a->add_shared_segments(false);
+
+    auto make_family_member = [&](int64_t tablet_id) {
+        auto meta = std::make_shared<TabletMetadataPB>();
+        meta->set_id(tablet_id);
+        meta->set_version(base_version);
+        meta->set_next_rowset_id(3);
+        set_primary_key_schema(meta.get(), 1001);
+        for (uint32_t rs_id : {1u, 2u}) {
+            auto* rs = meta->add_rowsets();
+            rs->set_id(rs_id);
+            rs->set_version(1);
+            rs->set_num_rows(10);
+            rs->set_data_size(100);
+            // Family-shared segment: same filename across ctx_b and ctx_c
+            // gives them identical RowsetPhysicalKey for the rowset edge.
+            rs->add_segments(fmt::format("family_seg_{}.dat", rs_id));
+            rs->add_segment_size(100);
+            rs->add_shared_segments(true);
+        }
+        auto* sst = meta->mutable_sstable_meta()->add_sstables();
+        sst->set_filename(legacy_filename);
+        sst->set_filesize(legacy_filesize);
+        sst->set_shared(true);
+        sst->set_max_rss_rowid((static_cast<uint64_t>(2) << 32) | 0);
+        return meta;
+    };
+
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(meta_a));
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(make_family_member(child_b)));
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(make_family_member(child_c)));
+
+    ReshardingTabletInfoPB resharding_tablet;
+    auto& merging_info = *resharding_tablet.mutable_merging_tablet_info();
+    merging_info.add_old_tablet_ids(child_a);
+    merging_info.add_old_tablet_ids(child_b);
+    merging_info.add_old_tablet_ids(child_c);
+    merging_info.set_new_tablet_id(merged_tablet);
+
+    TxnInfoPB txn_info;
+    txn_info.set_txn_id(2);
+    std::unordered_map<int64_t, TabletMetadataPtr> tablet_metadatas;
+    std::unordered_map<int64_t, TabletRangePB> tablet_ranges;
+    ASSERT_OK(lake::publish_resharding_tablet(_tablet_manager.get(), resharding_tablet, base_version, new_version,
+                                              txn_info, false, tablet_metadatas, tablet_ranges));
+
+    auto merged = tablet_metadatas.at(merged_tablet);
+    // dedup'd to one legacy sstable PB.
+    ASSERT_EQ(1, merged->sstable_meta().sstables_size());
+    const auto& out_sst = merged->sstable_meta().sstables(0);
+    // v2 fast-path signature: original filename preserved (byte-mapped),
+    // shared=true, no fileset_id minted. canonical_offset = ctx_b's
+    // rssid_offset = 1, accumulating into the emitted PB.
+    EXPECT_EQ(legacy_filename, out_sst.filename())
+            << "v2 fast-path keeps source filename even with non-zero canonical offset";
+    EXPECT_TRUE(out_sst.shared());
+    EXPECT_FALSE(out_sst.has_shared_rssid());
+    EXPECT_EQ(1, out_sst.rssid_offset()) << "accumulated = src.rssid_offset(0) + canonical_offset(1)";
+    EXPECT_EQ((static_cast<uint64_t>(3) << 32) | 0, out_sst.max_rss_rowid())
+            << "max_rss_rowid.high shifts by canonical_offset (=1)";
 }
 
 // TODO(round-3 follow-up): test_tablet_merging_legacy_sstable_rebuild_filters_outside_tablet_range
