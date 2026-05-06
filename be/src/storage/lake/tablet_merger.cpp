@@ -645,6 +645,37 @@ struct DcgSurvivingEntry {
     DeltaColumnGroupVerPB single_entry;
 };
 
+// True iff the entry's column_ids list contains |unique_id|. The
+// underlying PB shape is `entry.single_entry.unique_column_ids(0)
+// .column_ids()` (a single-entry-normalized DCG keeps all column ids
+// at slot 0); this helper hides the indirection.
+inline bool entry_claims_column_uid(const DcgSurvivingEntry& entry, uint32_t unique_id) {
+    for (auto claimed : entry.single_entry.unique_column_ids(0).column_ids()) {
+        if (claimed == unique_id) return true;
+    }
+    return false;
+}
+
+// Mark every DCG entry that shares any column UID with another entry
+// in |entries|. Two entries that both claim the same UID conflict —
+// merge_dcg_meta routes those through the rebuild path; non-conflicting
+// entries can be emitted as-is.
+inline std::vector<bool> mark_conflicting_dcg_entries(const std::vector<DcgSurvivingEntry>& entries) {
+    std::unordered_map<uint32_t, std::vector<size_t>> entry_indices_by_unique_id;
+    for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index) {
+        for (auto unique_id : entries[entry_index].single_entry.unique_column_ids(0).column_ids()) {
+            entry_indices_by_unique_id[unique_id].push_back(entry_index);
+        }
+    }
+    std::vector<bool> entry_is_conflicting(entries.size(), false);
+    for (const auto& [unique_id, entry_indices] : entry_indices_by_unique_id) {
+        if (entry_indices.size() > 1) {
+            for (size_t entry_index : entry_indices) entry_is_conflicting[entry_index] = true;
+        }
+    }
+    return entry_is_conflicting;
+}
+
 struct DcgSourceRowsetReference {
     size_t child_index;
     const RowsetMetadataPB* rowset = nullptr;
@@ -1015,14 +1046,7 @@ StatusOr<DeltaColumnGroupVerPB> rebuild_dcg_for_target_segment(
     std::unordered_map<uint32_t, ColumnSourceInfo> column_source_info_by_unique_id;
     for (uint32_t unique_id : rebuild_columns) {
         for (const DcgSurvivingEntry* entry : conflicting_entries) {
-            bool entry_claims_this_column = false;
-            for (auto claimed_unique_id : entry->single_entry.unique_column_ids(0).column_ids()) {
-                if (claimed_unique_id == unique_id) {
-                    entry_claims_this_column = true;
-                    break;
-                }
-            }
-            if (!entry_claims_this_column) continue;
+            if (!entry_claims_column_uid(*entry, unique_id)) continue;
             auto& info = column_source_info_by_unique_id[unique_id];
             if (info.default_donor == nullptr) info.default_donor = entry;
             info.override_by_child_index[entry->child_index] = entry;
@@ -1172,21 +1196,10 @@ Status merge_dcg_meta(TabletManager* tablet_manager, const std::vector<TabletMer
     for (auto& [target_rssid, target_work] : work_by_target) {
         if (target_work.entries.empty()) continue;
 
-        // Build column UID -> entries index (stable indices, not pointers).
-        std::unordered_map<uint32_t, std::vector<size_t>> entry_indices_by_unique_id;
-        for (size_t entry_index = 0; entry_index < target_work.entries.size(); ++entry_index) {
-            for (auto unique_id : target_work.entries[entry_index].single_entry.unique_column_ids(0).column_ids()) {
-                entry_indices_by_unique_id[unique_id].push_back(entry_index);
-            }
-        }
-
-        // Identify conflicting entries: any entry claiming a UID shared with another entry.
-        std::vector<bool> entry_is_conflicting(target_work.entries.size(), false);
-        for (auto& [unique_id, entry_indices] : entry_indices_by_unique_id) {
-            if (entry_indices.size() > 1) {
-                for (size_t entry_index : entry_indices) entry_is_conflicting[entry_index] = true;
-            }
-        }
+        // Identify conflicting entries: any entry claiming a UID shared
+        // with another entry. Conflict-free entries are emitted as-is;
+        // conflicting entries are rebuilt below.
+        const std::vector<bool> entry_is_conflicting = mark_conflicting_dcg_entries(target_work.entries);
 
         DeltaColumnGroupVerPB final_dcg;
 
@@ -2632,6 +2645,24 @@ const detail::RssidProjectionPlan& projection_plan_or_empty(const TabletMergeCon
     return (plan != nullptr) ? *plan : kEmptyPlan;
 }
 
+// Returns the highest (rowset.id + step + ctx.rssid_offset) seen across
+// merge_contexts[0..upper_exclusive), or |base_next_rowset_id| if higher.
+// Phase 1 in merge_tablet uses this as the watermark for ctx[i]'s
+// rssid_offset assignment so each child's projected rowset ids land
+// strictly above every earlier child's projected ids.
+uint32_t compute_cumulative_rowset_id_ceiling(const std::vector<TabletMergeContext>& merge_contexts,
+                                              size_t upper_exclusive, uint32_t base_next_rowset_id) {
+    uint32_t ceiling = base_next_rowset_id;
+    for (size_t j = 0; j < upper_exclusive; ++j) {
+        for (const auto& rowset : merge_contexts[j].metadata()->rowsets()) {
+            const uint32_t end = static_cast<uint32_t>(static_cast<int64_t>(rowset.id() + get_rowset_id_step(rowset)) +
+                                                       merge_contexts[j].rssid_offset());
+            ceiling = std::max(ceiling, end);
+        }
+    }
+    return ceiling;
+}
+
 // Emit one ancestor-inherited shared PK sstable (shared=true,
 // !has_shared_rssid) into dest via the v2 fast-path or its rebuild
 // fallback. Resolves family_id, the family's PerFamilyMaps, and the
@@ -2906,18 +2937,15 @@ StatusOr<MutableTabletMetadataPtr> merge_tablet(TabletManager* tablet_manager,
     new_tablet_metadata->clear_prev_garbage_version();
     new_tablet_metadata->set_cumulative_point(0);
 
-    // Phase 1: Prepare rssid offsets and merged range
+    // Phase 1: Prepare rssid offsets and merged range. For each ctx[i],
+    // set new_tablet_metadata.next_rowset_id to the watermark of all
+    // earlier ctxs[0..i-1]'s projected rowset ids; compute_rssid_offset
+    // then derives ctx[i].rssid_offset against that watermark so its
+    // projected ids land strictly above every earlier ctx's.
     for (size_t i = 1; i < merge_contexts.size(); ++i) {
-        // Temporarily set next_rowset_id for compute_rssid_offset
-        uint32_t temp_next = merge_contexts.front().metadata()->next_rowset_id();
-        for (size_t j = 0; j < i; ++j) {
-            for (const auto& rowset : merge_contexts[j].metadata()->rowsets()) {
-                uint32_t end = static_cast<uint32_t>(static_cast<int64_t>(rowset.id() + get_rowset_id_step(rowset)) +
-                                                     merge_contexts[j].rssid_offset());
-                temp_next = std::max(temp_next, end);
-            }
-        }
-        new_tablet_metadata->set_next_rowset_id(temp_next);
+        const uint32_t cumulative_ceiling = compute_cumulative_rowset_id_ceiling(
+                merge_contexts, /*upper_exclusive=*/i, merge_contexts.front().metadata()->next_rowset_id());
+        new_tablet_metadata->set_next_rowset_id(cumulative_ceiling);
         merge_contexts[i].set_rssid_offset(compute_rssid_offset(*new_tablet_metadata, *merge_contexts[i].metadata()));
     }
 
