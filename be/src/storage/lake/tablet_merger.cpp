@@ -299,17 +299,15 @@ inline uint64_t encode_rss_rowid(uint32_t rssid_high, uint64_t rowid_low) {
 
 // Tracks the contributing children's child-local ranges per canonical rowset
 // in new_metadata. PR-1 uses this for the post-merge_rowsets PK fail-fast
-// coverage check; PR-2 will reuse it to synthesize gap delvecs.
+// coverage check; PR-2 reuses it to synthesize gap delvecs.
 //
 // Key: index of the canonical rowset in new_metadata->rowsets().
-// child_ranges: each entry is the contributing child's effective_child_local_range
-// (rowset.range, fallback ctx.metadata.range, fallback unbounded), captured BEFORE
-// update_canonical's union_range mutates the canonical's stored range — otherwise
-// the convex hull would swallow gaps and the coverage / gap detection would fail.
-struct CanonicalContribution {
-    std::vector<TabletRangePB> child_ranges;
-};
-using CanonicalContribMap = std::unordered_map<int, CanonicalContribution>;
+// Value: each entry is the contributing child's effective_child_local_range
+// (rowset.range, fallback ctx.metadata.range, fallback unbounded), captured
+// BEFORE update_canonical's union_range mutates the canonical's stored range
+// — otherwise the convex hull would swallow gaps and the coverage / gap
+// detection would fail.
+using CanonicalContribMap = std::unordered_map<int, std::vector<TabletRangePB>>;
 
 // Singleton unbounded TabletRangePB used as the final fallback in
 // effective_child_local_range when neither rowset nor ctx.metadata carries a range.
@@ -526,7 +524,7 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
                 const auto& duplicate_effective_range = tablet_reshard_helper::effective_child_local_range(
                         rowset, ctx_meta, unbounded_range_singleton());
                 if (canonical_contribs != nullptr) {
-                    (*canonical_contribs)[canonical_index].child_ranges.push_back(duplicate_effective_range);
+                    (*canonical_contribs)[canonical_index].push_back(duplicate_effective_range);
                 }
                 RETURN_IF_ERROR(update_canonical(new_metadata->mutable_rowsets(canonical_index),
                                                  duplicate_effective_range, rowset));
@@ -543,7 +541,7 @@ Status merge_rowsets(std::vector<TabletMergeContext>& merge_contexts, TabletMeta
             const int new_index = new_metadata->rowsets_size();
             RETURN_IF_ERROR(add_rowset(merge_contexts[min_child_index], rowset, new_metadata));
             if (canonical_contribs != nullptr && !rowset.has_delete_predicate()) {
-                (*canonical_contribs)[new_index].child_ranges.push_back(std::move(initial_child_range));
+                (*canonical_contribs)[new_index].push_back(std::move(initial_child_range));
             }
         }
 
@@ -1315,8 +1313,7 @@ StatusOr<std::vector<CanonicalGapSpec>> compute_synthesized_gap_specs(TabletMana
         }
         if (!has_shared) continue;
 
-        ASSIGN_OR_RETURN(auto sorted_disjoint,
-                         tablet_reshard_helper::sort_and_merge_adjacent_ranges(contrib.child_ranges));
+        ASSIGN_OR_RETURN(auto sorted_disjoint, tablet_reshard_helper::sort_and_merge_adjacent_ranges(contrib));
         ASSIGN_OR_RETURN(auto non_contributed,
                          tablet_reshard_helper::compute_disjoint_gaps_within(new_metadata.range(), sorted_disjoint));
         if (non_contributed.empty()) continue;
