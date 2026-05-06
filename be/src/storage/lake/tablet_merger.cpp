@@ -193,46 +193,43 @@ public:
         return static_cast<uint32_t>(mapped);
     }
 
-    // True iff any rssid in [lifted_lower, lifted_upper] (inclusive,
-    // source-effective) maps to a value DIFFERENT from
-    // lifted + this->_rssid_offset under map_rssid's plan/shared_rssid
-    // priority. Used by merge_sstables to decide whether a non-shared
-    // legacy sstable can be projected by a single PB-level rssid_offset
-    // shift (metadata-only fast path) or must be rebuilt per entry.
-    //
-    // Conservative: false-positives only cost an extra rebuild
-    // (correctness preserved); false-negatives would silently mis-map PK
-    // lookups, so the check folds both projection plan and dedup map
-    // sources and treats overflow as a forced "rebuild needed" signal.
     // Precomputes the sorted set of source-effective rssids whose
     // map_rssid would return a value DIFFERENT from
     // rssid + this->_rssid_offset under the plan/shared_rssid priority.
     // merge_sstables calls this once per ctx, then uses
     // mapping_disagrees_with_natural_in_range below to range-test each
     // non-shared sstable in O(log N) instead of re-scanning the plan +
-    // shared_rssid_map per sstable. Walk treats arithmetic overflow as
-    // a disagreement so the downstream rebuild path runs and rejects
-    // out-of-range entries explicitly.
+    // shared_rssid_map per sstable.
+    //
+    // Conservative: arithmetic overflow on natural-offset projection is
+    // treated as a disagreement so the rebuild path runs and rejects
+    // out-of-range entries explicitly. False-positives only cost an
+    // extra rebuild; false-negatives would silently mis-map PK lookups.
     std::vector<uint32_t> compute_disagreement_keys() const {
-        auto add_if_disagreeing = [&](std::vector<uint32_t>& keys, uint32_t key, uint32_t value) {
+        auto disagrees = [&](uint32_t key, uint32_t value) -> bool {
             const int64_t natural = static_cast<int64_t>(key) + _rssid_offset;
-            if (natural < 0 || natural > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-                value != static_cast<uint32_t>(natural)) {
-                keys.push_back(key);
+            if (natural < 0 || natural > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+                return true; // arithmetic overflow → force rebuild
             }
+            return value != static_cast<uint32_t>(natural);
         };
+
+        const size_t plan_size = (_projection_plan != nullptr) ? _projection_plan->explicit_rssid_map.size() : 0;
         std::vector<uint32_t> keys;
+        keys.reserve(plan_size + _shared_rssid_map.size());
+
         if (_projection_plan != nullptr) {
-            keys.reserve(_projection_plan->explicit_rssid_map.size() + _shared_rssid_map.size());
             for (const auto& [source_key, final_rssid] : _projection_plan->explicit_rssid_map) {
                 if (source_key.child_index != _child_index) continue;
-                add_if_disagreeing(keys, source_key.source_rssid, final_rssid);
+                if (disagrees(source_key.source_rssid, final_rssid)) {
+                    keys.push_back(source_key.source_rssid);
+                }
             }
-        } else {
-            keys.reserve(_shared_rssid_map.size());
         }
         for (const auto& [source_rssid, final_rssid] : _shared_rssid_map) {
-            add_if_disagreeing(keys, source_rssid, final_rssid);
+            if (disagrees(source_rssid, final_rssid)) {
+                keys.push_back(source_rssid);
+            }
         }
         std::sort(keys.begin(), keys.end());
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -1707,6 +1704,23 @@ StatusOr<const LegacyRssidLookupMaps::PerFamilyMaps*> lookup_maps_for_ctx(const 
     return &orphan_iter->second;
 }
 
+// Mutable counterpart of lookup_maps_for_ctx used during the build
+// phase. Asserts the pre-create invariant via DCHECK rather than
+// returning Status, because build_legacy_rssid_lookup_maps already
+// pre-creates every entry it then populates — a miss here would be a
+// programmer bug, not a runtime data condition.
+LegacyRssidLookupMaps::PerFamilyMaps& mutable_per_family_maps_for_ctx(LegacyRssidLookupMaps& maps, uint32_t family_id,
+                                                                      size_t child_index) {
+    if (family_id == detail::InferredSplitFamilies::kNoFamily) {
+        auto iter = maps.orphan_by_child.find(child_index);
+        DCHECK(iter != maps.orphan_by_child.end()) << "orphan_by_child[" << child_index << "] not pre-created";
+        return iter->second;
+    }
+    auto iter = maps.per_family.find(family_id);
+    DCHECK(iter != maps.per_family.end()) << "per_family[" << family_id << "] not pre-created";
+    return iter->second;
+}
+
 StatusOr<LegacyRssidLookupMaps> build_legacy_rssid_lookup_maps(const std::vector<TabletMergeContext>& merge_contexts,
                                                                const detail::InferredSplitFamilies& families) {
     if (families.child_to_family.size() != merge_contexts.size()) {
@@ -1746,20 +1760,7 @@ StatusOr<LegacyRssidLookupMaps> build_legacy_rssid_lookup_maps(const std::vector
     for (size_t child_index = 0; child_index < merge_contexts.size(); ++child_index) {
         const auto& ctx = merge_contexts[child_index];
         const uint32_t family_id = families.child_to_family[child_index];
-        // find()-based lookup with DCHECK avoids the silent insertion
-        // operator[] would do if the pre-create invariant ever broke.
-        LegacyRssidLookupMaps::PerFamilyMaps* target_ptr = nullptr;
-        if (family_id == detail::InferredSplitFamilies::kNoFamily) {
-            auto iter = lookup_maps.orphan_by_child.find(child_index);
-            DCHECK(iter != lookup_maps.orphan_by_child.end())
-                    << "orphan_by_child[" << child_index << "] not pre-created";
-            target_ptr = &iter->second;
-        } else {
-            auto iter = lookup_maps.per_family.find(family_id);
-            DCHECK(iter != lookup_maps.per_family.end()) << "per_family[" << family_id << "] not pre-created";
-            target_ptr = &iter->second;
-        }
-        auto& target = *target_ptr;
+        auto& target = mutable_per_family_maps_for_ctx(lookup_maps, family_id, child_index);
 
         for (const auto& rowset : ctx.metadata()->rowsets()) {
             // Watermark map: rowset id (catches delete-only rowsets).
@@ -2582,6 +2583,32 @@ void reassign_fileset_ids_for_ordered_runs(google::protobuf::RepeatedPtrField<Pe
     }
 }
 
+// Source-effective rssid range that a sstable's stored entries could
+// reference, clamped to the uint32_t key space the per-ctx
+// disagreement-key vector indexes by. Both bounds are inclusive.
+//
+// The signed arithmetic matters because compute_rssid_offset can
+// produce a negative ctx.rssid_offset() when ctx[N>0]'s input rowset
+// ids exceed ctx[0]'s next_rowset_id (legal — exercised by
+// test_tablet_merging_accumulates_stacked_rssid_offset). Casting a
+// negative low to uint32_t directly would wrap to a huge value and
+// silently miss in-range disagreement keys.
+struct ClampedLiftedRange {
+    uint32_t lower = 0;
+    uint32_t upper = 0;
+    bool valid() const { return lower <= upper; }
+};
+
+ClampedLiftedRange clamp_lifted_range_to_uint32(int32_t source_rssid_offset, uint64_t source_max_rss_rowid_high) {
+    constexpr int64_t kUint32Max = std::numeric_limits<uint32_t>::max();
+    const int64_t low_signed = static_cast<int64_t>(source_rssid_offset) + 1;
+    const int64_t high_signed = static_cast<int64_t>(source_max_rss_rowid_high);
+    ClampedLiftedRange range;
+    range.lower = static_cast<uint32_t>(std::max<int64_t>(0, low_signed));
+    range.upper = (high_signed < 0) ? 0u : static_cast<uint32_t>(std::min(high_signed, kUint32Max));
+    return range;
+}
+
 Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeContext>& merge_contexts,
                       TabletMetadataPB* new_metadata) {
     auto* dest = new_metadata->mutable_sstable_meta()->mutable_sstables();
@@ -2707,18 +2734,10 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
             // ancestor and child-local references). The pre-probe is
             // signed-aware and conservative on the safe side: false-
             // positives only cost an extra rebuild.
-            const int64_t source_effective_low_signed = static_cast<int64_t>(sst.rssid_offset()) + 1;
-            const int64_t source_effective_high_signed = static_cast<int64_t>(sst.max_rss_rowid() >> 32);
-            const uint32_t lifted_lower = static_cast<uint32_t>(std::max<int64_t>(0, source_effective_low_signed));
-            const uint32_t lifted_upper =
-                    (source_effective_high_signed < 0)
-                            ? 0u
-                            : static_cast<uint32_t>(
-                                      std::min<int64_t>(source_effective_high_signed,
-                                                        static_cast<int64_t>(std::numeric_limits<uint32_t>::max())));
-            const bool needs_rebuild = lifted_lower <= lifted_upper && !ctx_disagreement_keys.empty() &&
+            const auto lifted_range = clamp_lifted_range_to_uint32(sst.rssid_offset(), sst.max_rss_rowid() >> 32);
+            const bool needs_rebuild = lifted_range.valid() && !ctx_disagreement_keys.empty() &&
                                        TabletMergeContext::mapping_disagrees_with_natural_in_range(
-                                               ctx_disagreement_keys, lifted_lower, lifted_upper);
+                                               ctx_disagreement_keys, lifted_range.lower, lifted_range.upper);
             if (needs_rebuild) {
                 PersistentIndexSstablePB rebuilt_pb;
                 RETURN_IF_ERROR(rebuild_non_shared_legacy_sstable(tablet_manager, new_metadata->id(), sst, ctx,
