@@ -2609,6 +2609,68 @@ ClampedLiftedRange clamp_lifted_range_to_uint32(int32_t source_rssid_offset, uin
     return range;
 }
 
+// Resolve the v2 family-canonical projection plan for a ctx. Non-PK
+// merges leave the plan pointer null at Phase 1.5 in merge_tablet; the
+// fast-path emit function still requires a plan reference, so an empty
+// static instance acts as a safe identity for those callers.
+const detail::RssidProjectionPlan& projection_plan_or_empty(const TabletMergeContext& ctx) {
+    static const detail::RssidProjectionPlan kEmptyPlan{};
+    const auto* plan = ctx.projection_plan();
+    return (plan != nullptr) ? *plan : kEmptyPlan;
+}
+
+// Emit one ancestor-inherited shared PK sstable (shared=true,
+// !has_shared_rssid) into dest via the v2 fast-path or its rebuild
+// fallback. Resolves family_id, the family's PerFamilyMaps, and the
+// projection plan from ctx. Drops sstables whose rebuild emitted no
+// entries (matches the cleanup contract documented on
+// rebuild_legacy_shared_sstable).
+Status emit_legacy_shared_sstable_into_dest(TabletManager* tablet_manager, const TabletMergeContext& ctx,
+                                            size_t child_index, const PersistentIndexSstablePB& src_pb,
+                                            const TabletMetadataPB& new_metadata,
+                                            const detail::InferredSplitFamilies& families,
+                                            const LegacyRssidLookupMaps& rssid_lookup_maps,
+                                            ::google::protobuf::RepeatedPtrField<PersistentIndexSstablePB>* dest) {
+    const uint32_t family_id = families.child_to_family[child_index];
+    ASSIGN_OR_RETURN(const auto* family_maps_ptr, lookup_maps_for_ctx(rssid_lookup_maps, family_id, child_index));
+    PersistentIndexSstablePB projected_pb;
+    RETURN_IF_ERROR(emit_legacy_shared_sstable_via_fastpath_or_rebuild(
+            tablet_manager, new_metadata.id(), src_pb, ctx, ctx.metadata(), new_metadata, family_id,
+            projection_plan_or_empty(ctx), *family_maps_ptr, &projected_pb));
+    if (!projected_pb.filename().empty()) {
+        dest->Add()->Swap(&projected_pb);
+    }
+    return Status::OK();
+}
+
+// Emit one non-shared legacy PK sstable (shared=false, !has_shared_rssid)
+// into dest. Routes through the per-entry rebuild path when the v2 plan
+// would project some referenced rssid to a value that disagrees with a
+// single ctx.rssid_offset shift; otherwise the metadata-only
+// project_non_shared_legacy_sstable path applies.
+Status emit_non_shared_legacy_sstable_into_dest(TabletManager* tablet_manager, const TabletMergeContext& ctx,
+                                                const PersistentIndexSstablePB& src_pb,
+                                                const TabletMetadataPB& new_metadata,
+                                                const std::vector<uint32_t>& ctx_disagreement_keys,
+                                                ::google::protobuf::RepeatedPtrField<PersistentIndexSstablePB>* dest) {
+    const auto lifted_range = clamp_lifted_range_to_uint32(src_pb.rssid_offset(), src_pb.max_rss_rowid() >> 32);
+    const bool needs_rebuild = lifted_range.valid() && !ctx_disagreement_keys.empty() &&
+                               TabletMergeContext::mapping_disagrees_with_natural_in_range(
+                                       ctx_disagreement_keys, lifted_range.lower, lifted_range.upper);
+    if (needs_rebuild) {
+        PersistentIndexSstablePB rebuilt_pb;
+        RETURN_IF_ERROR(rebuild_non_shared_legacy_sstable(tablet_manager, new_metadata.id(), src_pb, ctx,
+                                                          ctx.metadata(), &rebuilt_pb));
+        if (!rebuilt_pb.filename().empty()) {
+            dest->Add()->Swap(&rebuilt_pb);
+        }
+        return Status::OK();
+    }
+    auto* out = dest->Add();
+    out->CopyFrom(src_pb);
+    return project_non_shared_legacy_sstable(src_pb, ctx, out);
+}
+
 Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeContext>& merge_contexts,
                       TabletMetadataPB* new_metadata) {
     auto* dest = new_metadata->mutable_sstable_meta()->mutable_sstables();
@@ -2665,10 +2727,10 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
         const std::vector<uint32_t> ctx_disagreement_keys = ctx.compute_disagreement_keys();
 
         for (const auto& sst : ctx.metadata()->sstable_meta().sstables()) {
-            // Dedup: only shared sstables can be duplicates. The dedup map's
-            // value caches the SOURCE PB (not a dest index) — the rebuild
-            // path may replace or drop the projected PB, which would
-            // invalidate an index-based cache.
+            // (1) Dedup: only shared sstables can be duplicates across ctxs.
+            // The dedup map caches the SOURCE PB (not a dest index)
+            // because the rebuild path may replace or drop the projected
+            // PB, which would invalidate an index-based cache.
             if (sst.shared()) {
                 auto [it, inserted] = shared_dedup_sources.emplace(sst.filename(), sst);
                 if (!inserted) {
@@ -2679,79 +2741,32 @@ Status merge_sstables(TabletManager* tablet_manager, std::vector<TabletMergeCont
                 }
             }
 
-            // Ancestor-inherited shared PK sstable (shared=true,
-            // !has_shared_rssid): a single file holds entries for many
-            // ancestor rowsets, but the legacy metadata-only projection can
-            // only carry one rssid_offset. After multi-cycle split/merge with
-            // partial-child compaction, that single offset cannot keep stored
-            // rssids aligned with the merged tablet's surviving rowset ids.
-            // Rebuild physically — read each entry, remap rssids via merge_
-            // contexts, apply tablet-range and per-rssid delvec filters, emit
-            // a fresh non-shared sstable. See 6.4 in tablet_merge.md.
+            // (2) Ancestor-inherited shared PK sstable (shared=true,
+            // !has_shared_rssid): legacy form, may need rebuild after
+            // multi-cycle split/merge with partial-child compaction.
+            // The current ctx is the dedup-winner (= canonical_ctx) by
+            // construction since shared_dedup_sources only emplaces on
+            // first sighting. See 6.4 in tablet_merge.md.
             if (sst.shared() && !sst.has_shared_rssid()) {
-                // The current ctx is the dedup-winner by construction
-                // (shared_dedup_sources only emplaces on first sighting),
-                // so it serves as the canonical_ctx for this sstable. Its
-                // family_id (orphan-aware) selects the PerFamilyMaps used
-                // for both the fast-path's source/destination rssid checks
-                // and the rebuild path's per-entry remap.
                 RETURN_IF_ERROR(ensure_rssid_lookup_maps());
-                const uint32_t family_id = inferred_families.child_to_family[child_index];
-                ASSIGN_OR_RETURN(const auto* family_maps_ptr,
-                                 lookup_maps_for_ctx(rssid_lookup_maps, family_id, child_index));
-                // Resolve the v2 projection plan from the canonical_ctx so
-                // we don't have to plumb merge_tablet's stack local through
-                // every callsite. ctx is the dedup-winner (commit 3) so its
-                // projection_plan() pointer is the single shared plan when
-                // the PK gate fired in merge_tablet.
-                const detail::RssidProjectionPlan empty_plan{};
-                const detail::RssidProjectionPlan* plan_ptr = ctx.projection_plan();
-                const auto& plan = (plan_ptr != nullptr) ? *plan_ptr : empty_plan;
-                PersistentIndexSstablePB projected_pb;
-                RETURN_IF_ERROR(emit_legacy_shared_sstable_via_fastpath_or_rebuild(
-                        tablet_manager, new_metadata->id(), sst, ctx, ctx.metadata(), *new_metadata, family_id, plan,
-                        *family_maps_ptr, &projected_pb));
-                // Empty projected_pb → fast-path was unsafe AND rebuild
-                // dropped every entry; the shared_dedup_sources entry keeps
-                // same-filename siblings from re-running this work.
-                if (!projected_pb.filename().empty()) {
-                    dest->Add()->Swap(&projected_pb);
-                }
+                RETURN_IF_ERROR(emit_legacy_shared_sstable_into_dest(tablet_manager, ctx, child_index, sst,
+                                                                     *new_metadata, inferred_families,
+                                                                     rssid_lookup_maps, dest));
                 continue;
             }
 
-            // Modern projection: branch on has_shared_rssid, not on shared.
+            // (3) Modern projection: shared sstable with has_shared_rssid
+            // (split-derived single-rowset slice).
             if (sst.has_shared_rssid()) {
                 auto* out = dest->Add();
                 out->CopyFrom(sst);
                 RETURN_IF_ERROR(project_modern_shared_rssid_sstable(sst, ctx, new_metadata, out));
                 continue;
             }
-            // Non-shared, non-modern: child-local PK sstable. v2 may need
-            // a per-entry rebuild if the v2 plan would project some of
-            // its referenced rssids to a value that disagrees with a
-            // single ctx.rssid_offset shift (= sstable mixes shared-
-            // ancestor and child-local references). The pre-probe is
-            // signed-aware and conservative on the safe side: false-
-            // positives only cost an extra rebuild.
-            const auto lifted_range = clamp_lifted_range_to_uint32(sst.rssid_offset(), sst.max_rss_rowid() >> 32);
-            const bool needs_rebuild = lifted_range.valid() && !ctx_disagreement_keys.empty() &&
-                                       TabletMergeContext::mapping_disagrees_with_natural_in_range(
-                                               ctx_disagreement_keys, lifted_range.lower, lifted_range.upper);
-            if (needs_rebuild) {
-                PersistentIndexSstablePB rebuilt_pb;
-                RETURN_IF_ERROR(rebuild_non_shared_legacy_sstable(tablet_manager, new_metadata->id(), sst, ctx,
-                                                                  ctx.metadata(), &rebuilt_pb));
-                if (!rebuilt_pb.filename().empty()) {
-                    dest->Add()->Swap(&rebuilt_pb);
-                }
-                // empty rebuilt_pb → drop sstable, matches legacy-shared
-                // rebuild semantics.
-            } else {
-                auto* out = dest->Add();
-                out->CopyFrom(sst);
-                RETURN_IF_ERROR(project_non_shared_legacy_sstable(sst, ctx, out));
-            }
+
+            // (4) Non-shared, non-modern: child-local PK sstable.
+            RETURN_IF_ERROR(emit_non_shared_legacy_sstable_into_dest(tablet_manager, ctx, sst, *new_metadata,
+                                                                     ctx_disagreement_keys, dest));
         }
     }
 
