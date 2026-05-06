@@ -224,9 +224,9 @@ public:
         std::vector<uint32_t> keys;
         if (_projection_plan != nullptr) {
             keys.reserve(_projection_plan->explicit_rssid_map.size() + _shared_rssid_map.size());
-            for (const auto& entry : _projection_plan->explicit_rssid_map) {
-                if (entry.first.first != _child_index) continue;
-                add_if_disagreeing(keys, entry.first.second, entry.second);
+            for (const auto& [source_key, final_rssid] : _projection_plan->explicit_rssid_map) {
+                if (source_key.child_index != _child_index) continue;
+                add_if_disagreeing(keys, source_key.source_rssid, final_rssid);
             }
         } else {
             keys.reserve(_shared_rssid_map.size());
@@ -256,10 +256,10 @@ public:
     void update_shared_rssid_map(const RowsetMetadataPB& rowset, const RowsetMetadataPB& canonical_rowset) {
         uint32_t canonical_rssid = canonical_rowset.id();
         _shared_rssid_map[rowset.id()] = canonical_rssid;
-        for (int seg_pos = 0; seg_pos < rowset.segments_size(); ++seg_pos) {
-            uint32_t rssid = get_rssid(rowset, seg_pos);
-            uint32_t seg_offset = rssid - rowset.id();
-            _shared_rssid_map[rssid] = canonical_rssid + seg_offset;
+        for (int segment_pos = 0; segment_pos < rowset.segments_size(); ++segment_pos) {
+            uint32_t rssid = get_rssid(rowset, segment_pos);
+            uint32_t segment_offset_within_rowset = rssid - rowset.id();
+            _shared_rssid_map[rssid] = canonical_rssid + segment_offset_within_rowset;
         }
     }
 

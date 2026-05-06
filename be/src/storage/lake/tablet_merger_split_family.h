@@ -124,12 +124,22 @@ struct InferredSplitFamilies {
 // is always the smallest child_index in the family.
 StatusOr<InferredSplitFamilies> infer_split_families(const std::vector<SplitFamilyInferenceInput>& inputs);
 
-// Hash for the (child_index, source_rssid) key in
-// RssidProjectionPlan::explicit_rssid_map. Folds the two uint32 halves
-// into a single uint64 so the hash uses both fields independently.
+// Composite key for RssidProjectionPlan::explicit_rssid_map. The named
+// fields prevent positional swaps and self-document each side of the
+// pair (the prior std::pair<uint32_t, uint32_t> shape forced callers
+// to read .first.first / .first.second pattern with no spelling).
+struct SourceRssidKey {
+    uint32_t child_index = 0;
+    uint32_t source_rssid = 0;
+
+    bool operator==(const SourceRssidKey& other) const = default;
+};
+
+// Folds the two uint32 halves of SourceRssidKey into a single uint64 so
+// the hash uses both fields independently.
 struct SourceRssidKeyHash {
-    size_t operator()(const std::pair<uint32_t, uint32_t>& key) const noexcept {
-        return std::hash<uint64_t>{}((static_cast<uint64_t>(key.first) << 32) | key.second);
+    size_t operator()(const SourceRssidKey& key) const noexcept {
+        return std::hash<uint64_t>{}((static_cast<uint64_t>(key.child_index) << 32) | key.source_rssid);
     }
 };
 
@@ -139,8 +149,6 @@ struct SourceRssidKeyHash {
 // (commit 5). For now, this commit only BUILDS the plan; no caller
 // consumes it.
 struct RssidProjectionPlan {
-    using SourceRssidKey = std::pair<uint32_t, uint32_t>; // (child_index, source_rssid)
-
     // (child_index, source_rssid) → final_rssid for shared-ancestor rowsets
     // in safe families. Populated for both the rowset.id() key (covers
     // add_rowset's first map_rssid call and rowset-level metadata such as

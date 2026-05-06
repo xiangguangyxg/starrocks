@@ -371,7 +371,7 @@ StatusOr<RssidProjectionPlan> build_rssid_projection_plan(const std::vector<Spli
                 // Step 1 already would have marked the family unsafe on
                 // overflow, but defensively skip the entry here too.
                 if (rs_id_final >= 0 && rs_id_final <= std::numeric_limits<uint32_t>::max()) {
-                    plan.explicit_rssid_map.emplace(RssidProjectionPlan::SourceRssidKey{child_index, rowset.id()},
+                    plan.explicit_rssid_map.emplace(SourceRssidKey{child_index, rowset.id()},
                                                     static_cast<uint32_t>(rs_id_final));
                 }
                 for (int segment_pos = 0; segment_pos < rowset.segments_size(); ++segment_pos) {
@@ -379,7 +379,7 @@ StatusOr<RssidProjectionPlan> build_rssid_projection_plan(const std::vector<Spli
                     if (!lifted_or.has_value()) continue;
                     const int64_t segment_final = static_cast<int64_t>(*lifted_or) + family.canonical_rssid_offset;
                     if (segment_final < 0 || segment_final > std::numeric_limits<uint32_t>::max()) continue;
-                    plan.explicit_rssid_map.emplace(RssidProjectionPlan::SourceRssidKey{child_index, *lifted_or},
+                    plan.explicit_rssid_map.emplace(SourceRssidKey{child_index, *lifted_or},
                                                     static_cast<uint32_t>(segment_final));
                 }
             }
