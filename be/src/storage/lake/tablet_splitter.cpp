@@ -743,6 +743,33 @@ Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetada
     return Status::OK();
 }
 
+// Builds a single new-tablet metadata that is "identical" to the old tablet —
+// inherits rowsets / delvec_meta / sstable_meta / dcg_meta / rowset_to_schema as-is,
+// only rebinds id / version / commit_time / gtid and clears the per-version
+// transient fields (compaction_inputs, orphan_files, prev_garbage_version).
+//
+// Used by:
+//   - split_tablet's fallback path when get_tablet_split_ranges fails to
+//     produce a valid split (data-driven path can't compute boundaries).
+//   - PSPS's split_tablet_external fallback path when the old tablet has
+//     gained data between FE eligibility check and BE handler (race).
+//
+// In both cases the old tablet may be non-empty; the identical new tablet
+// must inherit its data so the load can write into it without data loss.
+MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadataPtr& old_tablet_metadata,
+                                                            int64_t new_id, int64_t new_version,
+                                                            const TxnInfoPB& txn_info) {
+    auto new_tablet_metadata = std::make_shared<TabletMetadataPB>(*old_tablet_metadata);
+    new_tablet_metadata->set_id(new_id);
+    new_tablet_metadata->set_version(new_version);
+    new_tablet_metadata->set_commit_time(txn_info.commit_time());
+    new_tablet_metadata->set_gtid(txn_info.gtid());
+    new_tablet_metadata->clear_compaction_inputs();
+    new_tablet_metadata->clear_orphan_files();
+    new_tablet_metadata->clear_prev_garbage_version();
+    return new_tablet_metadata;
+}
+
 } // namespace
 
 StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
@@ -775,14 +802,8 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
         LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: " << old_tablet_metadata->id()
                      << ", version: " << old_tablet_metadata->version() << ", txn_id: " << txn_info.txn_id()
                      << ", status: " << status;
-        auto new_tablet_metadata = std::make_shared<TabletMetadataPB>(*old_tablet_metadata);
-        new_tablet_metadata->set_id(splitting_tablet.new_tablet_ids(0));
-        new_tablet_metadata->set_version(new_version);
-        new_tablet_metadata->set_commit_time(txn_info.commit_time());
-        new_tablet_metadata->set_gtid(txn_info.gtid());
-        new_tablet_metadata->clear_compaction_inputs();
-        new_tablet_metadata->clear_orphan_files();
-        new_tablet_metadata->clear_prev_garbage_version();
+        auto new_tablet_metadata = make_identical_new_tablet_metadata(
+                old_tablet_metadata, splitting_tablet.new_tablet_ids(0), new_version, txn_info);
         new_metadatas.emplace(new_tablet_metadata->id(), std::move(new_tablet_metadata));
         return new_metadatas;
     }
