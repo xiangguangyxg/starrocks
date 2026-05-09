@@ -770,6 +770,29 @@ MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadata
     return new_tablet_metadata;
 }
 
+// Strict precondition check for the PSPS pre-split path: the old tablet must
+// carry no rowsets and no rowset-derived metadata. Schema/config fields are
+// intentionally NOT checked — they are inherited by the new tablets.
+//
+// Per-version transient fields (compaction_inputs, orphan_files,
+// prev_garbage_version) are also expected to be empty on a freshly created,
+// never-written tablet; they are checked here so we don't silently inherit
+// stale per-version state into the new tablets.
+bool old_tablet_is_fully_empty(const TabletMetadataPB& m) {
+    if (m.rowsets_size() != 0) return false;
+    if (m.compaction_inputs_size() != 0) return false;
+    if (m.orphan_files_size() != 0) return false;
+    if (m.has_prev_garbage_version()) return false;
+    if (!m.rowset_to_schema().empty()) return false;
+    if (m.has_delvec_meta() &&
+        (!m.delvec_meta().version_to_file().empty() || !m.delvec_meta().delvecs().empty())) {
+        return false;
+    }
+    if (m.has_sstable_meta() && m.sstable_meta().sstables_size() != 0) return false;
+    if (m.has_dcg_meta() && !m.dcg_meta().dcgs().empty()) return false;
+    return true;
+}
+
 } // namespace
 
 StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
