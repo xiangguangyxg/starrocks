@@ -312,7 +312,8 @@ Status TabletRangeHelper::validate_new_tablet_ranges(
     //    bounds (when both set) must not be byte-equal (catches zero-width
     //    children). Strict semantic ordering (lower < upper) requires a
     //    schema for type-aware comparison and is the caller's responsibility
-    //    (e.g., split_tablet_external compares via the tablet schema).
+    //    (e.g., compute_split_ranges_from_external_boundaries compares via
+    //    the tablet schema).
     for (const auto& r : new_tablet_ranges) {
         RETURN_IF_ERROR(validate_tablet_range(r));
         if (r.has_lower_bound() && r.has_upper_bound() &&

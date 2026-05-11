@@ -28,6 +28,8 @@
 #include "storage/lake/tablet_reshard_helper.h"
 #include "storage/lake/update_manager.h"
 #include "storage/tablet_range.h"
+#include "storage/tablet_schema.h"
+#include "types/type_descriptor.h"
 
 extern bvar::Adder<int64_t> g_tablet_reshard_split_fallback_total;
 extern bvar::Adder<int64_t> g_tablet_reshard_split_psps_fallback_total;
@@ -783,25 +785,38 @@ MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadata
 // fall back internally; it surfaces the precise reason via Status::message.
 //
 // Algorithm (high level):
-//   1. Validate size match and structural well-formedness of external_ranges.
-//   2. Seed K TabletRangeInfo from external_ranges (rowset_stats empty).
-//   3. Empty old tablet fast-path: K empty new-tablets fall out naturally.
-//   4. Build SegmentSplitInfo from rowsets (same as get_tablet_split_ranges).
-//   5. Compute segment envelope and effective envelope (intersection with
-//      parent's range). Empty / degenerate-point envelope -> InvalidArgument.
-//   6. Parse FE bounds into VariantTuple; validate semantic monotonic ordering
-//      (catches structurally-tiled but semantically-reversed adversarial input
-//      that the byte-level validate_new_tablet_ranges cannot detect).
-//   7. Build distribution vector covering the FULL segment envelope:
-//      [optional left_sink, K (or fewer, after clipping) active slots,
-//       optional right_sink]. Sinks absorb out-of-parent-range segment data
-//       from shared rowsets (prior-split residual).
-//   8. Distribute segments into the full vector.
-//   9. Build anchor; sanity-check that every rowset with anchor totals > 0
-//      has positive active weight on the matching (rows or bytes) axis.
-//      Otherwise allocate_proportionally would uniformly fabricate stats.
-//  10. Synthesize a RangeSplitResult and apply anchor; output is K
-//      TabletRangeInfo in *split_ranges with normalized rowset_stats.
+//   1a. Size match.
+//   1b. Structural well-formedness of external_ranges (schema-free byte check).
+//   1c. Schema-aware validation: each TuplePB matches the tablet's sort key
+//       in arity and per-column type. Required because DatumVariant::compare
+//       only DCHECKs matching types and would silently mis-compare in release.
+//   2.  Seed K TabletRangeInfo from external_ranges (rowset_stats empty).
+//   3.  Parse FE bounds into VariantTuple + track explicit-presence per side.
+//       "Explicit" means the bound was supplied on the external range OR
+//       inherited from a present parent bound. Only first.lo / last.hi can
+//       ever be non-explicit (== ±infinity, per structural validation).
+//       3a. Per-range strict check: parsed[i].lo >= parsed[i].hi (when both
+//           explicit) -> reject. Strict '>=' covers semantic zero-width that
+//           the byte-level structural check cannot detect.
+//       3b. Adjacent monotonic check: parsed[i].hi > parsed[i+1].lo -> reject.
+//           Interior bounds are always explicit per structural validation.
+//       Runs BEFORE the empty fast-path so empty PSPS tablets get the same
+//       semantic guarantees as non-empty ones.
+//   4.  Empty old tablet fast-path: K empty new-tablets fall out naturally.
+//   5.  Build SegmentSplitInfo from rowsets (same as get_tablet_split_ranges).
+//   6.  Compute segment envelope and effective envelope (intersection with
+//       parent's range). Empty / degenerate-point envelope -> InvalidArgument.
+//   7.  Build distribution vector covering the FULL segment envelope:
+//       [optional left_sink, K (or fewer, after clipping) active slots,
+//        optional right_sink]. Sinks absorb out-of-parent-range segment data
+//       from shared rowsets (prior-split residual). Non-explicit ±infinity
+//       sides clip to effective envelope edge.
+//   8.  Distribute segments into the full vector.
+//   9.  Build anchor; sanity-check that every rowset with anchor totals > 0
+//       has positive active weight on the matching (rows or bytes) axis.
+//       Otherwise allocate_proportionally would uniformly fabricate stats.
+//  10.  Synthesize a RangeSplitResult and apply anchor; output is K
+//       TabletRangeInfo in *split_ranges with normalized rowset_stats.
 Status compute_split_ranges_from_external_boundaries(
         TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
         const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
@@ -821,6 +836,81 @@ Status compute_split_ranges_from_external_boundaries(
     //     last.upper matches parent.upper, adjacent ranges meet exactly.
     RETURN_IF_ERROR(TabletRangeHelper::validate_new_tablet_ranges(old_tablet_metadata->range(), external_ranges));
 
+    // 1c. Schema-aware validation of FE-supplied TuplePB bounds. Without
+    //     this, DatumVariant::compare's DCHECK-only type guard means
+    //     release builds silently mis-compare malformed FE input.
+    //     For decimal-family columns, also validate precision/scale exactly:
+    //     DecimalTypeInfo compares raw unscaled values, so a bound with the
+    //     same LogicalType but different scale than the schema would
+    //     mis-order against schema-derived segment bounds.
+    auto tablet_schema = TabletSchema::create(old_tablet_metadata->schema());
+    const auto& sort_key_idxes = tablet_schema->sort_key_idxes();
+    if (sort_key_idxes.empty()) {
+        return Status::InvalidArgument("tablet has no sort key columns; PSPS path requires a sort key");
+    }
+    auto validate_tuple_against_schema = [&](const TuplePB& t, int range_idx,
+                                             std::string_view side) -> Status {
+        if (t.values_size() != static_cast<int>(sort_key_idxes.size())) {
+            return Status::InvalidArgument(
+                    fmt::format("new_tablet_ranges[{}].{}: tuple arity {} != sort_key arity {}", range_idx,
+                                side, t.values_size(), sort_key_idxes.size()));
+        }
+        for (int j = 0; j < t.values_size(); ++j) {
+            const auto& var = t.values(j);
+            // PSPS sort-key bounds are scalar values only — tablet sort
+            // keys are restricted to scalar types (no ARRAY/MAP/STRUCT).
+            // Enforce a single SCALAR PTypeNode with scalar_type set so
+            // malformed FE input cannot reach the underlying
+            // TypeDescriptor PTypeNode constructor, which DCHECKs and
+            // does unguarded types.Get() on complex-type child indices
+            // (be/src/types/type_descriptor.cpp:158-204).
+            if (!var.has_type() || var.type().types_size() != 1) {
+                return Status::InvalidArgument(fmt::format(
+                        "new_tablet_ranges[{}].{}: column[{}] variant must have exactly one type node "
+                        "(got types_size={})",
+                        range_idx, side, j, var.type().types_size()));
+            }
+            const auto& node = var.type().types(0);
+            if (static_cast<TTypeNodeType::type>(node.type()) != TTypeNodeType::SCALAR ||
+                !node.has_scalar_type()) {
+                return Status::InvalidArgument(fmt::format(
+                        "new_tablet_ranges[{}].{}: column[{}] variant must be a scalar type "
+                        "(got node_type={}, has_scalar_type={})",
+                        range_idx, side, j, node.type(), node.has_scalar_type()));
+            }
+            const int col_idx = sort_key_idxes[j];
+            const auto& col = tablet_schema->column(col_idx);
+            const LogicalType col_type = col.type();
+            const auto var_type_desc = TypeDescriptor::from_protobuf(var.type());
+            if (var_type_desc.type != col_type) {
+                return Status::InvalidArgument(fmt::format(
+                        "new_tablet_ranges[{}].{}: column[{}] variant type {} != schema type {}", range_idx,
+                        side, j, static_cast<int>(var_type_desc.type), static_cast<int>(col_type)));
+            }
+            if (var_type_desc.is_decimal_type()) {
+                const int schema_precision = static_cast<int>(col.precision());
+                const int schema_scale = static_cast<int>(col.scale());
+                if (var_type_desc.precision != schema_precision || var_type_desc.scale != schema_scale) {
+                    return Status::InvalidArgument(fmt::format(
+                            "new_tablet_ranges[{}].{}: column[{}] decimal precision/scale "
+                            "({}, {}) != schema ({}, {})",
+                            range_idx, side, j, var_type_desc.precision, var_type_desc.scale,
+                            schema_precision, schema_scale));
+                }
+            }
+        }
+        return Status::OK();
+    };
+    for (int i = 0; i < external_ranges.size(); ++i) {
+        const auto& er = external_ranges[i];
+        if (er.has_lower_bound()) {
+            RETURN_IF_ERROR(validate_tuple_against_schema(er.lower_bound(), i, "lower"));
+        }
+        if (er.has_upper_bound()) {
+            RETURN_IF_ERROR(validate_tuple_against_schema(er.upper_bound(), i, "upper"));
+        }
+    }
+
     // 2. Seed K TabletRangeInfo from external_ranges; rowset_stats stays empty
     //    for now (filled by apply_rowset_anchor in step 10).
     split_ranges->reserve(external_ranges.size());
@@ -829,15 +919,65 @@ Status compute_split_ranges_from_external_boundaries(
         tri.range = er;
     }
 
-    // 3. Empty old tablet fast-path: no rowsets to distribute, K
+    // 3. Parse FE bounds into VariantTuple + track explicit-presence. An
+    //    unset side (only possible at first.lo / last.hi per structural
+    //    validation) means ±infinity and is excluded from the per-range
+    //    inversion check at step 3a. Adjacent (3b) bounds are always
+    //    explicit (interior boundaries are required to be set).
+    struct ParsedBounds {
+        VariantTuple lo;
+        VariantTuple hi;
+        bool lo_explicit = false;
+        bool hi_explicit = false;
+    };
+    std::vector<ParsedBounds> parsed(external_ranges.size());
+    for (int i = 0; i < external_ranges.size(); ++i) {
+        const auto& er = external_ranges[i];
+        if (er.has_lower_bound()) {
+            RETURN_IF_ERROR(parsed[i].lo.from_proto(er.lower_bound()));
+            parsed[i].lo_explicit = true;
+        } else if (old_tablet_metadata->range().has_lower_bound()) {
+            RETURN_IF_ERROR(parsed[i].lo.from_proto(old_tablet_metadata->range().lower_bound()));
+            parsed[i].lo_explicit = true;
+        }
+        if (er.has_upper_bound()) {
+            RETURN_IF_ERROR(parsed[i].hi.from_proto(er.upper_bound()));
+            parsed[i].hi_explicit = true;
+        } else if (old_tablet_metadata->range().has_upper_bound()) {
+            RETURN_IF_ERROR(parsed[i].hi.from_proto(old_tablet_metadata->range().upper_bound()));
+            parsed[i].hi_explicit = true;
+        }
+    }
+
+    // 3a. Per-range strict semantic check. '>=' catches inversion AND
+    //     semantic zero-width (e.g., byte-distinct but same value under
+    //     schema-aware comparison). Skip when either side is ±infinity.
+    for (int i = 0; i < external_ranges.size(); ++i) {
+        if (!parsed[i].lo_explicit || !parsed[i].hi_explicit) continue;
+        if (parsed[i].lo.compare(parsed[i].hi) >= 0) {
+            return Status::InvalidArgument(
+                    fmt::format("new_tablet_ranges[{}] semantically inverted/zero-width (lower >= upper)", i));
+        }
+    }
+
+    // 3b. Adjacent monotonic check. Interior bounds are always explicit.
+    for (int i = 0; i + 1 < external_ranges.size(); ++i) {
+        if (parsed[i].hi.compare(parsed[i + 1].lo) > 0) {
+            return Status::InvalidArgument(
+                    fmt::format("new_tablet_ranges[{}/{}] semantically out of order", i, i + 1));
+        }
+    }
+
+    // 4. Empty old tablet fast-path: no rowsets to distribute, K
     //    TabletRangeInfo with empty rowset_stats is the correct output.
     //    build_new_tablets_from_split_ranges will produce K new tablets with
-    //    no rowsets.
+    //    no rowsets. Runs AFTER FE-input validation so empty PSPS tablets
+    //    cannot accept semantically-invalid ranges either.
     if (old_tablet_metadata->rowsets_size() == 0) {
         return Status::OK();
     }
 
-    // 4. Build SegmentSplitInfo from rowsets. Same logic as
+    // 5. Build SegmentSplitInfo from rowsets. Same logic as
     //    get_tablet_split_ranges; shared via copy because the segment-load
     //    error handling differs slightly here (we return PSPS-shaped errors).
     std::vector<SegmentSplitInfo> segments;
@@ -864,7 +1004,7 @@ Status compute_split_ranges_from_external_boundaries(
         return Status::InvalidArgument("rowsets present but no segments derived (possibly corrupt metadata)");
     }
 
-    // 5. Compute segment envelope and effective envelope.
+    // 6. Compute segment envelope and effective envelope.
     VariantTuple seg_min = segments.front().min_key;
     VariantTuple seg_max = segments.front().max_key;
     for (const auto& s : segments) {
@@ -892,46 +1032,9 @@ Status compute_split_ranges_from_external_boundaries(
                 "single key)");
     }
 
-    // 6. Parse FE bounds into VariantTuple and validate semantic monotonic
-    //    ordering. validate_new_tablet_ranges (step 1b) is byte-level; this
-    //    is schema-aware via VariantTuple::compare.
-    struct ParsedBounds {
-        VariantTuple lo;
-        VariantTuple hi;
-    };
-    std::vector<ParsedBounds> parsed(external_ranges.size());
-    for (int i = 0; i < external_ranges.size(); ++i) {
-        const auto& er = external_ranges[i];
-        if (er.has_lower_bound()) {
-            RETURN_IF_ERROR(parsed[i].lo.from_proto(er.lower_bound()));
-        } else if (old_tablet_metadata->range().has_lower_bound()) {
-            RETURN_IF_ERROR(parsed[i].lo.from_proto(old_tablet_metadata->range().lower_bound()));
-        } else {
-            parsed[i].lo = effective_lo;
-        }
-        if (er.has_upper_bound()) {
-            RETURN_IF_ERROR(parsed[i].hi.from_proto(er.upper_bound()));
-        } else if (old_tablet_metadata->range().has_upper_bound()) {
-            RETURN_IF_ERROR(parsed[i].hi.from_proto(old_tablet_metadata->range().upper_bound()));
-        } else {
-            parsed[i].hi = effective_hi;
-        }
-    }
-    for (int i = 0; i < external_ranges.size(); ++i) {
-        if (parsed[i].lo.compare(parsed[i].hi) > 0) {
-            return Status::InvalidArgument(
-                    fmt::format("new_tablet_ranges[{}] semantically inverted (lower > upper)", i));
-        }
-    }
-    for (int i = 0; i + 1 < external_ranges.size(); ++i) {
-        if (parsed[i].hi.compare(parsed[i + 1].lo) > 0) {
-            return Status::InvalidArgument(
-                    fmt::format("new_tablet_ranges[{}/{}] semantically out of order", i, i + 1));
-        }
-    }
-
     // 7. Build distribution vector covering the FULL segment envelope.
     //    dist_to_final[j] == -1 for sinks, otherwise the index into split_ranges.
+    //    Non-explicit ±infinity sides clip to the effective envelope edge.
     std::vector<RangeInfo> dist_ranges;
     std::vector<int> dist_to_final;
     dist_ranges.reserve(external_ranges.size() + 2);
@@ -944,8 +1047,12 @@ Status compute_split_ranges_from_external_boundaries(
         dist_to_final.push_back(-1);
     }
     for (int i = 0; i < external_ranges.size(); ++i) {
-        const VariantTuple& clipped_lo = (parsed[i].lo.compare(effective_lo) < 0) ? effective_lo : parsed[i].lo;
-        const VariantTuple& clipped_hi = (parsed[i].hi.compare(effective_hi) > 0) ? effective_hi : parsed[i].hi;
+        const VariantTuple clipped_lo =
+                parsed[i].lo_explicit ? ((parsed[i].lo.compare(effective_lo) < 0) ? effective_lo : parsed[i].lo)
+                                      : effective_lo;
+        const VariantTuple clipped_hi =
+                parsed[i].hi_explicit ? ((parsed[i].hi.compare(effective_hi) > 0) ? effective_hi : parsed[i].hi)
+                                      : effective_hi;
         // Skip on '>=' (zero-width too): [x,x) cannot contain any row under
         // closed-open semantics; including would risk closed-last-range edge.
         if (clipped_lo.compare(clipped_hi) >= 0) continue;
