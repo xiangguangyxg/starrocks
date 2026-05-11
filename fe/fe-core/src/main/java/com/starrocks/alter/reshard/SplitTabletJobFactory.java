@@ -147,7 +147,9 @@ public class SplitTabletJobFactory implements TabletReshardJobFactory {
 
             TabletMeta tabletMeta = GlobalStateMgr.getCurrentState().getTabletInvertedIndex()
                     .getTabletMeta(oldTabletId);
-            if (tabletMeta == TabletInvertedIndex.NOT_EXIST_TABLET_META
+            // getTabletMeta returns null (raw map miss) when the tablet is
+            // unknown — distinct from getTabletMetaList's NOT_EXIST sentinel.
+            if (tabletMeta == null || tabletMeta == TabletInvertedIndex.NOT_EXIST_TABLET_META
                     || tabletMeta.getTableId() != table.getId()) {
                 throw new StarRocksException("Cannot find tablet " + oldTabletId
                         + " in inverted index in table " + db.getFullName() + '.' + table.getName());
