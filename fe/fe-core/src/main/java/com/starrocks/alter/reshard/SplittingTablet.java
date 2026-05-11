@@ -23,6 +23,7 @@ import com.starrocks.proto.SplittingTabletInfoPB;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /*
@@ -53,6 +54,9 @@ public class SplittingTablet implements ReshardingTablet {
     public SplittingTablet(long oldTabletId, List<Long> newTabletIds, List<TabletRange> newTabletRanges) {
         this.oldTabletId = oldTabletId;
         this.newTabletIds = newTabletIds;
+        Preconditions.checkNotNull(newTabletRanges, "newTabletRanges must not be null");
+        Preconditions.checkArgument(newTabletRanges.stream().allMatch(Objects::nonNull),
+                "newTabletRanges must not contain null elements");
         // Always wrap in a mutable ArrayList: fallbackToIdenticalTablet() clears
         // this list after a BE-side fallback, mirroring how newTabletIds is
         // mutated via subList(...).clear().
