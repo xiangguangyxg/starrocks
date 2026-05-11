@@ -430,7 +430,8 @@ message SplittingTabletInfoPB {
     // FE-supplied new-tablet ranges (PSPS / Pre-Sample & Pre-Split path).
     // When non-empty:
     //   - BE skips data-driven boundary computation in `split_tablet` and
-    //     dispatches to `split_tablet_external` instead.
+    //     dispatches to `compute_split_ranges_from_external_boundaries`
+    //     instead, which honors these ranges verbatim.
     //   - Size MUST equal new_tablet_ids.size.
     //   - Ranges MUST cover the old tablet's range exactly with no gaps/overlaps.
     //   - Each range uses [lower, upper) (upper_bound_included=false).
