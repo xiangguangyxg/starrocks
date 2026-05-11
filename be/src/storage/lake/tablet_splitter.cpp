@@ -798,52 +798,35 @@ bool old_tablet_is_fully_empty(const TabletMetadataPB& m) {
     return true;
 }
 
-} // namespace
-
-StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
-        TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
-        const SplittingTabletInfoPB& splitting_tablet, int64_t new_version, const TxnInfoPB& txn_info) {
-    if (tablet_metadata == nullptr) {
-        return Status::InvalidArgument("tablet metadata is null");
-    }
-    if (splitting_tablet.new_tablet_ids_size() <= 0) {
-        return Status::InvalidArgument("splitting tablet has no new tablet");
-    }
-
-    // Flush the parent's PK-index memtable into sstables before propagating
-    // metadata to the children, so every child inherits an sstable_meta that
-    // already covers its rowsets' live data. This is the pre-split half of
-    // the "reshard inputs must have full sstable coverage" invariant; merge
-    // does the post-split half in merge_sstables.
-    ASSIGN_OR_RETURN(TabletMetadataPtr old_tablet_metadata,
-                     tablet_manager->update_mgr()->flush_pk_memtable(tablet_metadata));
-
-    std::unordered_map<int64_t, MutableTabletMetadataPtr> new_metadatas;
-
-    std::vector<TabletRangeInfo> split_ranges;
-    // colocate_column_count is carried at the txn level (single split job = single txn) since
-    // every SplittingTabletInfoPB in the same job would carry the same value. See lake_types.proto.
-    Status status = get_tablet_split_ranges(tablet_manager, old_tablet_metadata, splitting_tablet.new_tablet_ids_size(),
-                                            &split_ranges, txn_info.colocate_column_count());
-    if (!status.ok()) {
-        g_tablet_reshard_split_fallback_total << 1;
-        LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: " << old_tablet_metadata->id()
-                     << ", version: " << old_tablet_metadata->version() << ", txn_id: " << txn_info.txn_id()
-                     << ", status: " << status;
-        auto new_tablet_metadata = make_identical_new_tablet_metadata(
-                old_tablet_metadata, splitting_tablet.new_tablet_ids(0), new_version, txn_info);
-        new_metadatas.emplace(new_tablet_metadata->id(), std::move(new_tablet_metadata));
-        return new_metadatas;
-    }
-
-    // Defense-in-depth: get_tablet_split_ranges guarantees
-    // split_ranges.size() == new_tablet_ids_size() on OK, but a runtime check
-    // here prevents OOB reads into split_ranges[i] if the contract is ever
+// Build K new-tablet metadata entries from a pre-computed split_ranges vector.
+// Source-agnostic: the caller decides how split_ranges was produced (data-driven
+// boundary search, FE-supplied PSPS boundaries, or any future variant). Each
+// new tablet inherits the old tablet's schema/config, gets a fresh
+// id/version/commit_time/gtid/range, has per-version transient fields cleared,
+// and its rowset list is restricted to the new range with per-rowset stats
+// applied from split_ranges[i].rowset_stats.
+//
+// Precondition: split_ranges.size() == splitting_tablet.new_tablet_ids_size().
+// Per-rowset stats are honored when present in split_ranges[i].rowset_stats;
+// otherwise the rowset is preserved in the new tablet's metadata (still
+// referencing the same shared segment files) but with num_rows / data_size /
+// num_dels set to 0, signaling "rowset is visible in this child's metadata
+// but contributes no rows here under the child's range".
+StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> build_new_tablets_from_split_ranges(
+        const TabletMetadataPtr& old_tablet_metadata, const SplittingTabletInfoPB& splitting_tablet,
+        int64_t new_version, const TxnInfoPB& txn_info, const std::vector<TabletRangeInfo>& split_ranges) {
+    // Defense-in-depth: callers (get_tablet_split_ranges and PSPS helper) are
+    // contracted to return split_ranges.size() == new_tablet_ids_size() on OK,
+    // but a runtime check here prevents OOB reads if the contract is ever
     // broken by a future refactor (Release builds strip DCHECK).
     if (split_ranges.size() != static_cast<size_t>(splitting_tablet.new_tablet_ids_size())) {
         return Status::InternalError(fmt::format("split_ranges size mismatch: expected={}, actual={}",
                                                  splitting_tablet.new_tablet_ids_size(), split_ranges.size()));
     }
+
+    std::unordered_map<int64_t, MutableTabletMetadataPtr> new_metadatas;
+    new_metadatas.reserve(splitting_tablet.new_tablet_ids_size());
+
     for (int32_t i = 0; i < splitting_tablet.new_tablet_ids_size(); ++i) {
         auto new_tablet_new_metadata = std::make_shared<TabletMetadataPB>(*old_tablet_metadata);
         new_tablet_new_metadata->set_id(splitting_tablet.new_tablet_ids(i));
@@ -879,6 +862,47 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
     }
 
     return new_metadatas;
+}
+
+} // namespace
+
+StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
+        TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
+        const SplittingTabletInfoPB& splitting_tablet, int64_t new_version, const TxnInfoPB& txn_info) {
+    if (tablet_metadata == nullptr) {
+        return Status::InvalidArgument("tablet metadata is null");
+    }
+    if (splitting_tablet.new_tablet_ids_size() <= 0) {
+        return Status::InvalidArgument("splitting tablet has no new tablet");
+    }
+
+    // Flush the parent's PK-index memtable into sstables before propagating
+    // metadata to the children, so every child inherits an sstable_meta that
+    // already covers its rowsets' live data. This is the pre-split half of
+    // the "reshard inputs must have full sstable coverage" invariant; merge
+    // does the post-split half in merge_sstables.
+    ASSIGN_OR_RETURN(TabletMetadataPtr old_tablet_metadata,
+                     tablet_manager->update_mgr()->flush_pk_memtable(tablet_metadata));
+
+    std::vector<TabletRangeInfo> split_ranges;
+    // colocate_column_count is carried at the txn level (single split job = single txn) since
+    // every SplittingTabletInfoPB in the same job would carry the same value. See lake_types.proto.
+    Status status = get_tablet_split_ranges(tablet_manager, old_tablet_metadata, splitting_tablet.new_tablet_ids_size(),
+                                            &split_ranges, txn_info.colocate_column_count());
+    if (!status.ok()) {
+        g_tablet_reshard_split_fallback_total << 1;
+        LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: " << old_tablet_metadata->id()
+                     << ", version: " << old_tablet_metadata->version() << ", txn_id: " << txn_info.txn_id()
+                     << ", status: " << status;
+        auto new_tablet_metadata = make_identical_new_tablet_metadata(
+                old_tablet_metadata, splitting_tablet.new_tablet_ids(0), new_version, txn_info);
+        std::unordered_map<int64_t, MutableTabletMetadataPtr> new_metadatas;
+        new_metadatas.emplace(new_tablet_metadata->id(), std::move(new_tablet_metadata));
+        return new_metadatas;
+    }
+
+    return build_new_tablets_from_split_ranges(old_tablet_metadata, splitting_tablet, new_version, txn_info,
+                                                split_ranges);
 }
 
 } // namespace starrocks::lake
