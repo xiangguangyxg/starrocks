@@ -451,16 +451,27 @@ public class SplitTabletJobTest {
 
         PhysicalPartition physicalPartition = table.getAllPhysicalPartitions().iterator().next();
         MaterializedIndex materializedIndex = physicalPartition.getLatestBaseIndex();
-        long oldTabletId = materializedIndex.getTablets().get(0).getId();
+        Tablet oldTablet = materializedIndex.getTablets().get(0);
+        long oldTabletId = oldTablet.getId();
         long oldVersion = physicalPartition.getVisibleVersion();
         int oldTabletCount = materializedIndex.getTablets().size();
 
-        // K=3 disjoint, byte-contiguous ranges that the BE side validators
-        // accept (closed-open, no zero-width, monotonically increasing).
+        // Tests in this class share a single static table, and earlier @Test
+        // methods can leave the latest index's tablets with bounded ranges.
+        // Reset the chosen old tablet to Range.all() so the K=3 PSPS ranges
+        // below — built for a Range.all() parent — are deterministically
+        // valid regardless of test order.
+        oldTablet.setRange(new TabletRange());
+
+        // K=3 PSPS ranges that satisfy the BE-side structural validator on a
+        // Range.all() parent: first.lower absent, last.upper absent, interior
+        // boundaries set with closed-lower / open-upper, adjacent ranges meet
+        // exactly. This mirrors the contract enforced in
+        // TabletRangeHelper::validate_new_tablet_ranges (BE).
         List<TabletRange> newTabletRanges = List.of(
-                tabletRange(0, 100),
+                tabletRangeUpperOnly(100),
                 tabletRange(100, 200),
-                tabletRange(200, 300));
+                tabletRangeLowerOnly(200));
 
         TabletReshardJob tabletReshardJob = SplitTabletJobFactory.forExternalBoundaries(
                 db, table, oldTabletId, newTabletRanges);
@@ -528,6 +539,22 @@ public class SplitTabletJobTest {
                         List.of(tabletRange(0, 100), tabletRange(100, 200))));
     }
 
+    // PSPS must respect the tablet_reshard_max_split_count cap that the
+    // data-driven path enforces via TabletReshardUtils.calcSplitCount.
+    @Test
+    public void testForExternalBoundariesRejectsTooManyRanges() {
+        PhysicalPartition physicalPartition = table.getAllPhysicalPartitions().iterator().next();
+        long oldTabletId = physicalPartition.getLatestBaseIndex().getTablets().get(0).getId();
+
+        int oversize = Config.tablet_reshard_max_split_count + 1;
+        List<TabletRange> tooMany = new ArrayList<>(oversize);
+        for (int i = 0; i < oversize; i++) {
+            tooMany.add(tabletRange(i * 100, (i + 1) * 100));
+        }
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> SplitTabletJobFactory.forExternalBoundaries(db, table, oldTabletId, tooMany));
+    }
+
     // Mock helper: BE echo of the FE-supplied PSPS ranges, plus identical-tablet
     // siblings retaining their original ranges. This matches the BE's success
     // contract — newTabletRanges honored verbatim into K new tablets.
@@ -568,6 +595,16 @@ public class SplitTabletJobTest {
 
     private static TabletRange tabletRange(int lowerValue, int upperValue) {
         return new TabletRange(Range.of(createTuple(lowerValue), createTuple(upperValue), true, false));
+    }
+
+    // First range of a PSPS list that splits a Range.all() parent: (-inf, upperValue).
+    private static TabletRange tabletRangeUpperOnly(int upperValue) {
+        return new TabletRange(Range.lt(createTuple(upperValue)));
+    }
+
+    // Last range of a PSPS list that splits a Range.all() parent: [lowerValue, +inf).
+    private static TabletRange tabletRangeLowerOnly(int lowerValue) {
+        return new TabletRange(Range.ge(createTuple(lowerValue)));
     }
 
     private static Tuple createTuple(int value) {

@@ -31,6 +31,7 @@ import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.catalog.TabletRange;
 import com.starrocks.catalog.Tuple;
+import com.starrocks.common.Config;
 import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.concurrent.lock.AutoCloseableLock;
 import com.starrocks.common.util.concurrent.lock.LockType;
@@ -127,6 +128,12 @@ public class SplitTabletJobFactory implements TabletReshardJobFactory {
         Preconditions.checkArgument(newTabletRanges != null && newTabletRanges.size() >= 2,
                 "PSPS requires at least 2 new-tablet ranges (got %s)",
                 newTabletRanges == null ? "null" : newTabletRanges.size());
+        // Mirror the upper bound that TabletReshardUtils.calcSplitCount applies on the
+        // data-driven path. PSPS bypasses calcSplitCount, so enforce the cap here so
+        // a bad caller cannot allocate an unbounded number of new tablets/shards.
+        Preconditions.checkArgument(newTabletRanges.size() <= Config.tablet_reshard_max_split_count,
+                "PSPS new-tablet count %s exceeds tablet_reshard_max_split_count %s",
+                newTabletRanges.size(), Config.tablet_reshard_max_split_count);
 
         // Mirror the data-driven path's range-colocate unstable-group guard:
         // refuse to start a PSPS split while any peer GroupId is unstable.
