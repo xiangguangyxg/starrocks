@@ -52,12 +52,6 @@ struct TBackendInfo {
     10: optional i64 mem_limit_bytes
 
     11: optional Types.TPort arrow_flight_port
-
-    // PSPS (Pre-Sample & Pre-Split) capability. BE sets true when its build
-    // contains the PSPS code path (split_tablet_external + external_new_tablet_ranges
-    // handling). FE gates auto-PSPS on this flag for all alive nodes during
-    // rolling upgrades; absent (older BEs) defaults to false.
-    12: optional bool psps_supported
 }
 
 struct THeartbeatResult {

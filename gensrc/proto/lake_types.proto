@@ -434,8 +434,9 @@ message SplittingTabletInfoPB {
     //   - Size MUST equal new_tablet_ids.size.
     //   - Ranges MUST cover the old tablet's range exactly with no gaps/overlaps.
     //   - Each range uses [lower, upper) (upper_bound_included=false).
-    // Old BEs (pre-PSPS) silently ignore this field; FE must gate PSPS on the
-    // TBackendInfo.psps_supported heartbeat flag during rolling upgrades.
+    // Upgrade ordering policy: BE is upgraded before FE, so any FE that
+    // populates this field is guaranteed to be talking to BEs that consume
+    // it; no separate capability flag is needed.
     repeated TabletRangePB new_tablet_ranges = 3;
 }
 
