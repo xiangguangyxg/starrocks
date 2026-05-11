@@ -631,9 +631,9 @@ void apply_rowset_anchor(const std::unordered_map<uint32_t, RowsetAnchor>& ancho
 // larger than the sort-key arity returns Status::InvalidArgument here, which triggers
 // the same identical-tablet fallback as "no boundaries" — preserves the publish loop
 // instead of hard-failing.
-Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
-                               int32_t split_count, std::vector<TabletRangeInfo>* split_ranges,
-                               int32_t colocate_column_count) {
+Status get_tablet_split_ranges_impl(TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
+                                    int32_t split_count, std::vector<TabletRangeInfo>* split_ranges,
+                                    int32_t colocate_column_count) {
     if (split_count < 2) {
         return Status::InvalidArgument("Invalid split count, it is less than 2");
     }
@@ -1206,6 +1206,16 @@ Status compute_split_ranges_from_external_boundaries(
         int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges) {
     return compute_split_ranges_from_external_boundaries_impl(tablet_manager, old_tablet_metadata, external_ranges,
                                                               expected_new_tablet_count, split_ranges);
+}
+
+// Public wrapper for the data-driven split-ranges helper. Exposed for parity
+// testing against compute_split_ranges_from_external_boundaries; production
+// call site is split_tablet().
+Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
+                               int32_t split_count, std::vector<TabletRangeInfo>* split_ranges,
+                               int32_t colocate_column_count) {
+    return get_tablet_split_ranges_impl(tablet_manager, tablet_metadata, split_count, split_ranges,
+                                        colocate_column_count);
 }
 
 StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(

@@ -120,6 +120,19 @@ struct TabletRangeInfo {
     std::unordered_map<uint32_t, Statistic> rowset_stats;
 };
 
+// Data-driven peer of compute_split_ranges_from_external_boundaries:
+// computes K-1 boundaries from the old tablet's segment distribution and
+// emits K TabletRangeInfo with per-rowset anchored stats. Exposed for unit
+// testing (parity comparison with the PSPS path); the production call site
+// is in split_tablet().
+//
+// `tablet_manager` is only dereferenced by build_rowset_anchor's primary-key
+// delvec fallback. For tests using DUP_KEYS metadata with num_dels populated
+// directly, `tablet_manager` may be nullptr.
+Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
+                               int32_t split_count, std::vector<TabletRangeInfo>* split_ranges,
+                               int32_t colocate_column_count = 0);
+
 // PSPS peer of get_tablet_split_ranges: produces a vector<TabletRangeInfo>
 // from FE-supplied boundaries instead of computing them from segment
 // distribution. Exposed for unit testing of the validation paths; the

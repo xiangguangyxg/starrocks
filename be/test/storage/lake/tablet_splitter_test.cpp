@@ -14,6 +14,7 @@
 
 #include "storage/lake/tablet_splitter.h"
 
+#include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
 
 #include <optional>
@@ -1014,6 +1015,145 @@ TEST(TabletSplitterPspsTest, empty_tablet_rejects_semantic_inversion) {
     ASSERT_FALSE(status.ok())
             << "empty tablet must reject semantically-invalid PSPS ranges (W1 fix)";
     EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// =============================================================================
+// Parity: PSPS path produces the same per-range output as the data-driven path
+// when given the same K-1 boundaries.
+// =============================================================================
+//
+// Both paths share build_rowset_anchor + apply_rowset_anchor downstream, so
+// equivalent boundary inputs SHOULD yield equivalent outputs (ranges + per-
+// rowset stats). This test:
+//   1. Runs the data-driven path on a synthetic 2-rowset tablet.
+//   2. Extracts the K-1 boundary it picked.
+//   3. Feeds the same boundary back through the PSPS path.
+//   4. Asserts the resulting K TabletRangeInfo entries are byte-equal.
+//
+// DUP_KEYS + explicit rowset-level num_dels lets us pass tablet_manager =
+// nullptr (no PK delvec fallback).
+
+namespace {
+
+// Build a DUP_KEYS tablet with N rowsets at disjoint integer key ranges. Each
+// rowset gets one segment populated with sort_key_min/max + num_rows; the
+// rowset-level num_rows/data_size/num_dels are set explicitly to skip the
+// build_rowset_anchor PK-fallback path.
+static TabletMetadataPtr make_dup_keys_metadata_with_rowsets(
+        std::initializer_list<std::tuple<uint32_t, int64_t, int64_t, int64_t, int64_t>> rowsets) {
+    auto m = std::make_shared<TabletMetadataPB>();
+    m->set_id(1);
+    m->set_version(1);
+    auto* schema = m->mutable_schema();
+    schema->set_keys_type(DUP_KEYS);
+    schema->set_id(100);
+    auto* col = schema->add_column();
+    col->set_unique_id(0);
+    col->set_name("k1");
+    col->set_type("BIGINT");
+    col->set_is_key(true);
+    col->set_is_nullable(false);
+    schema->add_sort_key_idxes(0);
+    // Parent range left as Range.all().
+
+    for (const auto& [id, lo, hi, num_rows, data_size] : rowsets) {
+        auto* r = m->add_rowsets();
+        r->set_id(id);
+        r->set_num_rows(num_rows);
+        r->set_data_size(data_size);
+        r->set_num_dels(0); // explicit to skip the PK delvec fallback in build_rowset_anchor.
+        r->add_segments("seg" + std::to_string(id));
+        r->add_segment_size(data_size);
+        auto* sm = r->add_segment_metas();
+        sm->set_num_rows(num_rows);
+        *sm->mutable_sort_key_min() = make_bigint_tuple_pb(lo);
+        *sm->mutable_sort_key_max() = make_bigint_tuple_pb(hi);
+    }
+    return m;
+}
+
+} // namespace
+
+TEST(TabletSplitterParityTest, psps_matches_data_driven_when_fed_same_boundaries) {
+    // Two disjoint rowsets at [0,50] and [60,100], 100 rows each. Data-driven
+    // will pick a boundary somewhere in the gap (50..60) for K=2.
+    auto m = make_dup_keys_metadata_with_rowsets({
+            std::make_tuple<uint32_t, int64_t, int64_t, int64_t, int64_t>(1, 0, 50, 100, 1000),
+            std::make_tuple<uint32_t, int64_t, int64_t, int64_t, int64_t>(2, 60, 100, 100, 1000),
+    });
+
+    std::vector<TabletRangeInfo> split_data_driven;
+    auto s = get_tablet_split_ranges(/*tablet_manager=*/nullptr, m, /*split_count=*/2, &split_data_driven,
+                                     /*colocate_column_count=*/0);
+    ASSERT_TRUE(s.ok()) << s;
+    ASSERT_EQ(2u, split_data_driven.size());
+    ASSERT_TRUE(split_data_driven[0].range.has_upper_bound());
+    ASSERT_TRUE(split_data_driven[1].range.has_lower_bound());
+    // Byte-equality of the interior boundary (data-driven emits one tuple,
+    // not two — same TuplePB on both sides).
+    ASSERT_TRUE(google::protobuf::util::MessageDifferencer::Equals(
+            split_data_driven[0].range.upper_bound(), split_data_driven[1].range.lower_bound()))
+            << "data-driven path's interior boundary must be a single TuplePB on both sides";
+
+    // Build PSPS external_ranges from the data-driven boundary, mirroring the
+    // parent Range.all() (first.lower unset, last.upper unset).
+    google::protobuf::RepeatedPtrField<TabletRangePB> external_ranges;
+    {
+        auto* r0 = external_ranges.Add();
+        *r0->mutable_upper_bound() = split_data_driven[0].range.upper_bound();
+        r0->set_upper_bound_included(false);
+    }
+    {
+        auto* r1 = external_ranges.Add();
+        *r1->mutable_lower_bound() = split_data_driven[1].range.lower_bound();
+        r1->set_lower_bound_included(true);
+    }
+
+    std::vector<TabletRangeInfo> split_psps;
+    s = compute_split_ranges_from_external_boundaries(/*tablet_manager=*/nullptr, m, external_ranges,
+                                                      /*expected_new_tablet_count=*/2, &split_psps);
+    ASSERT_TRUE(s.ok()) << s;
+    ASSERT_EQ(2u, split_psps.size());
+
+    // Ranges must be byte-equal proto messages.
+    for (size_t i = 0; i < split_data_driven.size(); ++i) {
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(
+                split_data_driven[i].range, split_psps[i].range))
+                << "range[" << i << "] differs between paths";
+    }
+
+    // Per-rowset stats must match field-by-field.
+    for (size_t i = 0; i < split_data_driven.size(); ++i) {
+        EXPECT_EQ(split_data_driven[i].rowset_stats.size(), split_psps[i].rowset_stats.size())
+                << "rowset_stats size differs at range " << i;
+        for (const auto& [rowset_id, stats_dd] : split_data_driven[i].rowset_stats) {
+            auto it = split_psps[i].rowset_stats.find(rowset_id);
+            ASSERT_NE(it, split_psps[i].rowset_stats.end())
+                    << "rowset " << rowset_id << " missing in PSPS output at range " << i;
+            EXPECT_EQ(stats_dd.num_rows, it->second.num_rows)
+                    << "range[" << i << "] rowset[" << rowset_id << "] num_rows differs";
+            EXPECT_EQ(stats_dd.data_size, it->second.data_size)
+                    << "range[" << i << "] rowset[" << rowset_id << "] data_size differs";
+            EXPECT_EQ(stats_dd.num_dels, it->second.num_dels)
+                    << "range[" << i << "] rowset[" << rowset_id << "] num_dels differs";
+        }
+    }
+
+    // Sanity: anchored stats sum to parent totals (the property both paths
+    // claim). Aggregate per rowset across the two child ranges.
+    for (uint32_t rowset_id : {1u, 2u}) {
+        int64_t sum_rows = 0;
+        int64_t sum_size = 0;
+        for (const auto& s : split_data_driven) {
+            auto it = s.rowset_stats.find(rowset_id);
+            if (it != s.rowset_stats.end()) {
+                sum_rows += it->second.num_rows;
+                sum_size += it->second.data_size;
+            }
+        }
+        EXPECT_EQ(100, sum_rows) << "rowset " << rowset_id << ": Σ children num_rows must equal parent";
+        EXPECT_EQ(1000, sum_size) << "rowset " << rowset_id << ": Σ children data_size must equal parent";
+    }
 }
 
 } // namespace starrocks::lake
