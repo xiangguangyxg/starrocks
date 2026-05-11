@@ -770,13 +770,18 @@ MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadata
     return new_tablet_metadata;
 }
 
-// Strict precondition check for the PSPS pre-split path: the old tablet must
-// carry no rowsets and no rowset-derived metadata. Schema/config fields are
-// intentionally NOT checked — they are inherited by the new tablets.
+// Precondition for the PSPS pre-split path: the old tablet must currently
+// carry no rowsets and no rowset-derived metadata. This is a "data-empty
+// now" check, NOT a "never-written" check — a tablet that previously had
+// rowsets which were later vacuumed (rowsets cleared but next_rowset_id /
+// cumulative_point advanced) is still accepted, because PSPS resets those
+// per-version counters explicitly on the new tablets in split_tablet_external.
+//
+// Schema/config fields are intentionally NOT checked — they are inherited
+// by the new tablets.
 //
 // Per-version transient fields (compaction_inputs, orphan_files,
-// prev_garbage_version) are also expected to be empty on a freshly created,
-// never-written tablet; they are checked here so we don't silently inherit
+// prev_garbage_version) are checked here so we don't silently inherit
 // stale per-version state into the new tablets.
 bool old_tablet_is_fully_empty(const TabletMetadataPB& m) {
     if (m.rowsets_size() != 0) return false;

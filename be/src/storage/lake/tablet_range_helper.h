@@ -59,10 +59,17 @@ public:
     static Status validate_tablet_range(const TabletRangePB& tablet_range_pb);
 
     // Check that a list of new-tablet ranges tiles the old tablet range
-    // exactly: well-formed individually, ordered, no gaps, no overlaps,
-    // first.lower matches old.lower, last.upper matches old.upper. Used by
-    // the PSPS pre-split path to validate FE-supplied ranges before BE
-    // commits to writing K new tablets.
+    // exactly: old range itself is well-formed; each new range is
+    // well-formed and non-zero-width (lower != upper by byte equality);
+    // adjacent ranges meet exactly with no gaps or overlaps; first.lower
+    // matches old.lower; last.upper matches old.upper. Used by the PSPS
+    // pre-split path to validate FE-supplied ranges before BE commits to
+    // writing K new tablets.
+    //
+    // Note: strict semantic ordering (lower < upper, ranges monotonically
+    // increasing) requires a schema for type-aware comparison and is the
+    // caller's responsibility. This helper only does schema-free structural
+    // checks.
     static Status validate_new_tablet_ranges(const TabletRangePB& old_tablet_range,
                                              const ::google::protobuf::RepeatedPtrField<TabletRangePB>& new_tablet_ranges);
 };

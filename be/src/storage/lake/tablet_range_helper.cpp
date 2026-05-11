@@ -303,9 +303,23 @@ Status TabletRangeHelper::validate_new_tablet_ranges(
         return Status::InvalidArgument("validate_new_tablet_ranges: new_tablet_ranges is empty");
     }
 
-    // 1. Each new-tablet range must be individually well-formed.
+    // 0. The old tablet's own range must be well-formed too — otherwise our
+    //    "first.lower matches old.lower" / "last.upper matches old.upper"
+    //    checks below could be comparing against a malformed reference.
+    RETURN_IF_ERROR(validate_tablet_range(old_tablet_range));
+
+    // 1. Each new-tablet range must be individually well-formed, and the two
+    //    bounds (when both set) must not be byte-equal (catches zero-width
+    //    children). Strict semantic ordering (lower < upper) requires a
+    //    schema for type-aware comparison and is the caller's responsibility
+    //    (e.g., split_tablet_external compares via the tablet schema).
     for (const auto& r : new_tablet_ranges) {
         RETURN_IF_ERROR(validate_tablet_range(r));
+        if (r.has_lower_bound() && r.has_upper_bound() &&
+            google::protobuf::util::MessageDifferencer::Equals(r.lower_bound(), r.upper_bound())) {
+            return Status::InvalidArgument(
+                    "validate_new_tablet_ranges: range with lower_bound == upper_bound (zero-width)");
+        }
     }
 
     // 2. First range's lower bound must match the old tablet's lower bound.
