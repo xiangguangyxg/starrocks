@@ -16,7 +16,10 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include "base/testutil/assert.h"
+#include "gen_cpp/lake_types.pb.h"
 #include "storage/tablet_range.h"
 #include "types/type_descriptor.h"
 
@@ -594,6 +597,10 @@ TEST(TabletSplitterTest, tablet_range_total_invariant_across_split_counts) {
 // they can be reused by the planned cross-publish (P2) refactor without
 // re-introducing a private split-only header.
 
+// Helpers below serve two test groups: colocate-aware data-driven splitter
+// tests (TabletSplitterTest.colocate_*) and PSPS external-boundaries tests
+// (TabletSplitterPspsTest.*). Kept in one anonymous namespace to avoid
+// duplicate-symbol churn.
 namespace {
 
 // Build a 2-column key tuple (k1, k2). Used for colocate-aware splitter tests.
@@ -613,6 +620,124 @@ static SegmentSplitInfo make_two_col_seg(int64_t lo_k1, int64_t lo_k2, int64_t h
     s.data_size = data_size;
     s.source_id = source_id;
     return s;
+}
+
+// =============================================================================
+// PSPS (Pre-Sample & Pre-Split) external-boundaries path helpers
+// =============================================================================
+//
+// These exercise compute_split_ranges_from_external_boundaries' validation
+// layers (1a/1b/1c/3a/3b). Empty tablets are used throughout so the production
+// path returns at the empty fast-path (step 4) without needing a real
+// TabletManager. tablet_manager = nullptr is safe in that regime.
+
+static VariantPB make_bigint_variant_pb(int64_t value) {
+    DatumVariant dv(get_type_info(LogicalType::TYPE_BIGINT), Datum(value));
+    VariantPB pb;
+    dv.to_proto(&pb);
+    return pb;
+}
+
+static VariantPB make_varchar_variant_pb(const std::string& value) {
+    auto type_info = get_type_info(LogicalType::TYPE_VARCHAR);
+    DatumVariant dv(type_info, Datum(Slice(value)));
+    VariantPB pb;
+    dv.to_proto(&pb);
+    return pb;
+}
+
+static VariantPB make_decimal64_variant_pb(int precision, int scale, int64_t raw_value) {
+    auto type_desc = TypeDescriptor::create_decimalv3_type(TYPE_DECIMAL64, precision, scale);
+    auto type_info = get_type_info(type_desc);
+    DatumVariant dv(type_info, Datum(raw_value));
+    VariantPB pb;
+    dv.to_proto(&pb);
+    return pb;
+}
+
+static TuplePB make_bigint_tuple_pb(int64_t value) {
+    TuplePB t;
+    *t.add_values() = make_bigint_variant_pb(value);
+    return t;
+}
+
+// Build a closed-open [lower, upper) range. Either side may be absent (nullopt)
+// for unbounded ±infinity semantics.
+static TabletRangePB make_bigint_range_pb(std::optional<int64_t> lower, std::optional<int64_t> upper) {
+    TabletRangePB r;
+    if (lower.has_value()) {
+        *r.mutable_lower_bound() = make_bigint_tuple_pb(*lower);
+        r.set_lower_bound_included(true);
+    }
+    if (upper.has_value()) {
+        *r.mutable_upper_bound() = make_bigint_tuple_pb(*upper);
+        r.set_upper_bound_included(false);
+    }
+    return r;
+}
+
+// Build a minimal empty TabletMetadataPtr with a single BIGINT sort-key column
+// and the requested parent range. Used by every PSPS validation test that
+// expects the function to return before touching segments/anchors.
+static TabletMetadataPtr make_empty_metadata_bigint_key(std::optional<int64_t> parent_lower,
+                                                        std::optional<int64_t> parent_upper) {
+    auto m = std::make_shared<TabletMetadataPB>();
+    m->set_id(1);
+    m->set_version(1);
+
+    auto* schema = m->mutable_schema();
+    schema->set_keys_type(PRIMARY_KEYS);
+    schema->set_id(100);
+    auto* col = schema->add_column();
+    col->set_unique_id(0);
+    col->set_name("k1");
+    col->set_type("BIGINT");
+    col->set_is_key(true);
+    col->set_is_nullable(false);
+    schema->add_sort_key_idxes(0);
+
+    *m->mutable_range() = make_bigint_range_pb(parent_lower, parent_upper);
+    return m;
+}
+
+// Same shape but with a DECIMAL64(precision, scale) sort key.
+static TabletMetadataPtr make_empty_metadata_decimal64_key(int precision, int scale) {
+    auto m = std::make_shared<TabletMetadataPB>();
+    m->set_id(1);
+    m->set_version(1);
+
+    auto* schema = m->mutable_schema();
+    schema->set_keys_type(PRIMARY_KEYS);
+    schema->set_id(100);
+    auto* col = schema->add_column();
+    col->set_unique_id(0);
+    col->set_name("k1");
+    col->set_type("DECIMAL64");
+    col->set_is_key(true);
+    col->set_is_nullable(false);
+    col->set_precision(precision);
+    col->set_frac(scale); // ColumnPB.frac is the scale field
+    col->set_length(8);
+    schema->add_sort_key_idxes(0);
+
+    // Decimal parent range: cover [10000, 100000) raw to keep tests simple.
+    // (raw value space; the unit-test rationale doesn't depend on the human value)
+    auto* pr = m->mutable_range();
+    auto* lo = pr->mutable_lower_bound();
+    *lo->add_values() = make_decimal64_variant_pb(precision, scale, 10000);
+    pr->set_lower_bound_included(true);
+    auto* hi = pr->mutable_upper_bound();
+    *hi->add_values() = make_decimal64_variant_pb(precision, scale, 100000);
+    pr->set_upper_bound_included(false);
+    return m;
+}
+
+static google::protobuf::RepeatedPtrField<TabletRangePB> make_ranges(std::initializer_list<TabletRangePB> ranges) {
+    google::protobuf::RepeatedPtrField<TabletRangePB> r;
+    for (const auto& range : ranges) {
+        *r.Add() = range;
+    }
+    return r;
 }
 
 } // namespace
@@ -712,6 +837,183 @@ TEST(TabletSplitterTest, colocate_aware_split_keeps_stats_consistent_across_pref
             << "rows from the prefix-crossing segment must contribute to the LEFT child";
     EXPECT_GT(left_it->second.first, 0);
     EXPECT_GT(left_it->second.second, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Happy path: empty tablet, K=2 well-formed ranges covering parent.
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, empty_tablet_happy_path_k2) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    auto ranges = make_ranges({make_bigint_range_pb(0, 50), make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(/*tablet_manager=*/nullptr, m, ranges,
+                                                                /*expected_new_tablet_count=*/2, &out);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_EQ(2, out.size());
+    EXPECT_TRUE(out[0].rowset_stats.empty());
+    EXPECT_TRUE(out[1].rowset_stats.empty());
+}
+
+// -----------------------------------------------------------------------------
+// 1a: size mismatch (K=3 ranges but expected_new_tablet_count=2)
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, size_mismatch_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    auto ranges = make_ranges(
+            {make_bigint_range_pb(0, 33), make_bigint_range_pb(33, 66), make_bigint_range_pb(66, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(/*tablet_manager=*/nullptr, m, ranges,
+                                                                /*expected_new_tablet_count=*/2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: tuple arity mismatch (2-column tuple for a 1-column sort key)
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, tuple_arity_mismatch_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    TabletRangePB r0;
+    auto* lo = r0.mutable_lower_bound();
+    *lo->add_values() = make_bigint_variant_pb(0);
+    *lo->add_values() = make_bigint_variant_pb(0); // extra column
+    r0.set_lower_bound_included(true);
+    *r0.mutable_upper_bound() = make_bigint_tuple_pb(50);
+    r0.set_upper_bound_included(false);
+    auto ranges = make_ranges({r0, make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: variant type mismatch (VARCHAR variant for BIGINT sort key)
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, tuple_type_mismatch_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    TabletRangePB r0 = make_bigint_range_pb(0, 50);
+    // Replace upper bound with a VARCHAR variant.
+    r0.mutable_upper_bound()->clear_values();
+    *r0.mutable_upper_bound()->add_values() = make_varchar_variant_pb("50");
+    auto ranges = make_ranges({r0, make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: decimal precision mismatch (schema DECIMAL64(10,2), bound DECIMAL64(11,2))
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, decimal_precision_mismatch_is_rejected) {
+    auto m = make_empty_metadata_decimal64_key(10, 2);
+    // Build two adjacent ranges spanning parent [10000, 100000) but with
+    // bound precision 11 instead of 10.
+    auto make_decimal_range = [](int precision, int scale, int64_t lo_raw, int64_t hi_raw) {
+        TabletRangePB r;
+        *r.mutable_lower_bound()->add_values() = make_decimal64_variant_pb(precision, scale, lo_raw);
+        r.set_lower_bound_included(true);
+        *r.mutable_upper_bound()->add_values() = make_decimal64_variant_pb(precision, scale, hi_raw);
+        r.set_upper_bound_included(false);
+        return r;
+    };
+    auto ranges = make_ranges({make_decimal_range(11, 2, 10000, 50000), make_decimal_range(11, 2, 50000, 100000)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: decimal scale mismatch (schema DECIMAL64(10,2), bound DECIMAL64(10,3))
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, decimal_scale_mismatch_is_rejected) {
+    auto m = make_empty_metadata_decimal64_key(10, 2);
+    auto make_decimal_range = [](int precision, int scale, int64_t lo_raw, int64_t hi_raw) {
+        TabletRangePB r;
+        *r.mutable_lower_bound()->add_values() = make_decimal64_variant_pb(precision, scale, lo_raw);
+        r.set_lower_bound_included(true);
+        *r.mutable_upper_bound()->add_values() = make_decimal64_variant_pb(precision, scale, hi_raw);
+        r.set_upper_bound_included(false);
+        return r;
+    };
+    auto ranges = make_ranges({make_decimal_range(10, 3, 10000, 50000), make_decimal_range(10, 3, 50000, 100000)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: variant has no `type` field
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, variant_missing_type_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    TabletRangePB r0 = make_bigint_range_pb(0, 50);
+    // Drop the `type` field on the upper bound's variant.
+    r0.mutable_upper_bound()->mutable_values(0)->clear_type();
+    auto ranges = make_ranges({r0, make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: variant has `type` but PTypeDesc.types is empty
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, variant_empty_ptypedesc_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    TabletRangePB r0 = make_bigint_range_pb(0, 50);
+    r0.mutable_upper_bound()->mutable_values(0)->mutable_type()->clear_types();
+    auto ranges = make_ranges({r0, make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 1c: variant uses a non-SCALAR PTypeNode (ARRAY) — must reject before
+// TypeDescriptor::from_protobuf reaches unsafe child-node access.
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, variant_non_scalar_node_is_rejected) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    TabletRangePB r0 = make_bigint_range_pb(0, 50);
+    // Mutate the single PTypeNode on the upper bound's variant to look like
+    // ARRAY (TTypeNodeType::ARRAY == 1) and remove its scalar_type payload.
+    auto* var = r0.mutable_upper_bound()->mutable_values(0);
+    var->mutable_type()->mutable_types(0)->set_type(static_cast<int32_t>(TTypeNodeType::ARRAY));
+    var->mutable_type()->mutable_types(0)->clear_scalar_type();
+    auto ranges = make_ranges({r0, make_bigint_range_pb(50, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 2, &out);
+    ASSERT_FALSE(status.ok());
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
+}
+
+// -----------------------------------------------------------------------------
+// 3b: adjacent ranges out of order semantically. Important: empty tablets must
+// also reject this (the fix that moved the semantic check before the empty
+// fast-path).
+// -----------------------------------------------------------------------------
+TEST(TabletSplitterPspsTest, empty_tablet_rejects_semantic_inversion) {
+    auto m = make_empty_metadata_bigint_key(0, 100);
+    // 3 ranges that tile structurally (first.lower==0, last.upper==100, byte
+    // adjacencies hold), but the middle range is semantically inverted:
+    //   [0, 50) [50, 40) [40, 100)
+    // ranges[0].upper == ranges[1].lower byte-wise (50==50).
+    // ranges[1].upper == ranges[2].lower byte-wise (40==40).
+    // Structural validation accepts; step 3a semantic check rejects on the
+    // middle range's lower(50) >= upper(40).
+    auto ranges = make_ranges(
+            {make_bigint_range_pb(0, 50), make_bigint_range_pb(50, 40), make_bigint_range_pb(40, 100)});
+    std::vector<TabletRangeInfo> out;
+    auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 3, &out);
+    ASSERT_FALSE(status.ok())
+            << "empty tablet must reject semantically-invalid PSPS ranges (W1 fix)";
+    EXPECT_TRUE(status.is_invalid_argument()) << status;
 }
 
 } // namespace starrocks::lake

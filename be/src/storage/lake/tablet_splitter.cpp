@@ -498,16 +498,8 @@ StatusOr<RangeSplitResult> calculate_range_split_boundaries(const std::vector<Se
 
 namespace {
 
-struct Statistic {
-    int64_t num_rows = 0;
-    int64_t data_size = 0;
-    int64_t num_dels = 0;
-};
-
-struct TabletRangeInfo {
-    TabletRangePB range;
-    std::unordered_map<uint32_t, Statistic> rowset_stats;
-};
+// Statistic and TabletRangeInfo are declared in tablet_splitter.h (the PSPS
+// path returns vector<TabletRangeInfo> through that header for testability).
 
 // Per-rowset anchor totals taken from the parent's recorded metadata. Used to
 // renormalize per-split-group estimates so Σ children equals parent exactly,
@@ -817,7 +809,7 @@ MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadata
 //       Otherwise allocate_proportionally would uniformly fabricate stats.
 //  10.  Synthesize a RangeSplitResult and apply anchor; output is K
 //       TabletRangeInfo in *split_ranges with normalized rowset_stats.
-Status compute_split_ranges_from_external_boundaries(
+Status compute_split_ranges_from_external_boundaries_impl(
         TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
         const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
         int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges) {
@@ -1204,6 +1196,17 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> build_new_tablet
 }
 
 } // namespace
+
+// Public wrapper for the anon-namespace implementation. Exposed via
+// tablet_splitter.h so unit tests can drive the validation paths directly
+// without spinning up a TabletManager/filesystem fixture.
+Status compute_split_ranges_from_external_boundaries(
+        TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
+        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
+        int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges) {
+    return compute_split_ranges_from_external_boundaries_impl(tablet_manager, old_tablet_metadata, external_ranges,
+                                                              expected_new_tablet_count, split_ranges);
+}
 
 StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
         TabletManager* tablet_manager, const TabletMetadataPtr& tablet_metadata,
