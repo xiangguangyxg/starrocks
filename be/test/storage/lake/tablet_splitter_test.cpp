@@ -860,8 +860,8 @@ TEST(TabletSplitterPspsTest, empty_tablet_happy_path_k2) {
 // -----------------------------------------------------------------------------
 TEST(TabletSplitterPspsTest, size_mismatch_is_rejected) {
     auto m = make_empty_metadata_bigint_key(0, 100);
-    auto ranges = make_ranges(
-            {make_bigint_range_pb(0, 33), make_bigint_range_pb(33, 66), make_bigint_range_pb(66, 100)});
+    auto ranges =
+            make_ranges({make_bigint_range_pb(0, 33), make_bigint_range_pb(33, 66), make_bigint_range_pb(66, 100)});
     std::vector<TabletRangeInfo> out;
     auto status = compute_split_ranges_from_external_boundaries(/*tablet_manager=*/nullptr, m, ranges,
                                                                 /*expected_new_tablet_count=*/2, &out);
@@ -1008,12 +1008,11 @@ TEST(TabletSplitterPspsTest, empty_tablet_rejects_semantic_inversion) {
     // ranges[1].upper == ranges[2].lower byte-wise (40==40).
     // Structural validation accepts; step 3a semantic check rejects on the
     // middle range's lower(50) >= upper(40).
-    auto ranges = make_ranges(
-            {make_bigint_range_pb(0, 50), make_bigint_range_pb(50, 40), make_bigint_range_pb(40, 100)});
+    auto ranges =
+            make_ranges({make_bigint_range_pb(0, 50), make_bigint_range_pb(50, 40), make_bigint_range_pb(40, 100)});
     std::vector<TabletRangeInfo> out;
     auto status = compute_split_ranges_from_external_boundaries(nullptr, m, ranges, 3, &out);
-    ASSERT_FALSE(status.ok())
-            << "empty tablet must reject semantically-invalid PSPS ranges (W1 fix)";
+    ASSERT_FALSE(status.ok()) << "empty tablet must reject semantically-invalid PSPS ranges (W1 fix)";
     EXPECT_TRUE(status.is_invalid_argument()) << status;
 }
 
@@ -1091,8 +1090,8 @@ TEST(TabletSplitterParityTest, psps_matches_data_driven_when_fed_same_boundaries
     ASSERT_TRUE(split_data_driven[1].range.has_lower_bound());
     // Byte-equality of the interior boundary (data-driven emits one tuple,
     // not two — same TuplePB on both sides).
-    ASSERT_TRUE(google::protobuf::util::MessageDifferencer::Equals(
-            split_data_driven[0].range.upper_bound(), split_data_driven[1].range.lower_bound()))
+    ASSERT_TRUE(google::protobuf::util::MessageDifferencer::Equals(split_data_driven[0].range.upper_bound(),
+                                                                   split_data_driven[1].range.lower_bound()))
             << "data-driven path's interior boundary must be a single TuplePB on both sides";
 
     // Build PSPS external_ranges from the data-driven boundary, mirroring the
@@ -1117,8 +1116,7 @@ TEST(TabletSplitterParityTest, psps_matches_data_driven_when_fed_same_boundaries
 
     // Ranges must be byte-equal proto messages.
     for (size_t i = 0; i < split_data_driven.size(); ++i) {
-        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(
-                split_data_driven[i].range, split_psps[i].range))
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(split_data_driven[i].range, split_psps[i].range))
                 << "range[" << i << "] differs between paths";
     }
 

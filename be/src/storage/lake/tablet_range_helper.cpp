@@ -325,26 +325,22 @@ Status TabletRangeHelper::validate_new_tablet_ranges(
 
     // 2. First range's lower bound must match the old tablet's lower bound.
     const auto& first = new_tablet_ranges[0];
-    if (!tuple_bound_equal(first.has_lower_bound(), first.lower_bound(),
-                           old_tablet_range.has_lower_bound(), old_tablet_range.lower_bound())) {
-        return Status::InvalidArgument(
-                "validate_new_tablet_ranges: first.lower_bound != old_tablet_range.lower_bound");
+    if (!tuple_bound_equal(first.has_lower_bound(), first.lower_bound(), old_tablet_range.has_lower_bound(),
+                           old_tablet_range.lower_bound())) {
+        return Status::InvalidArgument("validate_new_tablet_ranges: first.lower_bound != old_tablet_range.lower_bound");
     }
     if (first.has_lower_bound() && !first.lower_bound_included()) {
-        return Status::InvalidArgument(
-                "validate_new_tablet_ranges: first.lower_bound must be inclusive when set");
+        return Status::InvalidArgument("validate_new_tablet_ranges: first.lower_bound must be inclusive when set");
     }
 
     // 3. Last range's upper bound must match the old tablet's upper bound.
     const auto& last = new_tablet_ranges[new_tablet_ranges.size() - 1];
-    if (!tuple_bound_equal(last.has_upper_bound(), last.upper_bound(),
-                           old_tablet_range.has_upper_bound(), old_tablet_range.upper_bound())) {
-        return Status::InvalidArgument(
-                "validate_new_tablet_ranges: last.upper_bound != old_tablet_range.upper_bound");
+    if (!tuple_bound_equal(last.has_upper_bound(), last.upper_bound(), old_tablet_range.has_upper_bound(),
+                           old_tablet_range.upper_bound())) {
+        return Status::InvalidArgument("validate_new_tablet_ranges: last.upper_bound != old_tablet_range.upper_bound");
     }
     if (last.has_upper_bound() && last.upper_bound_included()) {
-        return Status::InvalidArgument(
-                "validate_new_tablet_ranges: last.upper_bound must be exclusive when set");
+        return Status::InvalidArgument("validate_new_tablet_ranges: last.upper_bound must be exclusive when set");
     }
 
     // 4. Adjacent ranges must tile exactly: ranges[i].upper == ranges[i+1].lower,
@@ -353,14 +349,14 @@ Status TabletRangeHelper::validate_new_tablet_ranges(
         const auto& cur = new_tablet_ranges[i];
         const auto& nxt = new_tablet_ranges[i + 1];
         if (!cur.has_upper_bound() || !nxt.has_lower_bound()) {
-            return Status::InvalidArgument(fmt::format(
-                    "validate_new_tablet_ranges: gap at boundary {} (interior bounds must be set)", i));
+            return Status::InvalidArgument(
+                    fmt::format("validate_new_tablet_ranges: gap at boundary {} (interior bounds must be set)", i));
         }
         if (cur.upper_bound_included() || !nxt.lower_bound_included()) {
-            return Status::InvalidArgument(fmt::format(
-                    "validate_new_tablet_ranges: invalid bound flags at boundary {} "
-                    "(left must be exclusive, right must be inclusive)",
-                    i));
+            return Status::InvalidArgument(
+                    fmt::format("validate_new_tablet_ranges: invalid bound flags at boundary {} "
+                                "(left must be exclusive, right must be inclusive)",
+                                i));
         }
         if (!google::protobuf::util::MessageDifferencer::Equals(cur.upper_bound(), nxt.lower_bound())) {
             return Status::InvalidArgument(

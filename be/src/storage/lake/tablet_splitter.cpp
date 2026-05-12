@@ -811,8 +811,8 @@ MutableTabletMetadataPtr make_identical_new_tablet_metadata(const TabletMetadata
 //       TabletRangeInfo in *split_ranges with normalized rowset_stats.
 Status compute_split_ranges_from_external_boundaries_impl(
         TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
-        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
-        int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges) {
+        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges, int32_t expected_new_tablet_count,
+        std::vector<TabletRangeInfo>* split_ranges) {
     DCHECK(split_ranges != nullptr);
     DCHECK(split_ranges->empty());
 
@@ -840,12 +840,10 @@ Status compute_split_ranges_from_external_boundaries_impl(
     if (sort_key_idxes.empty()) {
         return Status::InvalidArgument("tablet has no sort key columns; PSPS path requires a sort key");
     }
-    auto validate_tuple_against_schema = [&](const TuplePB& t, int range_idx,
-                                             std::string_view side) -> Status {
+    auto validate_tuple_against_schema = [&](const TuplePB& t, int range_idx, std::string_view side) -> Status {
         if (t.values_size() != static_cast<int>(sort_key_idxes.size())) {
-            return Status::InvalidArgument(
-                    fmt::format("new_tablet_ranges[{}].{}: tuple arity {} != sort_key arity {}", range_idx,
-                                side, t.values_size(), sort_key_idxes.size()));
+            return Status::InvalidArgument(fmt::format("new_tablet_ranges[{}].{}: tuple arity {} != sort_key arity {}",
+                                                       range_idx, side, t.values_size(), sort_key_idxes.size()));
         }
         for (int j = 0; j < t.values_size(); ++j) {
             const auto& var = t.values(j);
@@ -857,37 +855,36 @@ Status compute_split_ranges_from_external_boundaries_impl(
             // does unguarded types.Get() on complex-type child indices
             // (be/src/types/type_descriptor.cpp:158-204).
             if (!var.has_type() || var.type().types_size() != 1) {
-                return Status::InvalidArgument(fmt::format(
-                        "new_tablet_ranges[{}].{}: column[{}] variant must have exactly one type node "
-                        "(got types_size={})",
-                        range_idx, side, j, var.type().types_size()));
+                return Status::InvalidArgument(
+                        fmt::format("new_tablet_ranges[{}].{}: column[{}] variant must have exactly one type node "
+                                    "(got types_size={})",
+                                    range_idx, side, j, var.type().types_size()));
             }
             const auto& node = var.type().types(0);
-            if (static_cast<TTypeNodeType::type>(node.type()) != TTypeNodeType::SCALAR ||
-                !node.has_scalar_type()) {
-                return Status::InvalidArgument(fmt::format(
-                        "new_tablet_ranges[{}].{}: column[{}] variant must be a scalar type "
-                        "(got node_type={}, has_scalar_type={})",
-                        range_idx, side, j, node.type(), node.has_scalar_type()));
+            if (static_cast<TTypeNodeType::type>(node.type()) != TTypeNodeType::SCALAR || !node.has_scalar_type()) {
+                return Status::InvalidArgument(
+                        fmt::format("new_tablet_ranges[{}].{}: column[{}] variant must be a scalar type "
+                                    "(got node_type={}, has_scalar_type={})",
+                                    range_idx, side, j, node.type(), node.has_scalar_type()));
             }
             const int col_idx = sort_key_idxes[j];
             const auto& col = tablet_schema->column(col_idx);
             const LogicalType col_type = col.type();
             const auto var_type_desc = TypeDescriptor::from_protobuf(var.type());
             if (var_type_desc.type != col_type) {
-                return Status::InvalidArgument(fmt::format(
-                        "new_tablet_ranges[{}].{}: column[{}] variant type {} != schema type {}", range_idx,
-                        side, j, static_cast<int>(var_type_desc.type), static_cast<int>(col_type)));
+                return Status::InvalidArgument(
+                        fmt::format("new_tablet_ranges[{}].{}: column[{}] variant type {} != schema type {}", range_idx,
+                                    side, j, static_cast<int>(var_type_desc.type), static_cast<int>(col_type)));
             }
             if (var_type_desc.is_decimal_type()) {
                 const int schema_precision = static_cast<int>(col.precision());
                 const int schema_scale = static_cast<int>(col.scale());
                 if (var_type_desc.precision != schema_precision || var_type_desc.scale != schema_scale) {
-                    return Status::InvalidArgument(fmt::format(
-                            "new_tablet_ranges[{}].{}: column[{}] decimal precision/scale "
-                            "({}, {}) != schema ({}, {})",
-                            range_idx, side, j, var_type_desc.precision, var_type_desc.scale,
-                            schema_precision, schema_scale));
+                    return Status::InvalidArgument(
+                            fmt::format("new_tablet_ranges[{}].{}: column[{}] decimal precision/scale "
+                                        "({}, {}) != schema ({}, {})",
+                                        range_idx, side, j, var_type_desc.precision, var_type_desc.scale,
+                                        schema_precision, schema_scale));
                 }
             }
         }
@@ -955,8 +952,7 @@ Status compute_split_ranges_from_external_boundaries_impl(
     // 3b. Adjacent monotonic check. Interior bounds are always explicit.
     for (int i = 0; i + 1 < external_ranges.size(); ++i) {
         if (parsed[i].hi.compare(parsed[i + 1].lo) > 0) {
-            return Status::InvalidArgument(
-                    fmt::format("new_tablet_ranges[{}/{}] semantically out of order", i, i + 1));
+            return Status::InvalidArgument(fmt::format("new_tablet_ranges[{}/{}] semantically out of order", i, i + 1));
         }
     }
 
@@ -1202,8 +1198,8 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> build_new_tablet
 // without spinning up a TabletManager/filesystem fixture.
 Status compute_split_ranges_from_external_boundaries(
         TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
-        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
-        int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges) {
+        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges, int32_t expected_new_tablet_count,
+        std::vector<TabletRangeInfo>* split_ranges) {
     return compute_split_ranges_from_external_boundaries_impl(tablet_manager, old_tablet_metadata, external_ranges,
                                                               expected_new_tablet_count, split_ranges);
 }
@@ -1261,9 +1257,8 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
         if (is_psps) {
             g_tablet_reshard_split_psps_fallback_total << 1;
             LOG(WARNING) << "PSPS validation/compute failed; identical fallback. "
-                         << "tablet_id=" << old_tablet_metadata->id()
-                         << ", version=" << old_tablet_metadata->version() << ", txn_id=" << txn_info.txn_id()
-                         << ", status=" << status;
+                         << "tablet_id=" << old_tablet_metadata->id() << ", version=" << old_tablet_metadata->version()
+                         << ", txn_id=" << txn_info.txn_id() << ", status=" << status;
         } else {
             g_tablet_reshard_split_fallback_total << 1;
             LOG(WARNING) << "Failed to get tablet split ranges, will not split this tablet: "
@@ -1278,7 +1273,7 @@ StatusOr<std::unordered_map<int64_t, MutableTabletMetadataPtr>> split_tablet(
     }
 
     return build_new_tablets_from_split_ranges(old_tablet_metadata, splitting_tablet, new_version, txn_info,
-                                                split_ranges);
+                                               split_ranges);
 }
 
 } // namespace starrocks::lake

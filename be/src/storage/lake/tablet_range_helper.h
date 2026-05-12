@@ -70,8 +70,9 @@ public:
     // increasing) requires a schema for type-aware comparison and is the
     // caller's responsibility. This helper only does schema-free structural
     // checks.
-    static Status validate_new_tablet_ranges(const TabletRangePB& old_tablet_range,
-                                             const ::google::protobuf::RepeatedPtrField<TabletRangePB>& new_tablet_ranges);
+    static Status validate_new_tablet_ranges(
+            const TabletRangePB& old_tablet_range,
+            const ::google::protobuf::RepeatedPtrField<TabletRangePB>& new_tablet_ranges);
 };
 
 } // namespace starrocks::lake

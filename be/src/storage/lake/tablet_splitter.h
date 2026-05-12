@@ -143,7 +143,7 @@ Status get_tablet_split_ranges(TabletManager* tablet_manager, const TabletMetada
 // `tablet_manager` may be nullptr.
 Status compute_split_ranges_from_external_boundaries(
         TabletManager* tablet_manager, const TabletMetadataPtr& old_tablet_metadata,
-        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges,
-        int32_t expected_new_tablet_count, std::vector<TabletRangeInfo>* split_ranges);
+        const ::google::protobuf::RepeatedPtrField<TabletRangePB>& external_ranges, int32_t expected_new_tablet_count,
+        std::vector<TabletRangeInfo>* split_ranges);
 
 } // namespace starrocks::lake
