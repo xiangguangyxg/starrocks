@@ -137,6 +137,14 @@ static Status decode_datetime_min_max(const orc::Type* orc_type, const orc::prot
             }
             int64_t secs = ms / 1000;
             ns += (ms - secs * 1000) * 1000000L;
+            // orc_ts_to_native_ts now carries the sub-second into the before-epoch result for the
+            // data load path. Pre-1970 stripe-stats sub-second is a separate, pre-existing concern
+            // here (the ORC nanos field is stored with a +1 offset this decoder does not undo, the
+            // remainder above can be negative, and the before-epoch instant branch ignores the
+            // offset), so keep dropping it for negative-epoch bounds to leave pruning unchanged.
+            if (secs < 0) {
+                ns = 0;
+            }
             OrcTimestampHelper::orc_ts_to_native_ts(&min, utc_tzinfo, tz_offset_in_seconds, secs, ns, is_instant);
         }
 
@@ -148,6 +156,10 @@ static Status decode_datetime_min_max(const orc::Type* orc_type, const orc::prot
             }
             int64_t secs = ms / 1000;
             ns += (ms - secs * 1000) * 1000000L;
+            // See the minimum branch: keep dropping the sub-second for negative-epoch bounds.
+            if (secs < 0) {
+                ns = 0;
+            }
             OrcTimestampHelper::orc_ts_to_native_ts(&max, utc_tzinfo, tz_offset_in_seconds, secs, ns, is_instant);
         }
 
