@@ -104,6 +104,12 @@ CONF_mInt32(starlet_filesystem_instance_cache_capacity, "10000");
 
 CONF_mInt32(starlet_filesystem_instance_cache_ttl_sec, "86400");
 
+// Whether a local disk-cache miss may be served from a peer BE that still holds the block,
+// instead of reading from object storage. Only takes effect when the serving side is also
+// enabled. Warmup and CACHE SELECT never use peer reads: peer read buys critical-path latency,
+// while background bulk work would just contend for a production node's scarce disk IOPS.
+CONF_mBool(starlet_enable_peer_cache_read, "false");
+
 #endif
 
 } // namespace starrocks::config

@@ -251,6 +251,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：BE 范围内的客户端缓存为每个远程主机保留的最大缓存 client 实例数。提高此值可以减少重连和 stub 创建开销，但会增加内存和文件描述符使用；降低它则节省资源但可能增加连接 churn。该值在启动时读取，运行时无法更改。目前一个共享设置控制所有客户端缓存类型；将来可能会引入每种缓存的独立配置。
 - 引入版本：v3.2.0
 
+### starlet_enable_peer_cache_read
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：本地磁盘缓存未命中时，是否允许读取仍缓存该数据块的对端 BE，而不是从对象存储读取。仅当对端 BE 也开启了对外提供缓存服务的开关时才生效。无论该参数如何设置，预热和 CACHE SELECT 都不会使用对端读取，因为它们属于后台批量操作，走对端读取只会争抢生产节点稀缺的磁盘 IOPS；只有对延迟敏感的查询读取才会使用对端缓存。
+- 引入版本：-
+
 ### starlet_filesystem_instance_cache_capacity
 
 - 默认值：10000

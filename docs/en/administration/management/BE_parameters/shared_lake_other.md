@@ -254,6 +254,15 @@ This topic introduces the following types of BE configurations:
 - Description: The maximum number of cached client instances retained for each remote host by BE-wide client caches. This single setting is used when creating BackendServiceClientCache, FrontendServiceClientCache, and BrokerServiceClientCache during ExecEnv initialization, so it limits the number of client stubs/connections kept per host across those caches. Raising this value reduces reconnects and stub creation overhead at the cost of increased memory and file-descriptor usage; lowering it saves resources but may increase connection churn. The value is read at startup and cannot be changed at runtime. Currently one shared setting controls all client cache types; separate per-cache configuration may be introduced later.
 - Introduced in: v3.2.0
 
+### starlet_enable_peer_cache_read
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether a local disk-cache miss can be served by reading the missing block from a peer BE that still caches it, instead of reading from object storage. This only takes effect when the peer BE also has peer serving enabled. Warmup and CACHE SELECT never use peer reads regardless of this setting, because they are background bulk operations and routing them through peer reads would contend for a production node's scarce disk IOPS; only latency-sensitive query reads use peer cache.
+- Introduced in: -
+
 ### starlet_filesystem_instance_cache_capacity
 
 - Default: 10000
