@@ -218,6 +218,15 @@ This topic introduces the following types of BE configurations:
 - Description: The maximum number of cached client instances retained for each remote host by BE-wide client caches. This single setting is used when creating BackendServiceClientCache, FrontendServiceClientCache, and BrokerServiceClientCache during ExecEnv initialization, so it limits the number of client stubs/connections kept per host across those caches. Raising this value reduces reconnects and stub creation overhead at the cost of increased memory and file-descriptor usage; lowering it saves resources but may increase connection churn. The value is read at startup and cannot be changed at runtime. Currently one shared setting controls all client cache types; separate per-cache configuration may be introduced later.
 - Introduced in: v3.2.0
 
+### starlet_enable_peer_cache_read
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: In a shared-data cluster, whether to try reading a locally-missed Data Cache block from a peer node (a previous holder of the tablet's shard) before falling back to remote storage. It accelerates queries and Compaction after a tablet migrates between nodes (for example, rebalance following tablet Split/Merge, or scaling in/out). This item takes effect only when `starlet_use_star_cache` is `true`, and is sampled when a file is opened (it applies to subsequent file opens). Peer cache read is a pure accelerator: on any miss or timeout it falls back to remote storage, so the worst case is identical to the current behavior. `false` disables peer cache read.
+- Introduced in: v4.2
+
 ### starlet_filesystem_instance_cache_capacity
 
 - Default: 10000

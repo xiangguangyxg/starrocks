@@ -207,15 +207,18 @@ public:
 
         const auto& read_stats = (*stream_st)->get_io_stats();
         auto stats = std::make_unique<io::NumericStatistics>();
-        stats->reserve(11);
+        stats->reserve(14);
         stats->append(kBytesReadLocalDisk, read_stats.bytes_read_local_disk);
         stats->append(kBytesWriteLocalDisk, read_stats.bytes_write_local_disk);
         stats->append(kBytesReadRemote, read_stats.bytes_read_remote);
+        stats->append(kBytesReadPeer, read_stats.bytes_read_peer);
         stats->append(kIOCountLocalDisk, read_stats.io_count_local_disk);
         stats->append(kIOCountRemote, read_stats.io_count_remote);
+        stats->append(kIOCountPeer, read_stats.io_count_peer);
         stats->append(kIONsReadLocalDisk, read_stats.io_ns_read_local_disk);
         stats->append(kIONsWriteLocalDisk, read_stats.io_ns_write_local_disk);
         stats->append(kIONsReadRemote, read_stats.io_ns_read_remote);
+        stats->append(kIONsReadPeer, read_stats.io_ns_read_peer);
         stats->append(kPrefetchHitCount, read_stats.prefetch_hit_count);
         stats->append(kPrefetchWaitFinishNs, read_stats.prefetch_wait_finish_ns);
         stats->append(kPrefetchPendingNs, read_stats.prefetch_pending_ns);
@@ -228,10 +231,22 @@ public:
             return {};
         }
         const auto& s = (*stream_st)->get_io_stats();
+        // This lightweight snapshot has no dedicated peer field; peer reads are non-local, so fold
+        // them into the remote (non-local) byte/op/time totals to keep this trace complete. The
+        // per-query lake profile still reports peer reads separately.
         return {
-                s.bytes_read_local_disk,  s.bytes_read_remote,  s.bytes_write_local_disk, s.bytes_write_remote,
-                s.io_count_local_disk,    s.io_count_remote,    s.io_ns_read_local_disk,  s.io_ns_read_remote,
-                s.io_ns_write_local_disk, s.io_ns_write_remote, s.prefetch_hit_count,     s.prefetch_wait_finish_ns,
+                s.bytes_read_local_disk,
+                s.bytes_read_remote + s.bytes_read_peer,
+                s.bytes_write_local_disk,
+                s.bytes_write_remote,
+                s.io_count_local_disk,
+                s.io_count_remote + s.io_count_peer,
+                s.io_ns_read_local_disk,
+                s.io_ns_read_remote + s.io_ns_read_peer,
+                s.io_ns_write_local_disk,
+                s.io_ns_write_remote,
+                s.prefetch_hit_count,
+                s.prefetch_wait_finish_ns,
                 s.prefetch_pending_ns,
         };
     }
@@ -351,6 +366,11 @@ public:
         if (info.size.has_value()) {
             opt.file_size = info.size.value();
         }
+        // Offer peer-cache-read candidates for this shard (empty / no-op unless enabled and the
+        // shard has peer_sources); guard against a missing worker on injected/startup paths.
+        if (auto worker = get_staros_worker(); worker != nullptr) {
+            opt.peer_read_options = worker->get_peer_read_options(pair.second);
+        }
         auto file_st = (*fs_st)->open(pair.first, opt);
 
         if (!file_st.ok()) {
@@ -377,6 +397,11 @@ public:
         auto opt = ReadOptions();
         opt.skip_fill_local_cache = opts.skip_fill_local_cache;
         opt.buffer_size = opts.buffer_size;
+        // Offer peer-cache-read candidates for this shard (empty / no-op unless enabled and the
+        // shard has peer_sources); guard against a missing worker on injected/startup paths.
+        if (auto worker = get_staros_worker(); worker != nullptr) {
+            opt.peer_read_options = worker->get_peer_read_options(pair.second);
+        }
         auto file_st = (*fs_st)->open(pair.first, opt);
 
         if (!file_st.ok()) {

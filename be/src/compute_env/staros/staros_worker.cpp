@@ -17,6 +17,8 @@
 
 #include <starlet.h>
 
+#include <unordered_set>
+
 #include "base/concurrency/await.h"
 #include "base/container/lru_cache.h"
 #include "base/crypto/sha.h"
@@ -136,6 +138,81 @@ absl::StatusOr<staros::starlet::ShardInfo> StarOSWorker::retrieve_shard_info(Sha
         return _fetch_shard_info_from_remote(id);
     }
     return st;
+}
+
+absl::StatusOr<std::string> StarOSWorker::resolve_peer_worker_addr(WorkerId worker_id) {
+    auto* starlet = get_starlet();
+    if (starlet == nullptr) {
+        return absl::FailedPreconditionError("starlet is not ready");
+    }
+    // Resolve the peer worker id to its "ip:port" via the co-worker map. get_worker_replication_info
+    // self-warms the map from StarManager on demand (rate-limited), so no separate refresh is
+    // needed here. An unresolved worker (down / scaled-out) is dropped by the caller and the read
+    // falls back to remote storage (fail-safe).
+    auto info_or = starlet->get_worker_replication_info(worker_id);
+    if (!info_or.ok()) {
+        return info_or.status();
+    }
+    return info_or->ip_port;
+}
+
+StarOSWorker::PeerReadOptions StarOSWorker::get_peer_read_options(ShardId id) {
+    PeerReadOptions opts;
+    // Fast path: peer cache read is disabled, or the Data Cache (star cache) it accelerates is
+    // disabled -> no lock, allocation, or lookup. The peer path only exists on the star-cache
+    // read path, so it is pointless (and against the documented contract) when star cache is off.
+    if (!config::starlet_enable_peer_cache_read || !config::starlet_use_star_cache) {
+        return opts;
+    }
+
+    // Snapshot the shard's peer_sources and this worker's identity under the shared lock (the same
+    // way worker_info() reads the inherited identity), then resolve addresses OUTSIDE the lock:
+    // resolve_peer_worker_addr may synchronously refresh the co-worker map via starmgr, so it must
+    // not run while holding _mtx. The worker identity is assigned once by the control plane at the
+    // first heartbeat and is effectively immutable thereafter.
+    std::vector<staros::PeerSourceInfo> sources;
+    WorkerId self = 0;
+    ServiceId service;
+    {
+        std::shared_lock l(_mtx);
+        auto it = _shards.find(id);
+        if (it == _shards.end()) {
+            return opts;
+        }
+        sources = it->second.shard_info.peer_sources;
+        self = worker_id();
+        service = service_id();
+    }
+    if (sources.empty()) {
+        return opts;
+    }
+    // Only proceed once this worker is registered: an empty service_id or zero worker_id means the
+    // control plane has not assigned the identity yet, so there is nothing valid to send.
+    if (service.empty() || self == 0) {
+        return opts;
+    }
+
+    opts.service_id = std::move(service);
+    opts.shard_id = id;
+
+    std::unordered_set<WorkerId> seen;
+    for (const auto& src : sources) {
+        WorkerId w = src.worker_id();
+        if (w == self) {
+            continue; // never peer-read from ourselves
+        }
+        if (!seen.insert(w).second) {
+            continue; // dedup by distinct worker (a candidate is a worker address)
+        }
+        auto addr = resolve_peer_worker_addr(w);
+        if (!addr.ok() || addr->empty()) {
+            continue; // worker down / scaled-out / unresolved: drop the candidate
+        }
+        // expire_ts carries record_time as a recency hint only; the peer-read gate fingerprints
+        // candidate membership (not expire_ts), so no per-open stability contract is required.
+        opts.peers.push_back({std::move(addr).value(), src.record_time()});
+    }
+    return opts;
 }
 
 std::vector<staros::starlet::ShardInfo> StarOSWorker::shards() const {

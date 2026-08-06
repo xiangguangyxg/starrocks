@@ -1409,6 +1409,13 @@ CONF_mInt32(starlet_cache_evict_throughput_mb, "200");
 // Only support in S3/HDFS currently.
 CONF_mInt32(starlet_fs_stream_buffer_size_bytes, "1048576");
 CONF_mBool(starlet_use_star_cache, "true");
+// Whether to try reading a locally-missed cache block from a peer worker (the shard's previous
+// holder) before falling back to remote storage. Requires starlet_use_star_cache=true. Peer read
+// is a pure accelerator: on any miss/timeout it falls back to remote storage, so the worst case
+// equals current behavior (no correctness impact). Default false; flip to true after gray-release.
+// The cluster-wide master switch is on the starmanager side (peer-source retention); this flag is
+// a per-node kill switch, sampled at file open.
+CONF_mBool(starlet_enable_peer_cache_read, "false");
 CONF_Bool(starlet_star_cache_async_init, "true");
 CONF_mInt32(starlet_star_cache_mem_size_percent, "0");
 CONF_mInt64(starlet_star_cache_mem_size_bytes, "134217728");

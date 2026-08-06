@@ -116,11 +116,14 @@ TEST(StorageValueTypesTest, StatNameConstantsRemainStable) {
     EXPECT_STREQ("bytes_write_local_disk", kBytesWriteLocalDisk);
     EXPECT_STREQ("bytes_read_remote", kBytesReadRemote);
     EXPECT_STREQ("bytes_write_remote", kBytesWriteRemote);
+    EXPECT_STREQ("bytes_read_peer", kBytesReadPeer);
     EXPECT_STREQ("io_count_local_disk", kIOCountLocalDisk);
     EXPECT_STREQ("io_count_remote", kIOCountRemote);
+    EXPECT_STREQ("io_count_peer", kIOCountPeer);
     EXPECT_STREQ("io_ns_read_local_disk", kIONsReadLocalDisk);
     EXPECT_STREQ("io_ns_write_local_disk", kIONsWriteLocalDisk);
     EXPECT_STREQ("io_ns_read_remote", kIONsReadRemote);
+    EXPECT_STREQ("io_ns_read_peer", kIONsReadPeer);
     EXPECT_STREQ("io_ns_write_remote", kIONsWriteRemote);
     EXPECT_STREQ("prefetch_hit_count", kPrefetchHitCount);
     EXPECT_STREQ("prefetch_wait_finish_ns", kPrefetchWaitFinishNs);
@@ -133,6 +136,9 @@ TEST(StorageValueTypesTest, StatisticsDefaultToZero) {
 
     EXPECT_EQ(0, reader_stats.bytes_read);
     EXPECT_EQ(0, reader_stats.rowsets_read_count);
+    EXPECT_EQ(0, reader_stats.compressed_bytes_read_peer);
+    EXPECT_EQ(0, reader_stats.io_count_peer);
+    EXPECT_EQ(0, reader_stats.io_ns_read_peer);
     EXPECT_TRUE(reader_stats.flat_json_hits.empty());
     EXPECT_EQ(0, writer_stats.bytes_write_remote);
     EXPECT_EQ(0, writer_stats.segment_count);

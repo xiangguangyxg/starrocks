@@ -1043,6 +1043,13 @@ void LakeDataSource::init_counter(RuntimeState* state) {
     _io_ns_local_disk_timer = ADD_CHILD_TIMER(_runtime_profile, "IOTimeLocalDisk", io_statistics_name);
     _io_ns_remote_timer = ADD_CHILD_TIMER(_runtime_profile, "IOTimeRemote", io_statistics_name);
     _io_ns_total_timer = ADD_CHILD_TIMER(_runtime_profile, "IOTimeTotal", io_statistics_name);
+    // Peer cache read (served from a peer worker's cache instead of remote storage); named to
+    // match the connector-path DataCacheReadPeer* counters.
+    _datacache_read_peer_counter =
+            ADD_CHILD_COUNTER(_runtime_profile, "DataCacheReadPeerCounter", TUnit::UNIT, io_statistics_name);
+    _datacache_read_peer_bytes =
+            ADD_CHILD_COUNTER(_runtime_profile, "DataCacheReadPeerBytes", TUnit::BYTES, io_statistics_name);
+    _datacache_read_peer_timer = ADD_CHILD_TIMER(_runtime_profile, "DataCacheReadPeerTimer", io_statistics_name);
     // Prefetch
     _prefetch_hit_counter = ADD_CHILD_COUNTER(_runtime_profile, "PrefetchHitCount", TUnit::UNIT, io_statistics_name);
     _prefetch_wait_finish_timer = ADD_CHILD_TIMER(_runtime_profile, "PrefetchWaitFinishTime", io_statistics_name);
@@ -1179,6 +1186,10 @@ void LakeDataSource::update_counter(RuntimeState* state) {
     COUNTER_UPDATE(_io_ns_remote_timer, _reader->stats().io_ns_remote);
     COUNTER_UPDATE(_io_ns_total_timer, _reader->stats().io_ns);
 
+    COUNTER_UPDATE(_datacache_read_peer_counter, _reader->stats().io_count_peer);
+    COUNTER_UPDATE(_datacache_read_peer_bytes, _reader->stats().compressed_bytes_read_peer);
+    COUNTER_UPDATE(_datacache_read_peer_timer, _reader->stats().io_ns_read_peer);
+
     COUNTER_UPDATE(_prefetch_hit_counter, _reader->stats().prefetch_hit_count);
     COUNTER_UPDATE(_prefetch_wait_finish_timer, _reader->stats().prefetch_wait_finish_ns);
     COUNTER_UPDATE(_prefetch_pending_timer, _reader->stats().prefetch_pending_ns);
@@ -1273,6 +1284,8 @@ void LakeDataSource::update_counter(RuntimeState* state) {
         FlatJsonMetrics::instance()->flat_json_flatten_duration_ns_total.increment(_reader->stats().json_flatten_ns);
     }
     if (state && state->query_ctx()) {
+        // io_count_remote already includes peer reads (folded in as non-local in _update_stats),
+        // so this keeps total-read and local-cache-hit-rate semantics intact.
         state->query_ctx()->incr_read_stats(_reader->stats().io_count_local_disk, _reader->stats().io_count_remote);
     }
 }

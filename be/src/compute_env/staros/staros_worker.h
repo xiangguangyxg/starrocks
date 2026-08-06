@@ -49,6 +49,7 @@ public:
     using WorkerInfo = staros::starlet::WorkerInfo;
     using FileSystem = staros::starlet::fslib::FileSystem;
     using Configuration = staros::starlet::fslib::Configuration;
+    using PeerReadOptions = staros::starlet::fslib::PeerReadOptions;
 
     typedef std::function<void(ShardId)> add_shard_listener;
 
@@ -82,6 +83,19 @@ public:
     void register_add_shard_listener(add_shard_listener listener) { _add_shard_listener = std::move(listener); }
 
     void set_fs_cache_capacity(int32_t capacity);
+
+    // Build the peer-read options for a lake read on shard `id`: resolve the shard's cached
+    // peer_sources (candidate worker ids recorded by starmanager) to "ip:port" addresses,
+    // dropping this worker itself and any candidate that no longer resolves (down / scaled-out).
+    // Returns empty peers -- a no-op for the read path -- when peer cache read is disabled, the
+    // shard is unknown locally, or nothing resolves. Never fails: peer read is a pure accelerator,
+    // so the worst case is a fall-back to remote storage (current behavior).
+    PeerReadOptions get_peer_read_options(ShardId id);
+
+protected:
+    // Resolve a peer worker id to its "ip:port". protected + virtual so unit tests can inject a
+    // deterministic resolver without a live Starlet (mirrors `_fetch_shard_info_from_remote`).
+    virtual absl::StatusOr<std::string> resolve_peer_worker_addr(WorkerId worker_id);
 
 private:
     struct ShardInfoDetails {

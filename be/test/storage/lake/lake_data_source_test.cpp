@@ -376,6 +376,15 @@ TEST_F(LakeDataSourceTest, get_tablet_schema) {
     auto tablet_schema = ds.TEST_tablet_schema();
     ASSERT_TRUE(tablet_schema != nullptr);
     ASSERT_EQ(schema_id, tablet_schema->id());
+
+    // Peer-cache-read counters are wired into the lake scan profile by init_counter() (run during
+    // open()); assert they exist under the DataSource profile. Non-zero population is covered by
+    // the stats-plumbing unit tests and the cluster e2e validation.
+    auto* ds_profile = parent_profile.get_child(connector::DataSource::PROFILE_NAME);
+    ASSERT_NE(nullptr, ds_profile);
+    EXPECT_NE(nullptr, ds_profile->get_counter("DataCacheReadPeerCounter"));
+    EXPECT_NE(nullptr, ds_profile->get_counter("DataCacheReadPeerBytes"));
+    EXPECT_NE(nullptr, ds_profile->get_counter("DataCacheReadPeerTimer"));
 }
 
 // Exercise the vector-search branches of LakeDataSource::open() that were added by

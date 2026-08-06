@@ -4287,10 +4287,22 @@ void SegmentIterator::_update_stats(io::SeekableInputStream* rfile) {
         } else if (name == kBytesReadRemote) {
             _opts.stats->compressed_bytes_read_remote += value;
             _opts.stats->compressed_bytes_read += value;
+        } else if (name == kBytesReadPeer) {
+            // A peer read is a non-local read: fold it into the remote (non-local) totals so every
+            // consumer of the remote stats (compaction/publish/index reporting, query audit) counts
+            // it, and keep a separate peer breakdown for the lake scan profile's DataCacheReadPeer*
+            // counters. Peer is 0 unless peer cache read is enabled, so this is a no-op by default.
+            _opts.stats->compressed_bytes_read_peer += value;
+            _opts.stats->compressed_bytes_read_remote += value;
+            _opts.stats->compressed_bytes_read += value;
         } else if (name == kIOCountLocalDisk) {
             _opts.stats->io_count_local_disk += value;
             _opts.stats->io_count += value;
         } else if (name == kIOCountRemote) {
+            _opts.stats->io_count_remote += value;
+            _opts.stats->io_count += value;
+        } else if (name == kIOCountPeer) {
+            _opts.stats->io_count_peer += value;
             _opts.stats->io_count_remote += value;
             _opts.stats->io_count += value;
         } else if (name == kIONsReadLocalDisk) {
@@ -4298,6 +4310,9 @@ void SegmentIterator::_update_stats(io::SeekableInputStream* rfile) {
         } else if (name == kIONsWriteLocalDisk) {
             _opts.stats->io_ns_write_local_disk += value;
         } else if (name == kIONsReadRemote) {
+            _opts.stats->io_ns_remote += value;
+        } else if (name == kIONsReadPeer) {
+            _opts.stats->io_ns_read_peer += value;
             _opts.stats->io_ns_remote += value;
         } else if (name == kPrefetchHitCount) {
             _opts.stats->prefetch_hit_count += value;

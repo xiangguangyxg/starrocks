@@ -226,6 +226,11 @@ private:
     RuntimeProfile::Counter* _io_ns_local_disk_timer = nullptr;
     RuntimeProfile::Counter* _io_ns_remote_timer = nullptr;
     RuntimeProfile::Counter* _io_ns_total_timer = nullptr;
+    // Peer cache read (data served from a peer worker's cache instead of remote storage); named to
+    // match the connector-path DataCacheReadPeer* counters.
+    RuntimeProfile::Counter* _datacache_read_peer_counter = nullptr;
+    RuntimeProfile::Counter* _datacache_read_peer_bytes = nullptr;
+    RuntimeProfile::Counter* _datacache_read_peer_timer = nullptr;
     // Prefetch
     RuntimeProfile::Counter* _prefetch_hit_counter = nullptr;
     RuntimeProfile::Counter* _prefetch_wait_finish_timer = nullptr;

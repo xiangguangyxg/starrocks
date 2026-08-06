@@ -27,6 +27,7 @@
 #include <functional>
 
 #include "base/utility/defer_op.h"
+#include "common/config_staros_worker_fwd.h"
 #include "common/shutdown_hook.h"
 #include "compute_env/staros/staros_worker_metrics.h"
 #include "compute_env/staros/staros_worker_runtime.h"
@@ -325,6 +326,224 @@ TEST_F(StarOSWorkerTest, test_fallback_metric_increments_on_cache_miss_failure) 
     ASSERT_FALSE(got.ok());
     EXPECT_EQ(before_total + 1, metrics->staros_shard_info_fallback_total.value());
     EXPECT_EQ(before_failed + 1, metrics->staros_shard_info_fallback_failed_total.value());
+}
+
+namespace {
+
+staros::PeerSourceInfo make_peer_source(uint64_t worker_id, int64_t record_time) {
+    staros::PeerSourceInfo p;
+    p.set_worker_id(worker_id);
+    p.set_record_time(record_time);
+    return p;
+}
+
+// Test worker with an injectable address resolver, so get_peer_read_options can be exercised
+// without a live Starlet / co-worker registry.
+class PeerReadTestWorker : public StarOSWorker {
+public:
+    // worker_id -> resolved "ip:port". A missing entry models an unresolvable (down/scaled-out)
+    // worker; an entry mapped to "" models a resolver that returns OK with an empty address.
+    std::unordered_map<WorkerId, std::string> addr_book;
+    int resolve_calls = 0;
+
+protected:
+    absl::StatusOr<std::string> resolve_peer_worker_addr(WorkerId worker_id) override {
+        ++resolve_calls;
+        auto it = addr_book.find(worker_id);
+        if (it == addr_book.end()) {
+            return absl::NotFoundError("unresolved");
+        }
+        return it->second;
+    }
+};
+
+// RAII toggle for the peer-cache-read gflag, restored on scope exit.
+class ScopedPeerCacheRead {
+public:
+    explicit ScopedPeerCacheRead(bool enabled) : _saved(config::starlet_enable_peer_cache_read) {
+        config::starlet_enable_peer_cache_read = enabled;
+    }
+    ~ScopedPeerCacheRead() { config::starlet_enable_peer_cache_read = _saved; }
+
+private:
+    bool _saved;
+};
+
+} // namespace
+
+TEST_F(StarOSWorkerTest, peer_read_options_disabled_returns_empty) {
+    ScopedPeerCacheRead guard(false);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    worker.addr_book[2] = "10.0.0.2:9070";
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_TRUE(opts.peers.empty());
+    EXPECT_EQ(0, worker.resolve_calls); // disabled: no lookup or resolve at all
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_unknown_shard_returns_empty) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    auto opts = worker.get_peer_read_options(12345); // never added
+    EXPECT_TRUE(opts.peers.empty());
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_no_sources_returns_empty) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    StarOSWorker::ShardInfo info;
+    info.id = 100; // no peer_sources
+    ASSERT_TRUE(worker.add_shard(info).ok());
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_TRUE(opts.peers.empty());
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_builds_candidates_in_order) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    worker.set_service_id("svc-1");
+    worker.addr_book[2] = "10.0.0.2:9070";
+    worker.addr_book[3] = "10.0.0.3:9070";
+
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 222));
+    info.peer_sources.push_back(make_peer_source(3, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_EQ("svc-1", opts.service_id);
+    EXPECT_EQ(100u, opts.shard_id);
+    ASSERT_EQ(2u, opts.peers.size());
+    // order preserved from peer_sources; expire_ts carries record_time (recency hint).
+    EXPECT_EQ("10.0.0.2:9070", opts.peers[0].ip_port);
+    EXPECT_EQ(222, opts.peers[0].expire_ts);
+    EXPECT_EQ("10.0.0.3:9070", opts.peers[1].ip_port);
+    EXPECT_EQ(111, opts.peers[1].expire_ts);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_drops_self) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(7);
+    worker.set_service_id("svc-1");
+    worker.addr_book[7] = "10.0.0.7:9070"; // self: would resolve, but must be dropped
+    worker.addr_book[8] = "10.0.0.8:9070";
+
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(7, 222)); // self
+    info.peer_sources.push_back(make_peer_source(8, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    ASSERT_EQ(1u, opts.peers.size());
+    EXPECT_EQ("10.0.0.8:9070", opts.peers[0].ip_port);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_drops_unresolvable_and_empty_addr) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    worker.set_service_id("svc-1");
+    worker.addr_book[3] = "10.0.0.3:9070"; // resolvable
+    worker.addr_book[4] = "";              // resolves OK but empty -> drop
+    // worker 2 absent from addr_book -> NotFound -> drop
+
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 333));
+    info.peer_sources.push_back(make_peer_source(3, 222));
+    info.peer_sources.push_back(make_peer_source(4, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    ASSERT_EQ(1u, opts.peers.size());
+    EXPECT_EQ("10.0.0.3:9070", opts.peers[0].ip_port);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_dedups_by_worker) {
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    worker.set_service_id("svc-1");
+    worker.addr_book[2] = "10.0.0.2:9070";
+
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    // two sources for the same worker (e.g. merge fan-in): collapse to one candidate.
+    info.peer_sources.push_back(make_peer_source(2, 222));
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    ASSERT_EQ(1u, opts.peers.size());
+    EXPECT_EQ("10.0.0.2:9070", opts.peers[0].ip_port);
+    EXPECT_EQ(1, worker.resolve_calls); // dedup happens before resolving
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_null_starlet_default_resolver_returns_empty) {
+    // Exercise the PRODUCTION resolver (not overridden) with no live Starlet: get_starlet()==null
+    // must fail resolution so the candidate is dropped and the read path stays a no-op.
+    ScopedPeerCacheRead guard(true);
+    auto orig = swap_starlet_for_test(nullptr);
+    DeferOp restore([&] { (void)swap_starlet_for_test(std::move(orig)); });
+
+    StarOSWorker worker; // base class: uses the real resolve_peer_worker_addr -> get_starlet()
+    worker.set_worker_id(1);
+    worker.set_service_id("svc-1"); // registered identity, so the identity guard is not what trips
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_TRUE(opts.peers.empty());
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_empty_when_identity_unset) {
+    // Before registration, worker_id is 0 / service_id is empty; peer read must be a no-op then,
+    // never emitting candidates with an unset identity.
+    ScopedPeerCacheRead guard(true);
+    PeerReadTestWorker worker; // default worker_id() == 0, service_id() empty
+    worker.addr_book[2] = "10.0.0.2:9070";
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_TRUE(opts.peers.empty());
+    EXPECT_EQ(0, worker.resolve_calls);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_requires_star_cache) {
+    // Peer read only exists on the star-cache read path, so it must be a no-op when star cache is
+    // off, even if the peer-cache-read flag itself is on.
+    ScopedPeerCacheRead guard(true);
+    const bool saved_star_cache = config::starlet_use_star_cache;
+    config::starlet_use_star_cache = false;
+    DeferOp restore([&] { config::starlet_use_star_cache = saved_star_cache; });
+
+    PeerReadTestWorker worker;
+    worker.set_worker_id(1);
+    worker.addr_book[2] = "10.0.0.2:9070";
+    StarOSWorker::ShardInfo info;
+    info.id = 100;
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker.add_shard(info).ok());
+
+    auto opts = worker.get_peer_read_options(100);
+    EXPECT_TRUE(opts.peers.empty());
+    EXPECT_EQ(0, worker.resolve_calls); // star cache off: no lookup or resolve
 }
 
 } // namespace starrocks

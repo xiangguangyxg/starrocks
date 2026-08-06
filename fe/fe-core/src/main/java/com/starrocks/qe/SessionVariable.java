@@ -400,6 +400,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String SKIP_PAGE_CACHE = "skip_page_cache";
 
+    public static final String SKIP_FILL_DATACACHE = "skip_fill_datacache";
+
     public static final String SKIP_BLACK_LIST = "skip_black_list";
 
     /**
@@ -1304,6 +1306,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VariableMgr.VarAttr(name = SKIP_PAGE_CACHE)
     private boolean skipPageCache = false;
+
+    @VariableMgr.VarAttr(name = SKIP_FILL_DATACACHE)
+    private boolean skipFillDatacache = false;
 
     @VariableMgr.VarAttr(name = SKIP_BLACK_LIST)
     private boolean skipBlackList = false;
@@ -3833,6 +3838,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public boolean isSkipPageCache() {
         return skipPageCache;
+    }
+
+    public boolean isSkipFillDatacache() {
+        return skipFillDatacache;
     }
 
     public boolean isSkipBlackList() {

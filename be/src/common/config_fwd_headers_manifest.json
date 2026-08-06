@@ -646,6 +646,7 @@
         "starlet_cache_dir",
         "starlet_cache_thread_num",
         "starlet_delete_files_max_key_in_batch",
+        "starlet_enable_peer_cache_read",
         "starlet_filesystem_instance_cache_capacity",
         "starlet_filesystem_instance_cache_ttl_sec",
         "starlet_fs_read_prefetch_enable",

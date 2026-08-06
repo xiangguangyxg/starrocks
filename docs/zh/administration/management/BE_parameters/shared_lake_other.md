@@ -215,6 +215,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：BE 范围内的客户端缓存为每个远程主机保留的最大缓存 client 实例数。提高此值可以减少重连和 stub 创建开销，但会增加内存和文件描述符使用；降低它则节省资源但可能增加连接 churn。该值在启动时读取，运行时无法更改。目前一个共享设置控制所有客户端缓存类型；将来可能会引入每种缓存的独立配置。
 - 引入版本：v3.2.0
 
+### starlet_enable_peer_cache_read
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：存算分离集群中，当本地 Data Cache 未命中某个 Block 时，是否先尝试从对端节点（该 Tablet Shard 的先前持有节点）读取该 Block，读取失败再回退到远端存储。该机制可加速 Tablet 在节点间迁移（例如 Tablet Split/Merge 后的 rebalance，或扩缩容）后的查询和 Compaction。仅当 `starlet_use_star_cache` 为 `true` 时生效，并在打开文件时读取该配置（对后续打开的文件生效）。Peer Cache Read 仅为加速手段：任何未命中或超时都会回退到远端存储，因此最差情况与当前行为一致。`false` 表示禁用 Peer Cache Read。
+- 引入版本：v4.2
+
 ### starlet_filesystem_instance_cache_capacity
 
 - 默认值：10000

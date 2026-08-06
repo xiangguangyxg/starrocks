@@ -22,6 +22,7 @@
 #include <fslib/star_cache_configuration.h>
 #include <fslib/stat.h>
 #include <gtest/gtest.h>
+#include <shard.pb.h>
 
 #include <fstream>
 
@@ -30,6 +31,7 @@
 #include "base/utility/defer_op.h"
 #include "common/config_object_storage_fwd.h"
 #include "common/config_starlet_fwd.h"
+#include "common/config_staros_worker_fwd.h"
 #include "compute_env/staros/staros_worker.h"
 #include "compute_env/staros/staros_worker_runtime.h"
 #include "fs/fs_factory.h"
@@ -205,7 +207,17 @@ TEST_P(StarletFileSystemTest, test_write_and_read) {
     ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(uri));
     ASSIGN_OR_ABORT(auto nr, rf->read_at(0, buf, sizeof(buf)));
     ASSIGN_OR_ABORT(auto stats2, rf->get_numeric_statistics());
-    EXPECT_EQ((*stats2).size(), 11);
+    EXPECT_EQ((*stats2).size(), 14);
+    // The three peer-read stats are present; zero here since this read used no peer candidates.
+    int peer_stat_count = 0;
+    for (size_t i = 0; i < (*stats2).size(); ++i) {
+        std::string sname = (*stats2).name(i);
+        if (sname == "bytes_read_peer" || sname == "io_count_peer" || sname == "io_ns_read_peer") {
+            ++peer_stat_count;
+            EXPECT_EQ(0, (*stats2).value(i));
+        }
+    }
+    EXPECT_EQ(3, peer_stat_count);
     EXPECT_EQ("hello world!", std::string_view(buf, nr));
     // Exercise the lightweight `get_io_stats_snapshot()` path used by the publish
     // trace. After the read above the snapshot must reflect non-zero byte/op
@@ -936,6 +948,97 @@ TEST_F(NewFsStarletTest, test_new_fs_starlet_different_shard_ids) {
     auto fs4 = new_fs_starlet(22222, true);
     ASSERT_NE(nullptr, fs4);
     EXPECT_EQ(2, callback_count);
+}
+
+namespace {
+
+staros::PeerSourceInfo make_peer_source(uint64_t worker_id, int64_t record_time) {
+    staros::PeerSourceInfo p;
+    p.set_worker_id(worker_id);
+    p.set_record_time(record_time);
+    return p;
+}
+
+// Captures the ReadOptions handed to open(), so the peer_read_options wiring can be asserted.
+class CaptureOptionsFileSystem : public MockStarletFileSystem {
+public:
+    absl::StatusOr<std::unique_ptr<staros::starlet::fslib::ReadOnlyFile>> open(
+            std::string_view /*path*/, const staros::starlet::fslib::ReadOptions& opts) override {
+        last_peer_options = opts.peer_read_options;
+        ++open_count;
+        return std::unique_ptr<staros::starlet::fslib::ReadOnlyFile>(new SnapshotMockReadOnlyFile());
+    }
+    staros::starlet::fslib::PeerReadOptions last_peer_options;
+    int open_count = 0;
+};
+
+// Worker that resolves every peer worker id to a deterministic address, so get_peer_read_options
+// yields candidates without a live co-worker registry.
+class PeerSourceWorker : public StarOSWorker {
+protected:
+    absl::StatusOr<std::string> resolve_peer_worker_addr(WorkerId worker_id) override {
+        return fmt::format("10.0.0.{}:9070", worker_id);
+    }
+};
+
+} // namespace
+
+TEST_F(NewFsStarletTest, peer_read_options_filled_on_random_and_sequential_open) {
+    const bool saved = config::starlet_enable_peer_cache_read;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore_flag([&] { config::starlet_enable_peer_cache_read = saved; });
+
+    const int64_t shard_id = 700001;
+    auto worker = std::make_shared<PeerSourceWorker>();
+    worker->set_worker_id(1);        // registered identity so get_peer_read_options proceeds
+    worker->set_service_id("svc-1");
+    StarOSWorker::ShardInfo info;
+    info.id = shard_id;
+    info.peer_sources.push_back(make_peer_source(2, 111));
+    ASSERT_TRUE(worker->add_shard(info).ok());
+    set_staros_worker_for_test(worker);
+
+    auto mock_fs = std::make_shared<CaptureOptionsFileSystem>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock_fs;
+    });
+
+    auto fs = new_fs_starlet(shard_id, false);
+    ASSERT_NE(nullptr, fs);
+
+    // random-access open receives the resolved peer candidate for this shard.
+    ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(fmt::format("staros://{}/anyfile", shard_id)));
+    ASSERT_EQ(1u, mock_fs->last_peer_options.peers.size());
+    EXPECT_EQ("10.0.0.2:9070", mock_fs->last_peer_options.peers[0].ip_port);
+    EXPECT_EQ(static_cast<uint64_t>(shard_id), mock_fs->last_peer_options.shard_id);
+
+    // sequential open goes through the same peer-fill path.
+    mock_fs->last_peer_options = {};
+    ASSIGN_OR_ABORT(auto sf, fs->new_sequential_file(fmt::format("staros://{}/anyfile", shard_id)));
+    ASSERT_EQ(1u, mock_fs->last_peer_options.peers.size());
+    EXPECT_EQ("10.0.0.2:9070", mock_fs->last_peer_options.peers[0].ip_port);
+}
+
+TEST_F(NewFsStarletTest, peer_read_options_empty_when_worker_null) {
+    const bool saved = config::starlet_enable_peer_cache_read;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore_flag([&] { config::starlet_enable_peer_cache_read = saved; });
+
+    // No StarOS worker: the open path must still succeed with empty peer options (fail-safe).
+    set_staros_worker_for_test(nullptr);
+
+    const int64_t shard_id = 700002;
+    auto mock_fs = std::make_shared<CaptureOptionsFileSystem>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock_fs;
+    });
+
+    auto fs = new_fs_starlet(shard_id, false);
+    ASSERT_NE(nullptr, fs);
+    ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(fmt::format("staros://{}/anyfile", shard_id)));
+    EXPECT_TRUE(mock_fs->last_peer_options.peers.empty());
 }
 
 } // namespace starrocks
