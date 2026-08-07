@@ -18,6 +18,9 @@
 
 #include "base/testutil/assert.h"
 #include "base/testutil/id_generator.h"
+#include "base/testutil/sync_point.h"
+#include "base/utility/defer_op.h"
+#include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "storage/del_vector.h"
 #include "storage/lake/fixed_location_provider.h"
@@ -308,6 +311,72 @@ TEST_F(LakeDelvecLoaderTest, test_load_from_file_with_mismatched_cached_metadata
     ASSERT_TRUE(loader.load_from_file(tsid, version, &pdelvec).ok());
     ASSERT_TRUE(pdelvec != nullptr);
     EXPECT_EQ(expected_delvec, pdelvec->save());
+}
+
+// load_from_file reaches the tablet metadata through get_tablet_metadata, which used to take only a
+// bare `bool fill_cache` -- there was no way for the caller's LakeIOOptions::skip_peer_cache to reach
+// the open, so a CACHE SELECT's delvec metadata read fell back to a peer while every other read on
+// the same query avoided one. Assert the LakeIOOptions -> CacheOptions bridge, both values.
+TEST_F(LakeDelvecLoaderTest, test_load_from_file_bridges_skip_peer_cache) {
+    const int64_t tablet_id = 10008;
+    const uint32_t segment_id = 800;
+    const int64_t version = 17;
+    auto tablet = std::make_shared<Tablet>(_tablet_manager.get(), tablet_id);
+
+    auto metadata = std::make_shared<TabletMetadata>();
+    metadata->set_id(tablet_id);
+    metadata->set_version(version);
+    metadata->set_next_rowset_id(110);
+    metadata->mutable_schema()->set_keys_type(PRIMARY_KEYS);
+
+    MetaFileBuilder builder(*tablet, metadata);
+    DelVector dv;
+    dv.set_empty();
+    std::shared_ptr<DelVector> ndv;
+    std::vector<uint32_t> dels = {4, 8, 15, 16, 23, 42};
+    dv.add_dels_as_new_version(dels, version, &ndv);
+    const std::string expected_delvec = ndv->save();
+    builder.append_delvec(ndv, segment_id);
+    ASSERT_TRUE(builder.finalize(next_id()).ok());
+
+    int callback_count = 0;
+    bool captured_skip_peer_cache = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+        callback_count++;
+        captured_skip_peer_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache;
+    });
+
+    const auto meta_path = _tablet_manager->tablet_metadata_location(tablet_id, version);
+    TabletSegmentId tsid(tablet_id, segment_id);
+
+    // finalize() warmed the metacache; a cached hit never reaches an open, so the hook would never
+    // fire and the assertion below would be vacuous. Force a cold read each time.
+    {
+        _tablet_manager->metacache()->erase(meta_path);
+        LakeIOOptions lake_io_opts;
+        lake_io_opts.skip_peer_cache = true;
+        LakeDelvecLoader loader(_tablet_manager.get(), nullptr, true, lake_io_opts);
+        DelVectorPtr pdelvec;
+        ASSERT_TRUE(loader.load_from_file(tsid, version, &pdelvec).ok());
+        ASSERT_EQ(1, callback_count); // positive control: the metadata open actually happened
+        EXPECT_TRUE(captured_skip_peer_cache);
+        ASSERT_TRUE(pdelvec != nullptr);
+        EXPECT_EQ(expected_delvec, pdelvec->save());
+    }
+    {
+        _tablet_manager->metacache()->erase(meta_path);
+        LakeIOOptions lake_io_opts; // skip_peer_cache defaults to false: peer allowed
+        LakeDelvecLoader loader(_tablet_manager.get(), nullptr, true, lake_io_opts);
+        DelVectorPtr pdelvec;
+        ASSERT_TRUE(loader.load_from_file(tsid, version, &pdelvec).ok());
+        ASSERT_EQ(2, callback_count);
+        EXPECT_FALSE(captured_skip_peer_cache);
+    }
 }
 
 // Test load with pk_builder

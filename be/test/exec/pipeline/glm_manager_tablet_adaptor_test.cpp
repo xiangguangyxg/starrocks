@@ -30,6 +30,7 @@
 #include "connector/lake/lake_global_late_materialization_context.h"
 #include "exec/pipeline/lookup/tablet_adaptor.h"
 #include "exec/pipeline/scan/glm_manager.h"
+#include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "gtest/gtest.h"
 #include "runtime/descriptor_helper.h"
@@ -39,6 +40,7 @@
 #include "storage/lake/fixed_location_provider.h"
 #include "storage/lake/join_path.h"
 #include "storage/lake/location_provider.h"
+#include "storage/lake/metacache.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/tablet.h"
 #include "storage/lake/tablet_manager.h"
@@ -522,6 +524,71 @@ TEST_F(LakeScanTabletAdaptorCacheTest, SkipPeerCachePolicyIsHonored) {
                                /*query_use_page_cache=*/true);
     ASSERT_TRUE(observed.seen);
     EXPECT_TRUE(observed.lake_io_opts.skip_peer_cache);
+}
+
+// The lookup's own tablet-metadata load (LakeScanTabletAdaptor::init_schema -> get_tablet) is a
+// separate open from the segment reads above, and it used to go through the two-argument get_tablet
+// overload, which has no way to express the policy. A CACHE SELECT that suppressed peer reads would
+// therefore still fetch this tablet's metadata from a peer BE.
+//
+// Note the metacache trap: SetUp() and the get_tablet() below both cache the metadata, and a cached
+// hit never reaches an open, so the sync point would never fire and the assertion would be vacuous.
+// Erase the entry immediately before init_schema() and assert the callback fired.
+TEST_F(LakeScanTabletAdaptorCacheTest, SkipPeerCacheReachesTabletMetadataOpen) {
+    struct Observed {
+        int callback_count = 0;
+        bool skip_peer_cache = false;
+    };
+
+    auto load_tablet_metadata_through_lookup = [&](bool skip_peer_cache) {
+        LakeScanLazyMaterializationContext ctx;
+        TLakeScanNode scan_node; // no schema_key: init_schema takes the tablet-metadata schema path
+        ctx.set_scan_node(scan_node);
+
+        auto tablet = _tablet_mgr->get_tablet(_tablet_id, kVersion);
+        CHECK(tablet.ok()) << tablet.status();
+        std::vector<BaseRowsetSharedPtr> rowsets;
+        for (auto& rs : tablet->get_rowsets()) {
+            rowsets.emplace_back(rs);
+        }
+        ctx.capture_rowsets(static_cast<int32_t>(_tablet_id), kVersion, rowsets,
+                            {.use_page_cache = true,
+                             .fill_data_cache = true,
+                             .fill_metadata_cache = true,
+                             .skip_disk_cache = false,
+                             .skip_peer_cache = skip_peer_cache});
+
+        RuntimeState state(TUniqueId(), TQueryOptions(), TQueryGlobals(), nullptr);
+        auto adaptor_or = create_look_up_tablet_adaptor(RowPositionDescriptor::Type::LAKE_SCAN);
+        CHECK(adaptor_or.ok());
+        auto adaptor = std::move(adaptor_or.value());
+        CHECK_OK(adaptor->capture(&ctx));
+        CHECK_OK(adaptor->init(_tablet_id));
+
+        Observed observed;
+        SyncPoint::GetInstance()->EnableProcessing();
+        DeferOp sync_point_guard([]() {
+            SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+            SyncPoint::GetInstance()->DisableProcessing();
+        });
+        SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+            observed.callback_count++;
+            observed.skip_peer_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache;
+        });
+
+        // The get_tablet() above re-warmed the metacache, so erase last.
+        _tablet_mgr->metacache()->erase(_tablet_mgr->tablet_metadata_location(_tablet_id, kVersion));
+        CHECK_OK(adaptor->init_schema(&state));
+        return observed;
+    };
+
+    auto suppressed = load_tablet_metadata_through_lookup(/*skip_peer_cache=*/true);
+    ASSERT_EQ(1, suppressed.callback_count); // positive control: the open really happened
+    EXPECT_TRUE(suppressed.skip_peer_cache);
+
+    auto allowed = load_tablet_metadata_through_lookup(/*skip_peer_cache=*/false);
+    ASSERT_EQ(1, allowed.callback_count);
+    EXPECT_FALSE(allowed.skip_peer_cache);
 }
 
 } // namespace starrocks

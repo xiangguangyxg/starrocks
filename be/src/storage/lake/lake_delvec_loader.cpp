@@ -17,6 +17,7 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "storage/lake/location_provider.h"
+#include "storage/lake/options.h"
 #include "storage/lake/tablet_manager.h"
 
 namespace starrocks::lake {
@@ -57,7 +58,14 @@ Status LakeDelvecLoader::load_from_file(const TabletSegmentId& tsid, int64_t ver
                 (_lake_io_opts.location_provider != nullptr)
                         ? _lake_io_opts.location_provider->tablet_metadata_location(tsid.tablet_id, version)
                         : _tablet_manager->tablet_metadata_location(tsid.tablet_id, version);
-        ASSIGN_OR_RETURN(metadata, _tablet_manager->get_tablet_metadata(filepath, _fill_cache, 0, _lake_io_opts.fs));
+        // Bridge the read policy onto the metadata load. The two fill_* fields reproduce exactly what
+        // the bool overload built from _fill_cache; skip_peer_cache is what that overload cannot
+        // express, and dropping it here would let a CACHE SELECT's delvec metadata read fall back to
+        // a peer while every other read on the same query avoids one.
+        const CacheOptions cache_opts{.fill_meta_cache = _fill_cache,
+                                      .fill_data_cache = _fill_cache,
+                                      .skip_peer_cache = _lake_io_opts.skip_peer_cache};
+        ASSIGN_OR_RETURN(metadata, _tablet_manager->get_tablet_metadata(filepath, cache_opts, 0, _lake_io_opts.fs));
     }
 
     RETURN_IF_ERROR(

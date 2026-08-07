@@ -274,6 +274,10 @@ public:
     StatusOr<int64_t> get_tablet_data_size(int64_t tablet_id, int64_t* version_hint);
 
     StatusOr<int64_t> get_tablet_num_rows(int64_t tablet_id, int64_t version);
+    // The |cache_opts| overload exists for callers that run BEFORE the scan itself and would
+    // otherwise decide the read policy for it: this fills the tablet-metadata metacache, so a later
+    // reader of the same (tablet_id, version) gets a cache hit and never consults its own policy.
+    StatusOr<int64_t> get_tablet_num_rows(int64_t tablet_id, int64_t version, const CacheOptions& cache_opts);
 
     int64_t in_writing_data_size(int64_t tablet_id);
 

@@ -16,6 +16,10 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "base/testutil/assert.h"
@@ -27,6 +31,7 @@
 #include "column/schema.h"
 #include "column/vectorized_fwd.h"
 #include "common/config_exec_fwd.h"
+#include "common/config_lake_fwd.h"
 #include "common/config_scan_io_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "common/logging.h"
@@ -40,6 +45,7 @@
 #include "connector/lake/lake_global_late_materialization_context.h"
 #include "exec_primitive/pipeline/scan/scan_morsel.h"
 #include "exec_primitive/runtime_filter/runtime_filter_probe.h"
+#include "fs/fs.h"
 #include "fs/fs_factory.h"
 #include "fs/fs_util.h"
 #include "runtime/descriptor_helper.h"
@@ -908,10 +914,10 @@ TEST_F(LakeDataSourceTest, test_has_all_pk_columns_selected) {
 // clang-format off
 TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
     // Case 1: Non-PK table → skip warmup
-    { ASSERT_OK(connector::warmup_pk_index_sst_files(_tablet_metadata.get(), _tablet_mgr)); }
+    { ASSERT_OK(connector::warmup_pk_index_sst_files(_tablet_metadata.get(), _tablet_mgr, /*skip_peer_cache=*/true)); }
 
     // Case 2: nullptr metadata → skip warmup
-    { ASSERT_OK(connector::warmup_pk_index_sst_files(nullptr, _tablet_mgr)); }
+    { ASSERT_OK(connector::warmup_pk_index_sst_files(nullptr, _tablet_mgr, /*skip_peer_cache=*/true)); }
 
     // Case 3: PK table with cloud-native persistent index but no SST files → skip
     {
@@ -920,7 +926,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         pk_metadata.set_version(1);
         pk_metadata.set_enable_persistent_index(true);
         pk_metadata.set_persistent_index_type(PersistentIndexTypePB::CLOUD_NATIVE);
-        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr));
+        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true));
     }
 
     // Case 4: PK table with LOCAL persistent index → skip
@@ -934,7 +940,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         auto* sst = sst_meta->add_sstables();
         sst->set_filename("dummy.sst");
         sst->set_filesize(100);
-        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr));
+        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true));
     }
 
 #ifdef USE_STAROS
@@ -960,7 +966,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         sst->set_filename(sst_filename);
         sst->set_filesize(4096);
 
-        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr));
+        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true));
     }
 
     // Case 6: SST file exists but filesize not set in pb → fallback to get_size()
@@ -984,7 +990,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         sst->set_filename(sst_filename);
         // filesize not set (defaults to 0), should fallback to get_size()
 
-        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr));
+        ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true));
     }
 
     // Case 7: SST file does not exist → should return error
@@ -999,7 +1005,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         sst->set_filename("nonexistent.sst");
         sst->set_filesize(100);
 
-        ASSERT_FALSE(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr).ok());
+        ASSERT_FALSE(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true).ok());
     }
 
     // Case 8: SST with invalid encryption_meta → should return error
@@ -1015,7 +1021,7 @@ TEST_F(LakeDataSourceTest, test_warmup_pk_index_sst_files) {
         sst->set_filesize(1024);
         sst->set_encryption_meta("invalid_encryption_meta");
 
-        ASSERT_FALSE(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr).ok());
+        ASSERT_FALSE(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true).ok());
     }
 #endif
 }
@@ -1826,5 +1832,444 @@ TEST_F(LakeDataSourceTest, no_glm_context_when_late_materialization_disabled) {
     // get_ctx() DCHECKs on an unknown scan node id, so assert on the map itself.
     EXPECT_TRUE(glm_mgr._ctx_map.empty());
 }
+
+// ---------------------------------------------------------------------------
+// CACHE SELECT must not consume cross-BE peer bandwidth on any path it reaches.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Every RandomAccessFileOptions a hook observed during one action. Recording all of them, rather
+// than only the last, keeps the assertions honest if a path ever grows a second open.
+struct ObservedOpens {
+    int count = 0;
+    bool all_skip_peer_cache = true;
+    bool any_allow_peer_cache = false;
+
+    void record(void* arg) {
+        count++;
+        if (static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache) {
+            return;
+        }
+        all_skip_peer_cache = false;
+        any_allow_peer_cache = true;
+    }
+};
+
+// LakeDataSource::open() dereferences tuple_desc->table_desc(), so an open-based case needs a
+// descriptor table carrying the scanned columns plus a table descriptor on the tuple.
+void attach_c0_c1_desc_tbl(RuntimeState* runtime_state) {
+    TDescriptorTableBuilder desc_tbl_builder;
+    TSlotDescriptorBuilder slot_desc_builder;
+    TTupleDescriptorBuilder tuple_desc_builder;
+    tuple_desc_builder.add_slot(
+            slot_desc_builder.type(LogicalType::TYPE_INT).column_name("c0").column_pos(0).nullable(true).build());
+    tuple_desc_builder.add_slot(
+            slot_desc_builder.type(LogicalType::TYPE_INT).column_name("c1").column_pos(1).nullable(true).build());
+    tuple_desc_builder.build(&desc_tbl_builder);
+
+    DescriptorTbl* desc_tbl = nullptr;
+    CHECK_OK(DescriptorTbl::create(runtime_state, runtime_state->obj_pool(), desc_tbl_builder.desc_tbl(), &desc_tbl,
+                                   config::vector_chunk_size));
+    runtime_state->set_desc_tbl(desc_tbl);
+
+    TTableDescriptor tdesc;
+    tdesc.__set_id(0);
+    tdesc.__set_tableType(TTableType::OLAP_TABLE);
+    tdesc.__set_tableName("test_table");
+    tdesc.__set_dbName("test_db");
+    desc_tbl->get_tuple_descriptor(0)->set_table_desc(runtime_state->obj_pool()->add(new OlapTableDescriptor(tdesc)));
+}
+
+// Open a LakeDataSource over (tablet_id, version) and hand the opened source, plus open()'s status,
+// to |inspect| while everything it borrows is still alive.
+//
+// |before_open| runs immediately before open(). That is where a case needing a genuinely cold
+// metadata read drops the metacache entry: the fixture's SetUp and the get_tablet() below both warm
+// it, and a cached hit never reaches an open, so a sync-point assertion would observe nothing.
+//
+// open() is allowed to fail; every case here asserts on state init_reader_params() already produced.
+void run_scan(TabletManager* tablet_mgr, int64_t tablet_id, int64_t version, RuntimeState* runtime_state,
+              const std::function<void()>& before_open,
+              const std::function<void(connector::LakeDataSource&, const Status&)>& inspect) {
+    TInternalScanRange internal_scan_range;
+    internal_scan_range.__set_tablet_id(tablet_id);
+    internal_scan_range.__set_version(std::to_string(version));
+    TScanRange scan_range;
+    scan_range.__set_internal_scan_range(internal_scan_range);
+
+    TLakeScanNode lake_scan_node;
+    lake_scan_node.__set_tuple_id(0);
+    TPlanNode plan_node;
+    plan_node.__set_node_id(0);
+    plan_node.__set_lake_scan_node(lake_scan_node);
+
+    connector::LakeDataSourceProvider provider(plan_node);
+    provider.set_lake_tablet_manager(tablet_mgr);
+
+    ASSIGN_OR_ABORT(auto tablet, tablet_mgr->get_tablet(tablet_id, version));
+    std::vector<BaseRowsetSharedPtr> base_rowsets;
+    for (auto& rs : tablet.get_rowsets()) {
+        base_rowsets.emplace_back(rs);
+    }
+    pipeline::ScanMorsel morsel(plan_node.node_id, scan_range);
+    morsel.set_rowsets(base_rowsets);
+
+    connector::LakeDataSource ds(&provider, scan_range);
+    RuntimeProfile profile("LakeDataSourceTest");
+    ds.set_runtime_profile(&profile);
+    ds.set_morsel(&morsel);
+    DeferOp close_guard([&]() { ds.close(runtime_state); });
+
+    before_open();
+    auto status = ds.open(runtime_state);
+    inspect(ds, status);
+}
+
+} // namespace
+
+// A CACHE SELECT is background bulk IO, so none of its reads may compete with the query critical
+// path for a peer BE's disk IOPS. The policy comes from the raw query bit, which is why it holds in
+// BOTH cache-select modes: config::lake_cache_select_in_physical_way only decides whether the scan
+// degenerates into a file-cache warmup (cache_file_only), not whether peer reads are allowed.
+TEST_F(LakeDataSourceTest, cache_select_resolves_skip_peer_cache_policy) {
+    create_rowsets_for_testing(_tablet_metadata.get(), 2);
+
+    const bool saved_physical_way = config::lake_cache_select_in_physical_way;
+    DeferOp restore([&]() { config::lake_cache_select_in_physical_way = saved_physical_way; });
+
+    auto resolved_params = [&](bool enable_cache_select, bool physical_way) {
+        config::lake_cache_select_in_physical_way = physical_way;
+        auto runtime_state = create_runtime_state_for_test();
+        if (enable_cache_select) {
+            // connector_lake_test is -fno-access-control, so the query options can be set directly.
+            runtime_state->_query_options.__set_enable_cache_select(true);
+        }
+        attach_c0_c1_desc_tbl(runtime_state.get());
+
+        LakeIOOptions opts;
+        bool cache_file_only = false;
+        run_scan(
+                _tablet_mgr, _tablet_metadata->id(), 2, runtime_state.get(), [] {},
+                [&](connector::LakeDataSource& ds, const Status& status) {
+                    ASSERT_OK(status);
+                    opts = ds.TEST_params().lake_io_opts;
+                    cache_file_only = opts.cache_file_only;
+                });
+        return std::pair<bool, bool>{opts.skip_peer_cache, cache_file_only};
+    };
+
+    // CACHE SELECT in the physical (file-cache warmup) mode.
+    EXPECT_EQ((std::pair<bool, bool>{true, true}), resolved_params(true, true));
+    // CACHE SELECT in the logical mode: no cache_file_only, but peer reads are still suppressed.
+    EXPECT_EQ((std::pair<bool, bool>{true, false}), resolved_params(true, false));
+    // An ordinary scan is the critical path and keeps peer reads available, in either mode.
+    EXPECT_EQ((std::pair<bool, bool>{false, false}), resolved_params(false, true));
+    EXPECT_EQ((std::pair<bool, bool>{false, false}), resolved_params(false, false));
+}
+
+// The scan's own tablet-metadata load runs before init_reader_params() has populated
+// _params.lake_io_opts, so it has to source the policy from the query bit directly. Assert it
+// reaches the terminal per-tablet open (ProtobufFileWithHeader), cold, in both directions.
+TEST_F(LakeDataSourceTest, cache_select_reaches_cold_per_tablet_metadata_open) {
+    create_rowsets_for_testing(_tablet_metadata.get(), 2);
+
+    auto observe = [&](bool enable_cache_select) {
+        auto runtime_state = create_runtime_state_for_test();
+        if (enable_cache_select) {
+            runtime_state->_query_options.__set_enable_cache_select(true);
+        }
+        attach_c0_c1_desc_tbl(runtime_state.get());
+
+        ObservedOpens observed;
+        SyncPoint::GetInstance()->EnableProcessing();
+        DeferOp defer([]() {
+            SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+            SyncPoint::GetInstance()->DisableProcessing();
+        });
+
+        const auto meta_path = _tablet_mgr->tablet_metadata_location(_tablet_metadata->id(), 2);
+        run_scan(
+                _tablet_mgr, _tablet_metadata->id(), 2, runtime_state.get(),
+                [&]() {
+                    // Arm only here, after run_scan's own warm-up get_tablet: that read is plain
+                    // (peer-allowed) bookkeeping and must not be mistaken for the scan's own load.
+                    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options",
+                                                          [&](void* arg) { observed.record(arg); });
+                    _tablet_mgr->metacache()->erase(meta_path);
+                },
+                [](connector::LakeDataSource& /*ds*/, const Status& status) { ASSERT_OK(status); });
+        return observed;
+    };
+
+    auto suppressed = observe(/*enable_cache_select=*/true);
+    ASSERT_GT(suppressed.count, 0); // positive control: the open really happened
+    EXPECT_TRUE(suppressed.all_skip_peer_cache);
+
+    auto allowed = observe(/*enable_cache_select=*/false);
+    ASSERT_GT(allowed.count, 0);
+    EXPECT_TRUE(allowed.any_allow_peer_cache);
+}
+
+// The same policy has to survive the other terminal metadata open, the bundled one in
+// get_single_tablet_metadata. Writing the version only into a bundle (no per-tablet file) is what
+// routes get_tablet() there.
+TEST_F(LakeDataSourceTest, cache_select_reaches_bundled_metadata_open) {
+    create_rowsets_for_testing(_tablet_metadata.get(), 2);
+
+    constexpr int64_t kBundledVersion = 3;
+    TabletMetadata bundled = *_tablet_metadata; // same rowsets/segments, published only in a bundle
+    bundled.set_version(kBundledVersion);
+    std::map<int64_t, TabletMetadataPB> bundle{{bundled.id(), bundled}};
+    CHECK_OK(_tablet_mgr->put_bundle_tablet_metadata(bundle));
+
+    auto observe = [&](bool enable_cache_select) {
+        auto runtime_state = create_runtime_state_for_test();
+        if (enable_cache_select) {
+            runtime_state->_query_options.__set_enable_cache_select(true);
+        }
+        attach_c0_c1_desc_tbl(runtime_state.get());
+
+        ObservedOpens observed;
+        SyncPoint::GetInstance()->EnableProcessing();
+        DeferOp defer([]() {
+            SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
+            SyncPoint::GetInstance()->DisableProcessing();
+        });
+
+        run_scan(
+                _tablet_mgr, bundled.id(), kBundledVersion, runtime_state.get(),
+                [&]() {
+                    // Arm only here: run_scan's own warm-up get_tablet already opened the bundle with
+                    // the plain (peer-allowed) options, and that read is not the one under test.
+                    SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options",
+                                                          [&](void* arg) { observed.record(arg); });
+                    // Both the bundle write and that get_tablet warm the metacache; a cached hit never
+                    // reaches an open, so without this the assertions below would observe nothing.
+                    _tablet_mgr->metacache()->prune();
+                },
+                [](connector::LakeDataSource& /*ds*/, const Status& status) { ASSERT_OK(status); });
+        return observed;
+    };
+
+    auto suppressed = observe(/*enable_cache_select=*/true);
+    ASSERT_GT(suppressed.count, 0);
+    EXPECT_TRUE(suppressed.all_skip_peer_cache);
+
+    auto allowed = observe(/*enable_cache_select=*/false);
+    ASSERT_GT(allowed.count, 0);
+    EXPECT_TRUE(allowed.any_allow_peer_cache);
+}
+
+// Fragment prepare probes the row count of every tablet the scan is about to read
+// (_could_tablet_internal_parallel -> get_tablet_num_rows -> get_tablet_metadata). That read belongs
+// to the CACHE SELECT as much as the scan's own does, and until get_tablet_num_rows gained a
+// CacheOptions overload the policy could not be expressed there at all.
+TEST_F(LakeDataSourceTest, cache_select_prepare_time_row_count_probe_suppresses_peer) {
+    create_rowsets_for_testing(_tablet_metadata.get(), 2);
+    auto scan_ranges = create_scan_ranges({_tablet_metadata.get()});
+    const auto meta_path = _tablet_mgr->tablet_metadata_location(_tablet_metadata->id(), 2);
+
+    auto observe = [&](bool enable_cache_select) {
+        auto runtime_state = create_runtime_state_for_test();
+        if (enable_cache_select) {
+            runtime_state->_query_options.__set_enable_cache_select(true);
+        }
+        auto plan_node = create_lake_plan_node();
+        connector::LakeDataSourceProvider provider(plan_node);
+        provider.set_lake_tablet_manager(_tablet_mgr);
+        provider.set_estimated_scan_row_bytes(sizeof(int32_t));
+        provider._runtime_state = runtime_state.get();
+
+        ObservedOpens observed;
+        SyncPoint::GetInstance()->EnableProcessing();
+        DeferOp defer([]() {
+            SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+            SyncPoint::GetInstance()->DisableProcessing();
+        });
+        SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options",
+                                              [&](void* arg) { observed.record(arg); });
+
+        // create_rowsets_for_testing warmed the metacache; force the probe to actually open.
+        _tablet_mgr->metacache()->erase(meta_path);
+        int64_t scan_parallelism = 0;
+        int64_t splitted_scan_rows = 0;
+        // FORCE_SPLIT skips the early count-based return so the row-count loop actually runs.
+        auto could = provider._could_tablet_internal_parallel(scan_ranges, /*pipeline_dop=*/2, scan_ranges.size(),
+                                                              TTabletInternalParallelMode::type::FORCE_SPLIT,
+                                                              &scan_parallelism, &splitted_scan_rows);
+        CHECK(could.ok()) << could.status();
+        return observed;
+    };
+
+    auto suppressed = observe(/*enable_cache_select=*/true);
+    ASSERT_GT(suppressed.count, 0); // positive control: the probe really opened the metadata
+    EXPECT_TRUE(suppressed.all_skip_peer_cache);
+
+    auto allowed = observe(/*enable_cache_select=*/false);
+    ASSERT_GT(allowed.count, 0);
+    EXPECT_TRUE(allowed.any_allow_peer_cache);
+}
+
+// Regression for the ordering defect behind the above. Fragment prepare runs first and fills the
+// tablet-metadata metacache under exactly the key the scan's get_tablet() later requests. If that
+// prepare read is peer-allowed, the scan's read is a cache hit that issues no open and never
+// consults its policy -- so the scan-side fix is silently nullified while no individual site looks
+// wrong. Arm ONE hook across BOTH phases and require that a CACHE SELECT produced no peer-allowed
+// metadata open anywhere.
+TEST_F(LakeDataSourceTest, cache_select_prepare_does_not_preempt_scan_policy) {
+    create_rowsets_for_testing(_tablet_metadata.get(), 2);
+    auto scan_ranges = create_scan_ranges({_tablet_metadata.get()});
+    const auto meta_path = _tablet_mgr->tablet_metadata_location(_tablet_metadata->id(), 2);
+
+    auto runtime_state = create_runtime_state_for_test();
+    runtime_state->_query_options.__set_enable_cache_select(true);
+    attach_c0_c1_desc_tbl(runtime_state.get());
+
+    auto plan_node = create_lake_plan_node();
+    connector::LakeDataSourceProvider provider(plan_node);
+    provider.set_lake_tablet_manager(_tablet_mgr);
+    provider.set_estimated_scan_row_bytes(sizeof(int32_t));
+    provider._runtime_state = runtime_state.get();
+
+    ObservedOpens observed;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options",
+                                          [&](void* arg) { observed.record(arg); });
+
+    _tablet_mgr->metacache()->erase(meta_path);
+
+    // Phase 1 -- fragment prepare.
+    int64_t scan_parallelism = 0;
+    int64_t splitted_scan_rows = 0;
+    auto could = provider._could_tablet_internal_parallel(scan_ranges, /*pipeline_dop=*/2, scan_ranges.size(),
+                                                          TTabletInternalParallelMode::type::FORCE_SPLIT,
+                                                          &scan_parallelism, &splitted_scan_rows);
+    ASSERT_TRUE(could.ok()) << could.status();
+    ASSERT_GT(observed.count, 0); // prepare really is the one that reads the metadata first
+
+    // Phase 2 -- the scan itself. Its get_tablet() legitimately hits the cache prepare just filled;
+    // that is precisely why prepare's policy, not the scan's, is the one that decides.
+    run_scan(
+            _tablet_mgr, _tablet_metadata->id(), 2, runtime_state.get(), [] {},
+            [](connector::LakeDataSource& /*ds*/, const Status& status) { ASSERT_OK(status); });
+
+    EXPECT_TRUE(observed.all_skip_peer_cache);
+}
+
+#ifdef USE_STAROS
+// warmup_pk_index_sst_files opens the SST files with its own RandomAccessFileOptions -- a path with
+// no LakeIOOptions in scope -- so the policy has to arrive as an argument. Drive both values to show
+// the argument is what the open actually uses.
+TEST_F(LakeDataSourceTest, warmup_pk_index_sst_files_carries_skip_peer_cache) {
+    const std::string sst_filename = "warmup_peer_policy.sst";
+    {
+        ASSIGN_OR_ABORT(auto wf, FileSystem::Default()->new_writable_file(
+                                         _tablet_mgr->sst_location(_tablet_metadata->id(), sst_filename)));
+        ASSERT_OK(wf->append(std::string(4096, 'w')));
+        ASSERT_OK(wf->close());
+    }
+
+    TabletMetadata pk_metadata;
+    pk_metadata.set_id(_tablet_metadata->id());
+    pk_metadata.set_version(1);
+    pk_metadata.set_enable_persistent_index(true);
+    pk_metadata.set_persistent_index_type(PersistentIndexTypePB::CLOUD_NATIVE);
+    auto* sst = pk_metadata.mutable_sstable_meta()->add_sstables();
+    sst->set_filename(sst_filename);
+    sst->set_filesize(4096);
+
+    ObservedOpens observed;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("warmup_pk_index_sst_files::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("warmup_pk_index_sst_files::open_options",
+                                          [&](void* arg) { observed.record(arg); });
+
+    ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/true));
+    ASSERT_EQ(1, observed.count); // positive control
+    EXPECT_TRUE(observed.all_skip_peer_cache);
+
+    ASSERT_OK(connector::warmup_pk_index_sst_files(&pk_metadata, _tablet_mgr, /*skip_peer_cache=*/false));
+    ASSERT_EQ(2, observed.count);
+    EXPECT_TRUE(observed.any_allow_peer_cache);
+}
+
+// End to end for the warmup path: a CACHE SELECT over a cloud-native PK tablet installs an
+// sst_warmup_fn, and the callback it installed must carry the suppression all the way to the SST
+// open. The callback runs later, from a segment read, with nothing but what the lambda captured.
+TEST_F(LakeDataSourceTest, cache_select_sst_warmup_fn_suppresses_peer_reads) {
+    const bool saved_physical_way = config::lake_cache_select_in_physical_way;
+    config::lake_cache_select_in_physical_way = true; // required for the warmup callback to be installed
+    DeferOp restore([&]() { config::lake_cache_select_in_physical_way = saved_physical_way; });
+
+    TabletMetadata pk_metadata;
+    pk_metadata.set_id(next_id());
+    pk_metadata.set_version(2);
+    pk_metadata.set_enable_persistent_index(true);
+    pk_metadata.set_persistent_index_type(PersistentIndexTypePB::CLOUD_NATIVE);
+    auto* schema = pk_metadata.mutable_schema();
+    schema->set_id(next_id());
+    schema->set_num_short_key_columns(1);
+    schema->set_keys_type(PRIMARY_KEYS);
+    schema->set_num_rows_per_row_block(65535);
+    auto* c0 = schema->add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    auto* c1 = schema->add_column();
+    c1->set_unique_id(1);
+    c1->set_name("c1");
+    c1->set_type("INT");
+    c1->set_is_key(false);
+    c1->set_is_nullable(false);
+
+    const std::string sst_filename = "cache_select_warmup.sst";
+    {
+        ASSIGN_OR_ABORT(auto wf, FileSystem::Default()->new_writable_file(
+                                         _tablet_mgr->sst_location(pk_metadata.id(), sst_filename)));
+        ASSERT_OK(wf->append(std::string(4096, 'z')));
+        ASSERT_OK(wf->close());
+    }
+    auto* sst = pk_metadata.mutable_sstable_meta()->add_sstables();
+    sst->set_filename(sst_filename);
+    sst->set_filesize(4096);
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(pk_metadata));
+
+    auto runtime_state = create_runtime_state_for_test();
+    runtime_state->_query_options.__set_enable_cache_select(true);
+    attach_c0_c1_desc_tbl(runtime_state.get());
+
+    std::function<Status()> warmup_fn;
+    run_scan(
+            _tablet_mgr, pk_metadata.id(), 2, runtime_state.get(), [] {},
+            [&](connector::LakeDataSource& ds, const Status& /*status*/) {
+                // open() may not run to completion on this rowset-less PK tablet; the warmup callback
+                // is installed by init_reader_params()'s successors, well before the reader is built.
+                warmup_fn = ds.TEST_params().lake_io_opts.sst_warmup_fn;
+            });
+    ASSERT_TRUE(warmup_fn != nullptr);
+
+    ObservedOpens observed;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("warmup_pk_index_sst_files::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("warmup_pk_index_sst_files::open_options",
+                                          [&](void* arg) { observed.record(arg); });
+
+    ASSERT_OK(warmup_fn());
+    ASSERT_EQ(1, observed.count); // positive control
+    EXPECT_TRUE(observed.all_skip_peer_cache);
+}
+#endif // USE_STAROS
 
 } // namespace starrocks::lake

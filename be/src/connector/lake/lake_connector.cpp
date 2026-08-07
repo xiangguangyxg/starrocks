@@ -50,6 +50,7 @@
 #include "storage/chunk_helper.h"
 #include "storage/column_predicate_rewriter.h"
 #include "storage/flat_json_metrics.h"
+#include "storage/lake/options.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/table_schema_service.h"
 #include "storage/lake/tablet.h"
@@ -70,6 +71,25 @@ namespace {
 
 lake::TabletManager* lake_tablet_manager() {
     return StorageEnv::GetInstance()->lake_tablet_manager();
+}
+
+// CACHE SELECT is background bulk IO, not the query critical path, so none of its reads may consume
+// cross-BE peer bandwidth (see the rationale in warmup_pk_index_sst_files).
+//
+// Read from the raw query bit rather than any derived flag: _params.lake_io_opts.cache_file_only is
+// additionally gated on config::lake_cache_select_in_physical_way while the peer policy has to hold
+// for a CACHE SELECT in either mode, and _params does not exist yet at either of the two points that
+// need this -- the provider's fragment-prepare reads and LakeDataSource::get_tablet().
+//
+// |runtime_state| may legitimately be null: LakeDataSourceProvider::_runtime_state is only set by
+// init(), and the prepare path can run without it. Treat that as "cannot know", which keeps the
+// pre-existing peer-allowed behavior rather than silently suppressing peer reads for ordinary scans.
+bool query_is_cache_select(const RuntimeState* runtime_state) {
+    if (runtime_state == nullptr) {
+        return false;
+    }
+    const auto& query_options = runtime_state->query_options();
+    return query_options.__isset.enable_cache_select && query_options.enable_cache_select;
 }
 
 RowidRangeOptionPtr trim_coarse_split_by_pruned_range(const pipeline::LakeSplitContext& split_context) {
@@ -338,11 +358,21 @@ Status LakeDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
     return Status::OK();
 }
 
+// See query_is_cache_select() for why this reads the raw query bit. Shared with
+// LakeDataSourceProvider's fragment-prepare reads so the predicate has exactly one definition.
+bool LakeDataSource::_is_cache_select() const {
+    return query_is_cache_select(_runtime_state);
+}
+
 Status LakeDataSource::get_tablet(const TInternalScanRange& scan_range) {
     int64_t tablet_id = scan_range.tablet_id;
     int64_t version = strtoul(scan_range.version.c_str(), nullptr, 10);
     auto* tablet_manager = _provider->tablet_manager();
-    ASSIGN_OR_RETURN(_tablet, tablet_manager->get_tablet(tablet_id, version));
+    // fill_meta_cache / fill_data_cache reproduce what the two-argument overload passed before.
+    ASSIGN_OR_RETURN(_tablet, tablet_manager->get_tablet(tablet_id, version,
+                                                         lake::CacheOptions{.fill_meta_cache = true,
+                                                                            .fill_data_cache = true,
+                                                                            .skip_peer_cache = _is_cache_select()}));
     auto& lake_scan_node = _provider->_t_lake_scan_node;
     if (lake_scan_node.__isset.schema_key) {
         const auto& t_schema_key = lake_scan_node.schema_key;
@@ -473,15 +503,14 @@ Status LakeDataSource::init_reader_params(const std::vector<OlapScanRange*>& key
             !config::disable_storage_page_cache && _scan_range.fill_data_cache && !_scan_range.skip_page_cache;
     _params.lake_io_opts.fill_data_cache = _scan_range.fill_data_cache;
     _params.lake_io_opts.skip_disk_cache = _scan_range.skip_disk_cache;
+    _params.lake_io_opts.skip_peer_cache = _is_cache_select();
 
     if (thrift_lake_scan_node.__isset.sorted_by_keys_per_tablet) {
         _params.sorted_by_keys_per_tablet = thrift_lake_scan_node.sorted_by_keys_per_tablet;
     }
 
     _params.runtime_range_pruner = RuntimeScanRangePruner(parser, _conjuncts_manager->unarrived_runtime_filters());
-    _params.lake_io_opts.cache_file_only = _runtime_state->query_options().__isset.enable_cache_select &&
-                                           _runtime_state->query_options().enable_cache_select &&
-                                           config::lake_cache_select_in_physical_way;
+    _params.lake_io_opts.cache_file_only = _is_cache_select() && config::lake_cache_select_in_physical_way;
     _params.splitted_scan_rows = _provider->get_splitted_scan_rows();
     _params.scan_dop = _provider->get_scan_dop();
     _params.enable_prepared_physical_split_scan = _provider->enable_lake_prepared_physical_split_scan();
@@ -630,7 +659,11 @@ Status LakeDataSource::init_tablet_reader(RuntimeState* runtime_state, bool use_
         auto* tablet_mgr = _provider->tablet_manager();
         _params.lake_io_opts.sst_warmup_done = std::make_shared<std::atomic<bool>>(false);
         _params.lake_io_opts.sst_warmup_fn = [metadata, tablet_mgr]() -> Status {
-            return warmup_pk_index_sst_files(metadata.get(), tablet_mgr);
+            // Unconditionally true, not _is_cache_select(): warmup avoids peer because it is
+            // background bulk, which is a property of the workload, not of the query that happened
+            // to schedule it. Deriving it from the query type would hand a future non-CACHE-SELECT
+            // warmup a peer-allowed read -- the outcome the required parameter exists to prevent.
+            return warmup_pk_index_sst_files(metadata.get(), tablet_mgr, /*skip_peer_cache=*/true);
         };
     }
 
@@ -1194,7 +1227,8 @@ bool has_all_pk_columns_selected(const TabletSchema* tablet_schema, const std::v
     return true;
 }
 
-Status warmup_pk_index_sst_files(const TabletMetadataPB* metadata, lake::TabletManager* tablet_mgr) {
+Status warmup_pk_index_sst_files(const TabletMetadataPB* metadata, lake::TabletManager* tablet_mgr,
+                                 bool skip_peer_cache) {
 #ifndef USE_STAROS
     return Status::OK();
 #else
@@ -1223,10 +1257,20 @@ Status warmup_pk_index_sst_files(const TabletMetadataPB* metadata, lake::TabletM
     for (const auto& sstable_pb : sstable_meta.sstables()) {
         std::string sst_path = tablet_mgr->sst_location(tablet_id, sstable_pb.filename());
         RandomAccessFileOptions opts;
+        // Critical path uses peer, background bulk uses S3.
+        //
+        // Cross-BE peer cache reads exist to cut latency on the query critical path. This warmup is
+        // background bulk: pointing it at a peer BE would trade elastic object storage bandwidth for
+        // that node's scarce local disk IOPS, and it would do so while live queries are competing for
+        // them. The one production caller (CACHE SELECT) therefore passes true, and any new one is
+        // expected to as well -- the parameter is required rather than defaulted so that decision has
+        // to be made explicitly instead of inherited as "peer allowed".
+        opts.skip_peer_cache = skip_peer_cache;
         if (!sstable_pb.encryption_meta().empty()) {
             ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(sstable_pb.encryption_meta()));
             opts.encryption_info = std::move(info);
         }
+        TEST_SYNC_POINT_CALLBACK("warmup_pk_index_sst_files::open_options", &opts);
         ASSIGN_OR_RETURN(auto rf, fs::new_random_access_file(opts, sst_path));
         int64_t file_size = sstable_pb.filesize();
         if (file_size <= 0) {
@@ -1784,11 +1828,19 @@ StatusOr<bool> LakeDataSourceProvider::_could_tablet_internal_parallel(
 
     int64_t num_table_rows = 0;
     int64_t max_tablet_rows = 0;
+    // This loop runs at fragment prepare, before any driver reaches LakeDataSource::open(), over
+    // every tablet the scan is about to read. Leaving it peer-allowed would not merely leak one peer
+    // read per tablet: it fills the tablet-metadata metacache under exactly the key open()'s
+    // get_tablet() then requests, so that later read becomes a cache hit that issues no open at all
+    // and never consults the scan's own policy. The policy has to be applied here or it is moot.
+    // fill_meta_cache / fill_data_cache reproduce what the two-argument overload passed before.
+    const lake::CacheOptions cache_opts{
+            .fill_meta_cache = true, .fill_data_cache = true, .skip_peer_cache = query_is_cache_select(_runtime_state)};
     for (const auto& tablet_scan_range : scan_ranges) {
         int64_t version = std::stoll(tablet_scan_range.scan_range.internal_scan_range.version);
         ASSIGN_OR_RETURN(auto tablet_num_rows,
                          _tablet_manager->get_tablet_num_rows(
-                                 tablet_scan_range.scan_range.internal_scan_range.tablet_id, version));
+                                 tablet_scan_range.scan_range.internal_scan_range.tablet_id, version, cache_opts));
         num_table_rows += static_cast<int64_t>(tablet_num_rows);
         max_tablet_rows = std::max(max_tablet_rows, static_cast<int64_t>(tablet_num_rows));
     }

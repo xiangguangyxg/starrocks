@@ -1361,10 +1361,18 @@ StatusOr<int64_t> TabletManager::get_tablet_data_size(int64_t tablet_id, int64_t
 }
 
 StatusOr<int64_t> TabletManager::get_tablet_num_rows(int64_t tablet_id, int64_t version) {
+    // A default-constructed CacheOptions is {fill_meta_cache=true, fill_data_cache=true,
+    // skip_meta_cache=false, skip_peer_cache=false}, exactly what get_tablet_metadata(tablet_id,
+    // version) built from its fill_cache=true default, so existing callers are unaffected.
+    return get_tablet_num_rows(tablet_id, version, CacheOptions{});
+}
+
+StatusOr<int64_t> TabletManager::get_tablet_num_rows(int64_t tablet_id, int64_t version,
+                                                     const CacheOptions& cache_opts) {
     DCHECK(version != 0);
     int64_t num_rows = 0;
     TabletMetadataPtr metadata;
-    ASSIGN_OR_RETURN(metadata, get_tablet_metadata(tablet_id, version));
+    ASSIGN_OR_RETURN(metadata, get_tablet_metadata(tablet_id, version, cache_opts));
 
     for (const auto& rowset : metadata->rowsets()) {
         num_rows += rowset.num_rows();

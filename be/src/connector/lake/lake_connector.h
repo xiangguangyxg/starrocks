@@ -44,7 +44,11 @@ namespace starrocks::connector {
 bool has_all_pk_columns_selected(const TabletSchema* tablet_schema, const std::vector<SlotDescriptor*>& slots);
 
 // Warm up persistent index SST files for cloud-native PK tables.
-Status warmup_pk_index_sst_files(const TabletMetadataPB* metadata, lake::TabletManager* tablet_mgr);
+// |skip_peer_cache| has no default on purpose: a defaulted "allow peer" is how a new caller would
+// silently route background bulk warmup at a peer BE. See the rationale at the open site in
+// warmup_pk_index_sst_files().
+Status warmup_pk_index_sst_files(const TabletMetadataPB* metadata, lake::TabletManager* tablet_mgr,
+                                 bool skip_peer_cache);
 
 class LakeConnector final : public Connector {
 public:
@@ -125,6 +129,8 @@ private:
     RuntimeFilterSnapshots capture_runtime_filter_snapshots() const;
     void remember_runtime_filter_snapshots(RuntimeFilterSnapshots snapshots);
     bool needs_late_runtime_filter_reinit(const RuntimeFilterSnapshots& current_snapshots) const;
+
+    bool _is_cache_select() const;
 
     Status _extend_schema_by_access_paths();
     void _inherit_default_value_from_json(TabletColumn* column, const TabletColumn& root_column,

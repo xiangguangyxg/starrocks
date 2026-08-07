@@ -32,6 +32,7 @@
 #include "storage/chunk_helper.h"
 #include "storage/extends_column_utils.h"
 #include "storage/lake/meta_file.h"
+#include "storage/lake/options.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/table_schema_service.h"
 #include "storage/lake/tablet.h"
@@ -283,7 +284,13 @@ Status LakeScanTabletAdaptor::init_schema(RuntimeState* state) {
     const auto& lake_scan_node = _glm_ctx->scan_node();
 
     auto version = _glm_ctx->get_rowsets_version(_tablet_id);
-    ASSIGN_OR_RETURN(_tablet, tablet_mgr->get_tablet(_tablet_id, version));
+    // The lookup re-reads a tablet the scan already read, so it must honour the peer policy that scan
+    // resolved. fill_meta_cache / fill_data_cache reproduce what the two-argument overload passed.
+    ASSIGN_OR_RETURN(_tablet,
+                     tablet_mgr->get_tablet(_tablet_id, version,
+                                            lake::CacheOptions{.fill_meta_cache = true,
+                                                               .fill_data_cache = true,
+                                                               .skip_peer_cache = _lake_io_opts.skip_peer_cache}));
 
     if (lake_scan_node.__isset.schema_key) {
         const auto& t_schema_key = lake_scan_node.schema_key;
