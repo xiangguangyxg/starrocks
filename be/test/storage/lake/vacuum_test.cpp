@@ -2889,6 +2889,92 @@ TEST_P(LakeVacuumTest, test_drop_tablet_cache) {
     EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
 }
 
+// The repeated-invalidation observer must not see administrative bulk eviction, and this is the
+// path that shows why. Tablet metadata is a full snapshot per version, so a file that survives from
+// one version to the next is dropped once per version -- twice here, milliseconds apart and well
+// inside the 60s window. Fed to the observer, that alone would move
+// `repeated_invalidation_in_window` and tell an operator investigating a suspected self-heal loop
+// that they had found one.
+//
+// NOTE for anyone editing test_drop_tablet_cache above: its two versions deliberately share no
+// files, so it cannot produce a repeat and cannot stand in for this test.
+TEST_P(LakeVacuumTest, test_drop_tablet_cache_does_not_report_repeated_invalidation) {
+    constexpr int64_t kTabletId = 703;
+
+    // Version 2 and version 3 both list 703_shared.dat. Only version 3 adds 703_only_v3.dat.
+    ASSERT_OK(_tablet_mgr->put_tablet_metadata(json_to_pb<TabletMetadataPB>(R"DEL(
+        {
+            "id": 703,
+            "version": 2,
+            "rowsets": [
+                {
+                    "data_size": 100,
+                    "segment_metas": [
+                        {
+                            "filename": "703_shared.dat",
+                            "size": 100
+                        }
+                    ]
+                }
+            ],
+            "prev_garbage_version": 0
+        }
+        )DEL")));
+
+    ASSERT_OK(_tablet_mgr->put_tablet_metadata(json_to_pb<TabletMetadataPB>(R"DEL(
+        {
+            "id": 703,
+            "version": 3,
+            "rowsets": [
+                {
+                    "data_size": 300,
+                    "segment_metas": [
+                        {
+                            "filename": "703_shared.dat",
+                            "size": 100
+                        },
+                        {
+                            "filename": "703_only_v3.dat",
+                            "size": 200
+                        }
+                    ]
+                }
+            ],
+            "prev_garbage_version": 2
+        }
+        )DEL")));
+
+    std::vector<std::string> dropped;
+    SyncPoint::GetInstance()->SetCallBack("drop_tablet_cache:drop_local_cache", [&](void* arg) {
+        auto* path = reinterpret_cast<const std::string*>(arg);
+        dropped.emplace_back(::starrocks::path_util::base_name(*path));
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([&] {
+        SyncPoint::GetInstance()->ClearCallBack("drop_tablet_cache:drop_local_cache");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    const bool saved_tracking = config::lake_track_repeated_cache_invalidation;
+    DeferOp restore_tracking([&] { config::lake_track_repeated_cache_invalidation = saved_tracking; });
+    config::lake_track_repeated_cache_invalidation = true;
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t repeats_before = metrics->repeated_invalidation_in_window.value();
+    const int64_t bulk_before = metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value();
+
+    ASSERT_OK(drop_tablet_cache(_tablet_mgr.get(), kTabletId, 3));
+
+    // Positive control, and the load-bearing part of this test: the same file really was dropped
+    // twice inside the window. Without it the assertion below would also pass on a version chain
+    // that happens to share nothing, and would prove nothing at all.
+    ASSERT_EQ(2, std::count(dropped.begin(), dropped.end(), "703_shared.dat"));
+
+    EXPECT_EQ(repeats_before, metrics->repeated_invalidation_in_window.value());
+    EXPECT_EQ(bulk_before + static_cast<int64_t>(dropped.size()),
+              metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value());
+}
+
 TEST_P(LakeVacuumTest, test_vacuumed_version) {
     ASSERT_OK(_tablet_mgr->put_tablet_metadata(json_to_pb<TabletMetadataPB>(R"DEL(
         {

@@ -1851,6 +1851,11 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
         *(Status*)arg = Status::OK();
     });
 
+    auto* metrics = StorageMetrics::instance();
+    const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
+    const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+
     // Try to get metadata - should fail with corruption error
     auto res = _tablet_manager->get_tablet_metadata(tablet_id, 2);
 
@@ -1858,6 +1863,14 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     EXPECT_FALSE(res.ok());
     EXPECT_TRUE(res.status().is_corruption());
     EXPECT_TRUE(handler_called) << "corrupted_tablet_meta_handler should have been called";
+
+    // A per-tablet page failure inside an otherwise readable bundle is drop-only, and it is the
+    // one bucket nothing else pins positively: every other test asserts `bundle_page` does *not*
+    // move, so a slip to `other` here would leave the whole suite green while `other` quietly
+    // absorbed these failures.
+    EXPECT_EQ(bundle_page_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
+    EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
 }
 
 // Bundle tablet metadata checksum: the footer carries a crc32 over the bundle header plus a

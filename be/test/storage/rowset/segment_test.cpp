@@ -58,6 +58,7 @@
 #include "storage/rowset/column_reader.h"
 #include "storage/rowset/segment_options.h"
 #include "storage/rowset/segment_writer.h"
+#include "storage/storage_metrics.h"
 #include "storage/tablet_schema.h"
 #include "storage/tablet_schema_helper.h"
 #include "storage_primitive/chunk_iterator.h"
@@ -160,6 +161,52 @@ protected:
     std::shared_ptr<MemoryFileSystem> _fs = nullptr;
     std::unique_ptr<MemTracker> _page_cache_mem_tracker = nullptr;
 };
+
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
+// segment_footer is a same-stream retry site: a footer that fails to parse or checksum invalidates
+// the cache entry and re-parses on the stream already open. Nothing else asserts this bucket moves,
+// and page_io is the neighbouring same-stream site written in the same shape, so mis-assigning one
+// to the other would compile and leave the whole suite green while silently merging the two buckets
+// the `site` label exists to separate.
+TEST_F(SegmentReaderWriterTest, corrupted_footer_counts_segment_footer_cache_drop) {
+    const std::string file_name = kSegmentDir + "/corrupted_footer.dat";
+    {
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(file_name));
+        SegmentFooterPB footer;
+        footer.set_num_rows(7);
+        ASSERT_OK(Segment::write_segment_footer(wfile.get(), footer));
+        ASSERT_OK(wfile->close());
+    }
+
+    // Flip a byte of the serialized footer while leaving the trailing length, checksum and magic
+    // intact, so the read reaches the parse and checksum tests rather than bailing out earlier on
+    // a bad magic -- both of those report Corruption, which is what the drop branch keys on.
+    ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name));
+    ASSIGN_OR_ABORT(auto content, rfile->read_all());
+    ASSERT_GT(content.size(), 12u);
+    content[0] = static_cast<char>(content[0] ^ 0xFF);
+    ASSERT_OK(_fs->delete_file(file_name));
+    {
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(file_name));
+        ASSERT_OK(wfile->append(content));
+        ASSERT_OK(wfile->close());
+    }
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t footer_before = metrics->invalidating_cache_drops(CacheDropSite::kSegmentFooter).value();
+    const int64_t page_io_before = metrics->invalidating_cache_drops(CacheDropSite::kPageIo).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+
+    ASSIGN_OR_ABORT(auto read_file, _fs->new_random_access_file(file_name));
+    SegmentFooterPB parsed;
+    auto res = Segment::parse_segment_footer(read_file.get(), &parsed, nullptr, nullptr);
+    ASSERT_TRUE(res.status().is_corruption()) << res.status(); // positive control: drop branch reached
+
+    EXPECT_EQ(footer_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kSegmentFooter).value());
+    EXPECT_EQ(page_io_before, metrics->invalidating_cache_drops(CacheDropSite::kPageIo).value());
+    EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
+}
+#endif
 
 TEST_F(SegmentReaderWriterTest, estimate_segment_size) {
     size_t num_rows_per_block = 10;

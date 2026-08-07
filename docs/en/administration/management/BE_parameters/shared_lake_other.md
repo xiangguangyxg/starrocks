@@ -234,7 +234,7 @@ This topic introduces the following types of BE configurations:
 - Type: Boolean
 - Unit: -
 - Is mutable: Yes
-- Description: Whether to track how often the same file has its local cache entry invalidated more than once within 60 seconds, and report that count as the `repeated_invalidation_in_window` metric. A rising count means a drop-and-re-read cycle is not converging on good bytes. This is disabled by default because it is a diagnostic for a suspected self-heal loop rather than something a healthy cluster needs to pay for on the read path. When enabled, the tracker keeps a fixed table of 1024 cache key hashes, so its memory cost is constant and no file path is stored; on a busy node a repeat can be missed if its slot has already been taken by another file.
+- Description: Whether to track how often the same file has its local cache entry invalidated more than once within 60 seconds, and report that count as the `repeated_invalidation_in_window` metric. A rising count means a drop-and-re-read cycle is not converging on good bytes. Administrative bulk eviction is excluded, because it is not self-heal and repeats files by construction when a tablet's version chain is evicted. This is disabled by default because it is a diagnostic for a suspected self-heal loop rather than something a healthy cluster needs to pay for on the read path. When enabled, the tracker keeps a fixed table of 1024 cache key hashes, so its memory cost is constant and no file path is stored; on a busy node a repeat can be missed if its slot has already been taken by another file.
 - Introduced in: -
 
 ### lake_vacuum_min_batch_delete_size

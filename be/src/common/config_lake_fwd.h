@@ -118,12 +118,15 @@ CONF_mBool(lake_enable_protobuf_file_checksum, "true");
 // clear *.meta cache for lake table
 CONF_mBool(lake_clear_corrupted_cache_meta, "true");
 
-// When true, every invalidating local-cache drop is also fed to a small in-memory observer that
+// When true, invalidating local-cache drops are also fed to a small in-memory observer that
 // reports, as `repeated_invalidation_in_window`, how often the same file was invalidated more than
 // once within 60 seconds. That signal means a drop-and-re-read cycle is not converging on good
-// bytes. Off by default: the observer is a diagnostic for a suspected self-heal loop, not
-// something a healthy cluster needs to pay for on the read path. Only the hash of the file's cache
-// key is kept, in a fixed 1024-entry table, so the memory cost is constant and no path is stored.
+// bytes. Administrative bulk eviction is excluded: it is not self-heal, and because tablet
+// metadata is a full snapshot per version, evicting a tablet's version chain drops a surviving
+// file more than once by construction, which would report a loop that is not there. Off by
+// default: the observer is a diagnostic for a suspected self-heal loop, not something a healthy
+// cluster needs to pay for on the read path. Only the hash of the file's cache key is kept, in a
+// fixed 1024-entry table, so the memory cost is constant and no path is stored.
 CONF_mBool(lake_track_repeated_cache_invalidation, "false");
 
 // if set to true, CACHE SELECT will only read file, save CPU time

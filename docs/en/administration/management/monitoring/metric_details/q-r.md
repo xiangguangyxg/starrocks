@@ -118,7 +118,7 @@ description: "Alphabetical q - r"
 
 - Unit: Count
 - Type: Cumulative
-- Description: Total number of times the same file had its local cache entry invalidated more than once within 60 seconds in a shared-data cluster, which means a drop-and-re-read cycle is not converging on good bytes. Counted only while `lake_track_repeated_cache_invalidation` is enabled. The tracker keeps a fixed table of 1024 cache key hashes and never stores or exports a file path, so on a busy node a repeat can be missed if its slot has already been taken by another file.
+- Description: Total number of times the same file had its local cache entry invalidated more than once within 60 seconds in a shared-data cluster, which means a drop-and-re-read cycle is not converging on good bytes. Counted only while `lake_track_repeated_cache_invalidation` is enabled. Administrative bulk eviction is excluded and can never raise this counter: it is not self-heal, and because tablet metadata is a full snapshot per version, evicting a tablet's version chain drops a surviving file more than once by construction, which would otherwise report a loop that is not there. The tracker keeps a fixed table of 1024 cache key hashes and never stores or exports a file path, so on a busy node a repeat can be missed if its slot has already been taken by another file.
 
 ## `resource_group_bigquery_count`
 

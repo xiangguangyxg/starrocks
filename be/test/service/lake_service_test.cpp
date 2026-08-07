@@ -63,6 +63,7 @@
 #include "storage/protobuf_file.h"
 #include "storage/rowset/segment_writer.h"
 #include "storage/storage_env.h"
+#include "storage/storage_metrics.h"
 #include "storage/variant_tuple.h"
 
 namespace starrocks {
@@ -5988,9 +5989,20 @@ TEST_F(LakeServiceTest, test_repair_tablet_metadata) {
         request.set_enable_file_bundling(true);
         request.set_write_bundling_file(true);
 
+        auto* metrics = StorageMetrics::instance();
+        const int64_t bulk_before = metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value();
+        const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+
         _lake_service.repair_tablet_metadata(&cntl, &request, &response, nullptr);
         ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
         ASSERT_EQ(TStatusCode::OK, response.status().status_code()) << response.status().error_msgs(0);
+
+        // The pre-repair cleanup is administrative eviction, not corruption: one drop per tablet
+        // plus one for the shared bundle. Nothing else covers this site, so a slip to `other` here
+        // would put an admin operation into the bucket that is meant to mean "corruption found".
+        EXPECT_EQ(bulk_before + request.tablet_metadatas_size() + 1,
+                  metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value());
+        EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
         ASSERT_EQ(1, response.tablet_repair_statuses_size());
         ASSERT_EQ(0, response.tablet_repair_statuses(0).tablet_id());
         ASSERT_EQ(TStatusCode::OK, response.tablet_repair_statuses(0).status().status_code());

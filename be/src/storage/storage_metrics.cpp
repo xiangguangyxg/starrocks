@@ -242,7 +242,13 @@ IntCounter& StorageMetrics::invalidating_cache_drops(CacheDropSite site) {
 
 void StorageMetrics::record_invalidating_cache_drop(CacheDropSite site, std::string_view cache_key) {
     invalidating_cache_drops(site).increment(1);
-    if (config::lake_track_repeated_cache_invalidation) {
+    // Administrative bulk eviction is deliberately left unobserved. It is not self-heal, so a
+    // repeat from it says nothing about convergence, and it manufactures repeats by construction:
+    // lake metadata is a full snapshot per version, so walking a tablet's version chain drops a
+    // file that survived across two links twice, milliseconds apart and well inside the window.
+    // Feeding that in would make the one diagnostic built for a suspected self-heal loop report a
+    // loop that is not there, and would flush the slot table, evicting genuine observations.
+    if (site != CacheDropSite::kBulkCleanup && config::lake_track_repeated_cache_invalidation) {
         _observe_repeated_invalidation(cache_key);
     }
 }
@@ -253,10 +259,12 @@ void StorageMetrics::_observe_repeated_invalidation(std::string_view cache_key) 
     const uint64_t key_hash = std::hash<std::string_view>{}(cache_key);
     const int64_t now_ms = MonotonicMillis();
     auto& slot = _invalidation_slots[key_hash % kInvalidationSlotCount];
-    // Relaxed, unsynchronised load/store pairs: two threads landing on the same slot can interleave
-    // and one of them then sees the other's write instead of its own predecessor. The cost is at
-    // most one lost observation of a diagnostic counter that drives no decision, which is why no
-    // lock or CAS is warranted on a read path.
+    // The hash and the timestamp are independent relaxed atomics, read here as a non-atomic pair,
+    // so two threads landing on the same slot can interleave: a reader can straddle the other's
+    // two stores and pair an old hash with a fresh timestamp. A lost race therefore drops *or*
+    // fabricates a single observation -- this counter is not merely under-reporting. Both are
+    // acceptable for a diagnostic that drives no decision, and that is why no lock or CAS is
+    // warranted here on a read path.
     const uint64_t previous_hash = slot.key_hash.load(std::memory_order_relaxed);
     const int64_t previous_ms = slot.last_seen_ms.load(std::memory_order_relaxed);
     if (previous_ms != 0 && previous_hash == key_hash && now_ms - previous_ms <= kInvalidationWindowMs) {

@@ -305,6 +305,34 @@ TEST(StorageMetricsTest, RepeatedInvalidationObserverCountsSameKeyWithinWindow) 
     EXPECT_EQ(1, metrics.repeated_invalidation_in_window.value());
 }
 
+// Administrative bulk eviction must not reach the observer. It is not self-heal, so a repeat from
+// it carries no information about convergence -- and evicting a tablet's version chain repeats a
+// surviving file by construction, which would report a loop that is not there to the one operator
+// who is already looking for one.
+TEST(StorageMetricsTest, RepeatedInvalidationObserverIgnoresBulkCleanup) {
+    MetricRegistry registry("test_registry");
+    StorageMetrics metrics(&registry);
+    const bool saved = config::lake_track_repeated_cache_invalidation;
+    DeferOp restore([&] { config::lake_track_repeated_cache_invalidation = saved; });
+    config::lake_track_repeated_cache_invalidation = true;
+
+    const std::string key = "s3://bucket/db/tbl/0000001.dat";
+    metrics.record_invalidating_cache_drop(CacheDropSite::kBulkCleanup, key);
+    metrics.record_invalidating_cache_drop(CacheDropSite::kBulkCleanup, key);
+    metrics.record_invalidating_cache_drop(CacheDropSite::kBulkCleanup, key);
+    EXPECT_EQ(0, metrics.repeated_invalidation_in_window.value());
+    // Positive control: the drops did happen, so the zero above is the site predicate at work and
+    // not a config or plumbing failure that would make this test vacuous.
+    EXPECT_EQ(3, metrics.invalidating_cache_drops(CacheDropSite::kBulkCleanup).value());
+
+    // ...and the same key through an observed site is still counted, so the exclusion is scoped to
+    // the bulk site rather than having disabled the observer outright. The bulk drops above left
+    // nothing behind in the slot, so this needs its own two sightings.
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, key);
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, key);
+    EXPECT_EQ(1, metrics.repeated_invalidation_in_window.value());
+}
+
 TEST(StorageMetricsTest, RegisterGaugeHooksBeforeInstall) {
     StorageMetrics metrics;
     metrics.register_metadata_cache_bytes_total_hook([] { return 34; });
