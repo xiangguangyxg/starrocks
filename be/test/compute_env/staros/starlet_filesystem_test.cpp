@@ -22,6 +22,7 @@
 #include <fslib/star_cache_configuration.h>
 #include <fslib/stat.h>
 #include <gtest/gtest.h>
+#include <shard.pb.h>
 
 #include <fstream>
 
@@ -30,6 +31,7 @@
 #include "base/utility/defer_op.h"
 #include "common/config_object_storage_fwd.h"
 #include "common/config_starlet_fwd.h"
+#include "common/config_staros_worker_fwd.h"
 #include "compute_env/staros/staros_worker.h"
 #include "compute_env/staros/staros_worker_runtime.h"
 #include "fs/fs_factory.h"
@@ -555,6 +557,37 @@ protected:
     absl::Status initialize(const staros::starlet::fslib::Configuration& conf) override { return absl::OkStatus(); }
 };
 
+// Records the ReadOptions each open() call is invoked with, so tests can assert on
+// what StarletFileSystem delivered (peer_candidates, shard_token, skip_read_local_cache)
+// without needing a real starlet/starcache backend.
+class CapturingFs : public MockStarletFileSystem {
+public:
+    absl::StatusOr<std::unique_ptr<staros::starlet::fslib::ReadOnlyFile>> open(
+            std::string_view path, const staros::starlet::fslib::ReadOptions& opts) override {
+        last_opts = opts;
+        ++open_count;
+        return MockStarletFileSystem::open(path, opts);
+    }
+    staros::starlet::fslib::ReadOptions last_opts;
+    int open_count = 0;
+};
+
+// Registers a shard carrying a single peer candidate (worker 4242, never the local worker) on
+// the StarOSWorker installed by NewFsStarletTest::SetUp, so get_peer_read_options() has
+// something to hand back. Without this, injecting the CapturingFs alone is not enough: the
+// worker still has no shard info and the positive-control tests below could never pass.
+static void install_shard_with_peer(int64_t shard_id, const std::string& ip_port) {
+    ::staros::AddShardInfo pb;
+    pb.set_shard_id(shard_id);
+    auto* s = pb.add_peer_sources();
+    s->set_worker_id(4242);
+    s->set_ip_port(ip_port);
+    s->set_expires_at(1'900'000'000'000);
+    StarOSWorker::ShardInfo info;
+    ASSERT_TRUE(info.from_pb(pb, /*self_worker_id=*/1).ok());
+    ASSERT_TRUE(get_staros_worker()->add_shard(info).ok());
+}
+
 class NewFsStarletTest : public ::testing::Test {
 public:
     void SetUp() override {
@@ -936,6 +969,134 @@ TEST_F(NewFsStarletTest, test_new_fs_starlet_different_shard_ids) {
     auto fs4 = new_fs_starlet(22222, true);
     ASSERT_NE(nullptr, fs4);
     EXPECT_EQ(2, callback_count);
+}
+
+// The following tests cover StarletFileSystem delivering the StarOSWorker peer-read snapshot
+// (peer_candidates, shard_token) into ReadOptions on both open paths, and the sequential path
+// forwarding skip_disk_cache the same way the random path already does.
+//
+// Each test uses its own shard id: new_fs_starlet keeps a process-static filesystem cache keyed
+// by (shard id, raw mode), so reusing one across tests could hand back a previous test's mock.
+// Positive-control tests register a peer-bearing shard via install_shard_with_peer() on the
+// worker installed by NewFsStarletTest::SetUp -- without it, get_peer_read_options() returns an
+// empty snapshot and could never prove candidates were delivered. Tests that mutate
+// starlet_enable_peer_cache_read restore it with DeferOp, since it is a mutable global that would
+// otherwise leak into later tests. Every negative assertion is preceded by
+// ASSERT_EQ(open_count, ...) so a call that never reached open() cannot masquerade as one that
+// reached it with no candidates.
+
+// Positive control: without this, a "zero candidates" assertion elsewhere would prove nothing,
+// since a test that never reached the open would also report zero.
+TEST_F(NewFsStarletTest, random_open_delivers_peer_candidates) {
+    const int64_t kShard = 90001;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    install_shard_with_peer(kShard, "10.0.0.1:9070");
+
+    auto mock = std::make_shared<CapturingFs>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock;
+    });
+    auto fs = new_fs_starlet(kShard, true);
+    (void)fs->new_random_access_file(RandomAccessFileOptions(), fmt::format("staros://{}/seg.dat", kShard));
+    ASSERT_EQ(mock->open_count, 1);
+    ASSERT_NE(mock->last_opts.peer_candidates, nullptr);
+    EXPECT_NE(mock->last_opts.shard_token, 0u);
+}
+
+TEST_F(NewFsStarletTest, sequential_open_delivers_peer_candidates) {
+    const int64_t kShard = 90002;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    install_shard_with_peer(kShard, "10.0.0.1:9070");
+
+    auto mock = std::make_shared<CapturingFs>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock;
+    });
+    auto fs = new_fs_starlet(kShard, true);
+    (void)fs->new_sequential_file(SequentialFileOptions(), fmt::format("staros://{}/seg.dat", kShard));
+    ASSERT_EQ(mock->open_count, 1);
+    ASSERT_NE(mock->last_opts.peer_candidates, nullptr);
+    EXPECT_NE(mock->last_opts.shard_token, 0u);
+}
+
+// Pre-existing gap: the random path already forwarded skip_disk_cache into
+// ReadOptions::skip_read_local_cache; the sequential path did not. Fixed alongside the peer
+// candidate delivery above.
+TEST_F(NewFsStarletTest, sequential_open_forwards_skip_disk_cache) {
+    const int64_t kShard = 90003;
+    auto mock = std::make_shared<CapturingFs>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock;
+    });
+    auto fs = new_fs_starlet(kShard, true);
+
+    SequentialFileOptions opts;
+    opts.skip_disk_cache = true;
+    (void)fs->new_sequential_file(opts, fmt::format("staros://{}/seg.dat", kShard));
+    ASSERT_EQ(mock->open_count, 1);
+    EXPECT_TRUE(mock->last_opts.skip_read_local_cache); // pre-existing gap, fixed here
+    // skip_disk_cache must also suppress peer candidates on the sequential path, mirroring
+    // skip_disk_cache_also_suppresses_candidates on the random path below.
+    EXPECT_EQ(mock->last_opts.peer_candidates, nullptr);
+}
+
+TEST_F(NewFsStarletTest, skip_peer_cache_suppresses_candidates_on_both_opens) {
+    const int64_t kShard = 90004;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    install_shard_with_peer(kShard, "10.0.0.1:9070");
+
+    auto mock = std::make_shared<CapturingFs>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock;
+    });
+    auto fs = new_fs_starlet(kShard, true);
+    const std::string uri = fmt::format("staros://{}/seg.dat", kShard);
+
+    RandomAccessFileOptions raf_opts;
+    raf_opts.skip_peer_cache = true;
+    (void)fs->new_random_access_file(raf_opts, uri);
+    ASSERT_EQ(mock->open_count, 1);
+    EXPECT_EQ(mock->last_opts.peer_candidates, nullptr);
+    EXPECT_EQ(mock->last_opts.shard_token, 0u);
+
+    SequentialFileOptions seq_opts;
+    seq_opts.skip_peer_cache = true;
+    (void)fs->new_sequential_file(seq_opts, uri);
+    ASSERT_EQ(mock->open_count, 2);
+    EXPECT_EQ(mock->last_opts.peer_candidates, nullptr);
+    EXPECT_EQ(mock->last_opts.shard_token, 0u);
+}
+
+// Review round 1 finding C8: a self-heal re-read must be provably peer-free at this boundary,
+// not merely suppressed later inside starlet. skip_disk_cache alone -- without skip_peer_cache --
+// must also suppress candidate delivery, even though a peer-bearing shard and enabled config are
+// both present.
+TEST_F(NewFsStarletTest, skip_disk_cache_also_suppresses_candidates) {
+    const int64_t kShard = 90005;
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    install_shard_with_peer(kShard, "10.0.0.1:9070");
+
+    auto mock = std::make_shared<CapturingFs>();
+    SyncPoint::GetInstance()->SetCallBack("new_fs_starlet::get_shard_filesystem", [&](void* arg) {
+        auto* fs_st = static_cast<absl::StatusOr<std::shared_ptr<staros::starlet::fslib::FileSystem>>*>(arg);
+        *fs_st = mock;
+    });
+    auto fs = new_fs_starlet(kShard, true);
+
+    RandomAccessFileOptions opts;
+    opts.skip_disk_cache = true;
+    (void)fs->new_random_access_file(opts, fmt::format("staros://{}/seg.dat", kShard));
+    ASSERT_EQ(mock->open_count, 1);
+    EXPECT_EQ(mock->last_opts.peer_candidates, nullptr);
+    EXPECT_EQ(mock->last_opts.shard_token, 0u);
 }
 
 } // namespace starrocks
