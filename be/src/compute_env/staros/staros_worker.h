@@ -18,6 +18,7 @@
 
 #include <starlet.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,15 @@ public:
     using WorkerInfo = staros::starlet::WorkerInfo;
     using FileSystem = staros::starlet::fslib::FileSystem;
     using Configuration = staros::starlet::fslib::Configuration;
+
+    // Atomic (candidates, token) snapshot returned by get_peer_read_options(). Both fields are
+    // copied out of the same ShardInfoDetails under a single lock acquisition, so they always
+    // describe the same shard-info version -- never one version's candidates paired with
+    // another's token.
+    struct PeerReadSnapshot {
+        std::shared_ptr<const std::vector<staros::starlet::fslib::PeerCandidate>> candidates;
+        uint64_t shard_token = 0;
+    };
 
     typedef std::function<void(ShardId)> add_shard_listener;
 
@@ -83,12 +93,25 @@ public:
 
     void set_fs_cache_capacity(int32_t capacity);
 
+    // Returns the peer-read candidates and their shard token for `id`, or a default-constructed
+    // (null candidates, 0 token) snapshot when peer cache read is disabled or the shard is
+    // unknown. Cheap to call per open: off is checked before touching `_shards` at all, and on
+    // is a single shared_lock plus two shared_ptr/uint64_t copies -- no protobuf iteration.
+    PeerReadSnapshot get_peer_read_options(ShardId id) const;
+
 private:
     struct ShardInfoDetails {
         ShardInfo shard_info;
         std::shared_ptr<std::string> fs_cache_key;
+        // Cached from shard_info at construction time so get_peer_read_options() never has to
+        // recompute or reach into the protobuf-derived ShardInfo on the hot path.
+        std::shared_ptr<const ShardInfo::PeerCandidateList> peer_candidates;
+        uint64_t shard_token = 0;
 
-        ShardInfoDetails(ShardInfo info) : shard_info(std::move(info)) {}
+        ShardInfoDetails(ShardInfo info)
+                : shard_info(std::move(info)),
+                  peer_candidates(shard_info.peer_candidates()),
+                  shard_token(shard_info.shard_token()) {}
     };
 
     struct CacheValue {
@@ -145,6 +168,14 @@ private:
     std::unique_ptr<Cache> _fs_cache;
     add_shard_listener _add_shard_listener;
     TableMetricsManager* _table_metrics_mgr = nullptr;
+#ifdef BE_TEST
+    // Test-only instrumentation for get_peer_read_options(): incremented once per shared_lock
+    // acquisition so a test can prove both (candidates, token) fields were copied under the same
+    // acquisition. Never read directly -- each acquisition publishes a per-acquisition local
+    // snapshot of the post-increment value via TEST_SYNC_POINT_CALLBACK, so concurrent callers
+    // cannot race on the published value.
+    mutable std::atomic<uint64_t> _lock_generation{0};
+#endif
 };
 
 } // namespace starrocks

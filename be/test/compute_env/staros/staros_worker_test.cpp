@@ -23,9 +23,12 @@
 #include <manager.grpc.pb.h>
 #include <shard.pb.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <thread>
 
+#include "base/testutil/sync_point.h"
 #include "base/utility/defer_op.h"
 #include "common/config_staros_worker_fwd.h"
 #include "common/gflags_utils.h"
@@ -336,8 +339,12 @@ TEST_F(StarOSWorkerTest, test_read_cache_serving_defaults_off) {
     EXPECT_FALSE(config::starlet_enable_read_cache_serving);
 }
 
-// Verify the exact mapping used by init_staros_worker(): the BE config value reaches the real
-// starlet gflag of the same name via GFlagsUtils::UpdateFlagValue.
+// Verify that GFlagsUtils::UpdateFlagValue("starlet_enable_read_cache_serving", ...) correctly
+// sets the real starlet gflag of the same name and that the bool round-trips through the string
+// conversion. This does NOT exercise init_staros_worker() itself, so it would not catch the
+// startup mapping being deleted there: init_staros_worker() is one-shot (guarded by g_starlet)
+// and starts a real starlet server bound to config::starlet_port, so it cannot be called from a
+// unit test.
 TEST_F(StarOSWorkerTest, test_read_cache_serving_config_propagates_to_gflag) {
     bool saved = config::starlet_enable_read_cache_serving;
     DeferOp restore_config([&] { config::starlet_enable_read_cache_serving = saved; });
@@ -358,6 +365,166 @@ TEST_F(StarOSWorkerTest, test_read_cache_serving_config_propagates_to_gflag) {
                          .empty());
     ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
     EXPECT_EQ("false", value);
+}
+
+// Builds a ShardInfo carrying a single peer candidate (worker 4242, never the local worker),
+// via the dispatch (AddShard) from_pb path.
+static StarOSWorker::ShardInfo make_shard_with_peer(int64_t id, const std::string& ip_port) {
+    ::staros::AddShardInfo pb;
+    pb.set_shard_id(id);
+    auto* s = pb.add_peer_sources();
+    s->set_worker_id(4242); // not the local worker
+    s->set_ip_port(ip_port);
+    s->set_expires_at(1'900'000'000'000);
+    StarOSWorker::ShardInfo info;
+    EXPECT_TRUE(info.from_pb(pb, /*self_worker_id=*/1).ok());
+    // get_table_id() (called unconditionally from remove_shard(), a pre-existing issue outside
+    // this change's scope) DCHECKs without a "tableId" property -- set one so these tests don't
+    // depend on that unrelated defect.
+    info.properties["tableId"] = "1";
+    return info;
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_empty_when_config_disabled) {
+    config::starlet_enable_peer_cache_read = false;
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+    auto snap = worker->get_peer_read_options(1);
+    EXPECT_EQ(snap.candidates, nullptr);
+    EXPECT_EQ(snap.shard_token, 0u);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_shares_cached_list_when_enabled) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+    auto a = worker->get_peer_read_options(1);
+    auto b = worker->get_peer_read_options(1);
+    ASSERT_NE(a.candidates, nullptr);
+    EXPECT_EQ(a.candidates.get(), b.candidates.get()); // cached, not rebuilt
+    EXPECT_NE(a.shard_token, 0u);
+    EXPECT_EQ(a.shard_token, b.shard_token);
+}
+
+TEST_F(StarOSWorkerTest, peer_read_options_empty_for_unknown_shard) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    auto snap = worker->get_peer_read_options(424242);
+    EXPECT_EQ(snap.candidates, nullptr);
+    EXPECT_EQ(snap.shard_token, 0u);
+}
+
+// NOTE: this one is sequential and proves only shared_ptr lifetime -- it would still pass an
+// implementation that fetched candidates and token under two separate locks. The genuinely
+// concurrent case below is the one that pins atomicity.
+TEST_F(StarOSWorkerTest, snapshot_survives_shard_replacement) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+    auto held = worker->get_peer_read_options(1);
+    ASSERT_NE(held.candidates, nullptr);
+    const auto* raw = held.candidates.get();
+    const uint64_t tok = held.shard_token;
+
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.2:9070")).ok());
+
+    EXPECT_EQ(held.candidates.get(), raw); // pre-replacement open stays coherent
+    EXPECT_EQ(held.shard_token, tok);
+    auto fresh = worker->get_peer_read_options(1);
+    EXPECT_NE(fresh.candidates.get(), raw);
+    EXPECT_NE(fresh.shard_token, tok);
+}
+
+// The atomicity test: hammer replacement while reading snapshots. Only two (candidates, token)
+// pairs are coherent -- version A's list with version A's token, or B's with B's. A torn read
+// pairing A's list with B's token is exactly what a two-lock implementation would produce.
+TEST_F(StarOSWorkerTest, concurrent_replacement_never_yields_a_torn_snapshot) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+    const uint64_t tok_a = worker->get_peer_read_options(1).shard_token;
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.2:9070")).ok());
+    const uint64_t tok_b = worker->get_peer_read_options(1).shard_token;
+    ASSERT_NE(tok_a, tok_b);
+
+    // RAII stop+join: a bare `writer.join()` after the loop is skipped when an assertion fails,
+    // and a running std::thread destructor calls std::terminate.
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        int i = 0;
+        while (!stop.load()) {
+            (void)worker->add_shard(make_shard_with_peer(1, (i++ % 2) ? "10.0.0.1:9070" : "10.0.0.2:9070"));
+        }
+    });
+    DeferOp join_writer([&] {
+        stop.store(true);
+        writer.join();
+    });
+    for (int i = 0; i < 20000; ++i) {
+        auto snap = worker->get_peer_read_options(1);
+        ASSERT_NE(snap.candidates, nullptr);
+        ASSERT_EQ(snap.candidates->size(), 1u);
+        const auto& addr = (*snap.candidates)[0].ip_port;
+        // The pair must be internally consistent.
+        if (snap.shard_token == tok_a) {
+            EXPECT_EQ(addr, "10.0.0.1:9070");
+        } else {
+            ASSERT_EQ(snap.shard_token, tok_b);
+            EXPECT_EQ(addr, "10.0.0.2:9070");
+        }
+    }
+}
+
+// The stress test above is probabilistic. The atomicity claim needs a deterministic test:
+// a test-only monotonic counter is incremented every time the accessor acquires its shared lock
+// (StarOSWorker::_lock_generation, #ifdef BE_TEST), and its post-increment value is published
+// at both copy sites via TEST_SYNC_POINT_CALLBACK. One acquisition spanning both copies means the
+// two published generations are equal; an implementation that released and re-acquired the lock
+// between the two copies would publish different values.
+TEST_F(StarOSWorkerTest, both_snapshot_fields_are_copied_under_one_lock_acquisition) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+
+    uint64_t gen_at_candidates = 0, gen_at_token = 0;
+    int hits = 0;
+    SyncPoint::GetInstance()->SetCallBack("StarOSWorker::get_peer_read_options::gen_at_candidates",
+                                          [&](void* arg) {
+                                              gen_at_candidates = *static_cast<uint64_t*>(arg);
+                                              ++hits;
+                                          });
+    SyncPoint::GetInstance()->SetCallBack("StarOSWorker::get_peer_read_options::gen_at_token", [&](void* arg) {
+        gen_at_token = *static_cast<uint64_t*>(arg);
+        ++hits;
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp sp([] {
+        SyncPoint::GetInstance()->ClearCallBack("StarOSWorker::get_peer_read_options::gen_at_candidates");
+        SyncPoint::GetInstance()->ClearCallBack("StarOSWorker::get_peer_read_options::gen_at_token");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    auto snap = worker->get_peer_read_options(1);
+    ASSERT_EQ(hits, 2); // positive control: both sites were reached
+    EXPECT_NE(gen_at_candidates, 0u);
+    EXPECT_EQ(gen_at_candidates, gen_at_token); // one acquisition spanned both copies
+    ASSERT_NE(snap.candidates, nullptr);
+    EXPECT_NE(snap.shard_token, 0u);
+}
+
+TEST_F(StarOSWorkerTest, remove_shard_releases_peer_state) {
+    config::starlet_enable_peer_cache_read = true;
+    DeferOp restore([] { config::starlet_enable_peer_cache_read = false; });
+    auto worker = std::make_shared<StarOSWorker>();
+    ASSERT_TRUE(worker->add_shard(make_shard_with_peer(1, "10.0.0.1:9070")).ok());
+    ASSERT_TRUE(worker->remove_shard(1).ok());
+    auto snap = worker->get_peer_read_options(1);
+    EXPECT_EQ(snap.candidates, nullptr);
 }
 
 } // namespace starrocks

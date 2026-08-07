@@ -80,6 +80,13 @@ struct LakeIOOptions {
     std::shared_ptr<std::atomic<bool>> sst_warmup_done;
     std::shared_ptr<FileSystem> fs;
     std::shared_ptr<starrocks::lake::LocationProvider> location_provider;
+    // Skip cross-BE peer cache reads for this open, i.e. the starlet/starcache peer-cache-read
+    // path (StarOSWorker::get_peer_read_options) -- NOT be/src/cache/peer_cache_engine, an
+    // unrelated existing BE feature with a colliding name. Defaults to false (peer read allowed)
+    // to match the sibling skip_* flags above; several call sites brace-init these options with
+    // designated initializers, where an omitted field is value-initialized, so an
+    // "allow_peer_cache_read" flag would instead default to false meaning "peer silently disabled".
+    bool skip_peer_cache = false;
 };
 
 } // namespace starrocks
