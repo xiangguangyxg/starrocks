@@ -85,6 +85,7 @@ public:
 
     StatusOr<VersionedTablet> get_tablet(int64_t tablet_id, int64_t version, bool fill_meta_cache = true,
                                          bool fill_data_cache = true);
+    StatusOr<VersionedTablet> get_tablet(int64_t tablet_id, int64_t version, const CacheOptions& cache_opts);
 
     StatusOr<CompactionTaskPtr> compact(CompactionTaskContext* context);
 
@@ -327,7 +328,8 @@ private:
 
     Status put_tablet_metadata(const TabletMetadataPtr& metadata, const std::string& metadata_location);
     StatusOr<TabletMetadataPtr> load_tablet_metadata(const std::string& metadata_location, bool fill_data_cache,
-                                                     int64_t expected_gtid, const std::shared_ptr<FileSystem>& fs);
+                                                     int64_t expected_gtid, const std::shared_ptr<FileSystem>& fs,
+                                                     bool skip_peer_cache);
     StatusOr<TabletMetadataPtr> construct_initial_metadata(int64_t tablet_id);
     // Build version 1 TabletMetadataPB from a FE response. Exposed for unit tests.
     StatusOr<TabletMetadataPtr> build_initial_metadata(int64_t tablet_id, const TGetTabletMetadataResponse& resp);

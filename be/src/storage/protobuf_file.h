@@ -76,7 +76,7 @@ public:
 
     Status save(const ::google::protobuf::Message& message, bool sync = true);
 
-    Status load(::google::protobuf::Message* message, bool fill_cache = true);
+    Status load(::google::protobuf::Message* message, bool fill_cache = true, bool skip_peer_cache = false);
 
     static Status load_from_buffer(::google::protobuf::Message* message, std::string_view data,
                                    uint64_t magic = OLAP_FIX_HEADER_MAGIC_NUMBER,

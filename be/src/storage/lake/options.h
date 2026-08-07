@@ -23,6 +23,11 @@ struct CacheOptions {
     // Lets a caller tell "durably persisted in remote storage" apart from "only in the metacache"
     // (cached during publish but not yet durably flushed).
     bool skip_meta_cache = false;
+    // Skip cross-BE peer cache reads when opening the underlying metadata file. See
+    // RandomAccessFileOptions::skip_peer_cache (fs/fs.h) for the full rationale. Defaults to false
+    // (peer allowed); bulk/background metadata loads (e.g. CACHE SELECT, warmup) set it true so
+    // they never compete with the query critical path for peer bandwidth.
+    bool skip_peer_cache = false;
 };
 
 } // namespace starrocks::lake

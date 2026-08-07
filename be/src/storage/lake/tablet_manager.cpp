@@ -93,9 +93,9 @@ static Status save_lake_protobuf(const std::string& path, const ::google::protob
 // Load a lake metadata/txn-log protobuf. Auto-detects the checksummed header format and
 // falls back to legacy headerless protobuf, regardless of lake_enable_protobuf_file_checksum.
 static Status load_lake_protobuf(const std::string& path, ::google::protobuf::Message* message, bool fill_cache,
-                                 const std::shared_ptr<FileSystem>& fs = nullptr) {
+                                 const std::shared_ptr<FileSystem>& fs = nullptr, bool skip_peer_cache = false) {
     ProtobufFileWithHeader file(path, fs, LAKE_META_HEADER_MAGIC_NUMBER, /*allow_plain_protobuf_fallback=*/true);
-    return file.load(message, fill_cache);
+    return file.load(message, fill_cache, skip_peer_cache);
 }
 
 #if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
@@ -725,17 +725,18 @@ Status TabletManager::corrupted_tablet_meta_handler(const Status& s, const std::
 
 StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& metadata_location, bool fill_data_cache,
                                                                 int64_t expected_gtid,
-                                                                const std::shared_ptr<FileSystem>& fs) {
+                                                                const std::shared_ptr<FileSystem>& fs,
+                                                                bool skip_peer_cache) {
     TEST_ERROR_POINT("TabletManager::load_tablet_metadata");
     auto t0 = butil::gettimeofday_us();
     auto metadata = std::make_shared<TabletMetadataPB>();
-    auto s = load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs);
+    auto s = load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs, skip_peer_cache);
     if (!s.ok()) {
         RETURN_IF_ERROR(corrupted_tablet_meta_handler(s, metadata_location));
         // reset metadata
         metadata = std::make_shared<TabletMetadataPB>();
         // read again
-        RETURN_IF_ERROR(load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs));
+        RETURN_IF_ERROR(load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs, skip_peer_cache));
     }
 
     // Back-fill segment_metas from the deprecated legacy arrays for rowsets written by a
@@ -827,10 +828,12 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
     if (cache_key.ok() && _metacache->lookup_aggregation_partition(*cache_key)) {
         metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs);
         if (metadata_or.status().is_not_found()) {
-            metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs);
+            metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs,
+                                               cache_opts.skip_peer_cache);
         }
     } else {
-        metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs);
+        metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs,
+                                           cache_opts.skip_peer_cache);
         if (metadata_or.status().is_not_found()) {
             metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs);
             if (metadata_or.ok() && cache_key.ok()) {
@@ -842,7 +845,8 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
     if (metadata_or.status().is_not_found() && tablet_id != 0 && version == kInitialVersion) {
         // If the metadata is not found, we will try to read the initial metadata at least
         std::string new_path = join_path(prefix_name(path), tablet_initial_metadata_filename());
-        metadata_or = load_tablet_metadata(new_path, cache_opts.fill_data_cache, expected_gtid, fs);
+        metadata_or = load_tablet_metadata(new_path, cache_opts.fill_data_cache, expected_gtid, fs,
+                                           cache_opts.skip_peer_cache);
         // set tablet id for initial metadata
         if (metadata_or.ok()) {
             auto metadata = const_cast<starrocks::TabletMetadataPB*>(metadata_or.value().get());
@@ -1009,7 +1013,9 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
     } else {
         file_system = fs;
     }
-    RandomAccessFileOptions opts{.skip_fill_local_cache = !cache_opts.fill_data_cache};
+    RandomAccessFileOptions opts{.skip_fill_local_cache = !cache_opts.fill_data_cache,
+                                 .skip_peer_cache = cache_opts.skip_peer_cache};
+    TEST_SYNC_POINT_CALLBACK("TabletManager::metadata_open_options", &opts);
     // TODO(zhangqiang)
     // `read_all` only need to one api call and not increase the IOPS
     // but it will incur additional IO bandwidth overhead
@@ -1707,6 +1713,11 @@ void TabletManager::TEST_set_global_schema_cache(int64_t schema_id, TabletSchema
 StatusOr<VersionedTablet> TabletManager::get_tablet(int64_t tablet_id, int64_t version, bool fill_meta_cache,
                                                     bool fill_data_cache) {
     CacheOptions cache_opts{.fill_meta_cache = fill_meta_cache, .fill_data_cache = fill_data_cache};
+    return get_tablet(tablet_id, version, cache_opts);
+}
+
+StatusOr<VersionedTablet> TabletManager::get_tablet(int64_t tablet_id, int64_t version,
+                                                    const CacheOptions& cache_opts) {
     ASSIGN_OR_RETURN(auto metadata, get_tablet_metadata(tablet_id, version, cache_opts));
     return VersionedTablet(this, std::move(metadata));
 }

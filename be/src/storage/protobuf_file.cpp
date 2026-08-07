@@ -71,7 +71,7 @@ Status ProtobufFileWithHeader::save(const ::google::protobuf::Message& message, 
     return Status::OK();
 }
 
-Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool fill_cache) {
+Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool fill_cache, bool skip_peer_cache) {
     std::shared_ptr<FileSystem> fs;
     if (_fs) {
         fs = _fs;
@@ -83,7 +83,8 @@ Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool f
     // shorter than the header or simply lack the magic, in which case the whole content has to be
     // parsed as a plain protobuf. Read it all and dispatch through the buffer-based loader.
     if (_allow_plain_protobuf_fallback) {
-        RandomAccessFileOptions opts{.skip_fill_local_cache = !fill_cache};
+        RandomAccessFileOptions opts{.skip_fill_local_cache = !fill_cache, .skip_peer_cache = skip_peer_cache};
+        TEST_SYNC_POINT_CALLBACK("ProtobufFileWithHeader::open_options", &opts);
         ASSIGN_OR_RETURN(auto input_file, fs->new_random_access_file(opts, _path));
         ASSIGN_OR_RETURN(auto content, input_file->read_all());
         Status st = load_from_buffer(message, content, _magic, /*allow_plain_protobuf_fallback=*/true);

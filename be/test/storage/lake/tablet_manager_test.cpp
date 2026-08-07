@@ -1200,6 +1200,100 @@ TEST_F(LakeTabletManagerTest, get_tablet_metadata_skip_meta_cache_reads_durable)
     EXPECT_EQ(kDurableCommitTime, cached->commit_time());
 }
 
+// CacheOptions::skip_peer_cache must reach the per-tablet metadata open
+// (ProtobufFileWithHeader::load), since a bulk/background caller (e.g. CACHE SELECT, warmup) needs
+// to bypass peer reads even before any LakeIOOptions exists.
+TEST_F(LakeTabletManagerTest, get_tablet_metadata_propagates_skip_peer_cache) {
+    auto metadata = std::make_shared<TabletMetadata>();
+    auto tablet_id = next_id();
+    metadata->set_id(tablet_id);
+    metadata->set_version(2);
+    EXPECT_OK(_tablet_manager->put_tablet_metadata(metadata));
+
+    int callback_count = 0;
+    bool captured_skip_peer_cache = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+        callback_count++;
+        captured_skip_peer_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache;
+    });
+
+    // put_tablet_metadata() above warmed the metacache; prune it so this read is a genuinely cold
+    // open that reaches ProtobufFileWithHeader::load, not a metacache hit that never fires the hook.
+    _tablet_manager->metacache()->prune();
+    auto res = _tablet_manager->get_tablet_metadata(
+            tablet_id, 2,
+            lake::CacheOptions{.fill_meta_cache = true, .fill_data_cache = true, .skip_peer_cache = true});
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(1, callback_count); // positive control: the hook actually fired
+    EXPECT_TRUE(captured_skip_peer_cache);
+
+    // A default-constructed CacheOptions{} leaves the bit false.
+    _tablet_manager->metacache()->prune();
+    res = _tablet_manager->get_tablet_metadata(tablet_id, 2, lake::CacheOptions{});
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(2, callback_count);
+    EXPECT_FALSE(captured_skip_peer_cache);
+}
+
+// CacheOptions::skip_peer_cache must also reach the bundled-metadata open in
+// get_single_tablet_metadata -- the other terminal metadata open on the chain.
+TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_propagates_skip_peer_cache) {
+    auto tablet_id = next_id();
+    TabletSchemaPB schema_pb;
+    schema_pb.set_id(10);
+    schema_pb.set_num_short_key_columns(1);
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_rows_per_row_block(65535);
+    auto c0 = schema_pb.add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+
+    starrocks::TabletMetadataPB metadata1;
+    metadata1.set_id(tablet_id);
+    metadata1.set_version(2);
+    metadata1.mutable_schema()->CopyFrom(schema_pb);
+    (*metadata1.mutable_historical_schemas())[10].CopyFrom(schema_pb);
+
+    std::map<int64_t, TabletMetadataPB> metadatas;
+    metadatas.emplace(tablet_id, metadata1);
+    ASSERT_OK(_tablet_manager->put_bundle_tablet_metadata(metadatas));
+
+    int callback_count = 0;
+    bool captured_skip_peer_cache = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options", [&](void* arg) {
+        callback_count++;
+        captured_skip_peer_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache;
+    });
+
+    _tablet_manager->metacache()->prune();
+    auto res = _tablet_manager->get_single_tablet_metadata(
+            tablet_id, 2,
+            lake::CacheOptions{.fill_meta_cache = true, .fill_data_cache = true, .skip_peer_cache = true});
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(1, callback_count); // positive control: the hook actually fired
+    EXPECT_TRUE(captured_skip_peer_cache);
+
+    // A default-constructed CacheOptions{} leaves the bit false.
+    _tablet_manager->metacache()->prune();
+    res = _tablet_manager->get_single_tablet_metadata(tablet_id, 2, lake::CacheOptions{});
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(2, callback_count);
+    EXPECT_FALSE(captured_skip_peer_cache);
+}
+
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {
     // Create a corrupted bundle metadata file with bundle_metadata_size = 0
     std::string serialized_string;
