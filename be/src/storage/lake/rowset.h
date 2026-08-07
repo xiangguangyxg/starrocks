@@ -272,7 +272,13 @@ public:
     // this object's lifetime is scoped to one query. Callers with no per-query policy (compaction,
     // schema tools) simply never call this, leaving the pre-existing fill_data_cache=true,
     // fill_metadata_cache=true, peer-allowed default.
-    void set_lake_io_opts(const LakeIOOptions& lake_io_opts) { _lake_io_opts = lake_io_opts; }
+    void set_lake_io_opts(const LakeIOOptions& lake_io_opts) {
+        // Catches a caller that reaches this after get_segments()/get_segments_checked()/
+        // get_non_null_segments() already latched _segments under a different (or default)
+        // policy -- the ordering this method's contract requires but nothing else enforces.
+        DCHECK(!_segments_loaded);
+        _lake_io_opts = lake_io_opts;
+    }
 
     StatusOr<std::vector<SegmentPtr>> segments(bool fill_cache);
 

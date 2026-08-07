@@ -937,6 +937,13 @@ TEST_F(LakeTabletReaderSpit, test_reader_split_propagates_skip_peer_cache) {
         params.lake_io_opts.skip_peer_cache = true;
         ASSERT_OK(reader->prepare());
         ASSERT_OK(reader->open(params));
+        // Guard against the split branch silently degrading to init_collector() (e.g. if
+        // config::lake_tablet_rows_splitted_ratio changes at runtime and this fixture's row count
+        // falls below threshold): that path already carried the query's policy before this fix, so
+        // without this assertion the test would stay green while covering nothing this task added.
+        std::vector<pipeline::ScanSplitContextPtr> split_tasks;
+        reader->get_split_tasks(&split_tasks);
+        ASSERT_GT(split_tasks.size(), 0);
         reader->close();
     }
     ASSERT_FALSE(captured_skip_peer_cache.empty());
@@ -956,6 +963,9 @@ TEST_F(LakeTabletReaderSpit, test_reader_split_propagates_skip_peer_cache) {
         params.lake_io_opts.fill_metadata_cache = false;
         ASSERT_OK(reader->prepare());
         ASSERT_OK(reader->open(params));
+        std::vector<pipeline::ScanSplitContextPtr> split_tasks;
+        reader->get_split_tasks(&split_tasks);
+        ASSERT_GT(split_tasks.size(), 0);
         reader->close();
     }
     ASSERT_FALSE(captured_skip_peer_cache.empty());
