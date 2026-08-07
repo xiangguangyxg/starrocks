@@ -1478,6 +1478,15 @@ CONF_mInt32(starlet_filesystem_instance_cache_ttl_sec, "86400");
 // enabled. Warmup and CACHE SELECT never use peer reads: peer read buys critical-path latency,
 // while background bulk work would just contend for a production node's scarce disk IOPS.
 CONF_mBool(starlet_enable_peer_cache_read, "false");
+// Whether this BE serves peer cache read requests from other BEs whose local disk cache missed.
+// This is the server half of the two-axis peer-cache-read switch; starlet_enable_peer_cache_read
+// (above) is the client half. Rollout order matters: enable this config on every node first, then
+// enable the client config; to roll back, disable the client config first, then this one. Must
+// stay OFF in production until network isolation between peer BEs has been verified end-to-end
+// (a negative-path check that other tenants, services, and networks outside the cluster cannot
+// reach this port), because a BE with this enabled will answer peer-cache-read RPCs from any
+// worker that can reach it.
+CONF_mBool(starlet_enable_read_cache_serving, "false");
 CONF_mBool(starlet_write_file_with_tag, "false");
 #endif
 

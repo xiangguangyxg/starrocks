@@ -16,6 +16,10 @@
 
 #include <memory>
 
+#ifdef USE_STAROS
+#include "gflags/gflags.h"
+#endif
+
 #include "agent/agent_server.h"
 #include "base/testutil/assert.h"
 #include "base/testutil/scoped_updater.h"
@@ -27,6 +31,7 @@
 #include "common/config_agent_fwd.h"
 #include "common/config_cache_fwd.h"
 #include "common/config_lake_fwd.h"
+#include "common/config_staros_worker_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "common/config_update_registry.h"
 #include "common/config_vector_index_fwd.h"
@@ -237,6 +242,27 @@ TEST_F(ConfigUpdateHooksTest, test_update_lake_metadata_fetch_thread_count) {
     CHECK_OK(st);
     ASSERT_EQ(1, thread_pool->max_threads());
 }
+
+#ifdef USE_STAROS
+// register_config_update_hooks() runs in ServiceBE, so this is the runtime half of the
+// starlet_enable_read_cache_serving switch: verify that updating the BE config at runtime (not
+// just at startup) reaches the real starlet gflag of the same name.
+TEST_F(ConfigUpdateHooksTest, test_update_starlet_enable_read_cache_serving) {
+    bool saved = config::starlet_enable_read_cache_serving;
+    DeferOp restore_config([&] { config::starlet_enable_read_cache_serving = saved; });
+
+    ASSERT_OK(ConfigUpdateRegistry::instance()->update_config("starlet_enable_read_cache_serving", "true"));
+    EXPECT_TRUE(config::starlet_enable_read_cache_serving);
+    std::string value;
+    ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
+    EXPECT_EQ("true", value);
+
+    ASSERT_OK(ConfigUpdateRegistry::instance()->update_config("starlet_enable_read_cache_serving", "false"));
+    EXPECT_FALSE(config::starlet_enable_read_cache_serving);
+    ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
+    EXPECT_EQ("false", value);
+}
+#endif
 
 #ifdef WITH_TENANN
 TEST_F(ConfigUpdateHooksTest, vector_query_cache_capacity_uninitialized_cache_returns_internal_error) {

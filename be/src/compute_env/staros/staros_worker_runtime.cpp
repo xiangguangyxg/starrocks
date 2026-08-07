@@ -92,6 +92,8 @@ void init_staros_worker(const std::shared_ptr<starcache::StarCache>& star_cache,
                                                           std::to_string(config::starlet_fs_read_prefetch_enable));
     staros::starlet::common::GFlagsUtils::UpdateFlagValue(
             "fs_buffer_prefetch_threadpool_size", std::to_string(config::starlet_fs_read_prefetch_threadpool_size));
+    staros::starlet::common::GFlagsUtils::UpdateFlagValue(
+            "starlet_enable_read_cache_serving", std::to_string(config::starlet_enable_read_cache_serving));
 
     FLAGS_fslib_s3_virtual_address_domainlist = config::starlet_s3_virtual_address_domainlist;
     // use the same configuration as the external query

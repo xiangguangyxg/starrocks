@@ -260,6 +260,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：本地磁盘缓存未命中时，是否允许读取仍缓存该数据块的对端 BE，而不是从对象存储读取。仅当对端 BE 也开启了对外提供缓存服务的开关时才生效。无论该参数如何设置，预热和 CACHE SELECT 都不会使用对端读取，因为它们属于后台批量操作，走对端读取只会争抢生产节点稀缺的磁盘 IOPS；只有对延迟敏感的查询读取才会使用对端缓存。
 - 引入版本：-
 
+### starlet_enable_read_cache_serving
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：该 BE 是否对外提供缓存服务，即是否响应其他 BE 因本地磁盘缓存未命中而发出的对端缓存读取请求，而不仅仅读取自身的本地缓存和对象存储。这是对端缓存读取开关的服务端一侧；`starlet_enable_peer_cache_read` 是客户端一侧。在集群中上线对端缓存读取时，需先在所有节点开启此参数，再开启 `starlet_enable_peer_cache_read`；回滚时顺序相反，先关闭 `starlet_enable_peer_cache_read`，再关闭此参数。在生产环境中，必须等对端 BE 之间的网络隔离经过端到端验证后才能开启此参数，因为开启后该 BE 会响应任何能够访问到它的节点发来的对端缓存读取请求。
+- 引入版本：-
+
 ### starlet_filesystem_instance_cache_capacity
 
 - 默认值：10000

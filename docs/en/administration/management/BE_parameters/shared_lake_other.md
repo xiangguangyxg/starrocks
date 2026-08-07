@@ -263,6 +263,15 @@ This topic introduces the following types of BE configurations:
 - Description: Whether a local disk-cache miss can be served by reading the missing block from a peer BE that still caches it, instead of reading from object storage. This only takes effect when the peer BE also has peer serving enabled. Warmup and CACHE SELECT never use peer reads regardless of this setting, because they are background bulk operations and routing them through peer reads would contend for a production node's scarce disk IOPS; only latency-sensitive query reads use peer cache.
 - Introduced in: -
 
+### starlet_enable_read_cache_serving
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether this BE serves peer cache read requests from other BEs whose local disk cache missed, instead of only reading its own local cache and object storage. This is the server-side half of the peer cache read switch; `starlet_enable_peer_cache_read` is the client-side half. To roll out peer cache read across a cluster, enable this setting on every node first, then enable `starlet_enable_peer_cache_read`; to roll back, disable `starlet_enable_peer_cache_read` first, then this setting. Keep this OFF in production until network isolation between peer BEs has been verified end-to-end, because a BE with this setting enabled answers peer cache read requests from any worker that can reach it.
+- Introduced in: -
+
 ### starlet_filesystem_instance_cache_capacity
 
 - Default: 10000

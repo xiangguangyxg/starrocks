@@ -27,9 +27,12 @@
 #include <functional>
 
 #include "base/utility/defer_op.h"
+#include "common/config_staros_worker_fwd.h"
+#include "common/gflags_utils.h"
 #include "common/shutdown_hook.h"
 #include "compute_env/staros/staros_worker_metrics.h"
 #include "compute_env/staros/staros_worker_runtime.h"
+#include "gflags/gflags.h"
 
 namespace starrocks {
 
@@ -325,6 +328,36 @@ TEST_F(StarOSWorkerTest, test_fallback_metric_increments_on_cache_miss_failure) 
     ASSERT_FALSE(got.ok());
     EXPECT_EQ(before_total + 1, metrics->staros_shard_info_fallback_total.value());
     EXPECT_EQ(before_failed + 1, metrics->staros_shard_info_fallback_failed_total.value());
+}
+
+// starlet_enable_read_cache_serving is the server half of the peer-cache-read switch and must
+// default to off, since serving must not turn on until the network-isolation checks are proven.
+TEST_F(StarOSWorkerTest, test_read_cache_serving_defaults_off) {
+    EXPECT_FALSE(config::starlet_enable_read_cache_serving);
+}
+
+// Verify the exact mapping used by init_staros_worker(): the BE config value reaches the real
+// starlet gflag of the same name via GFlagsUtils::UpdateFlagValue.
+TEST_F(StarOSWorkerTest, test_read_cache_serving_config_propagates_to_gflag) {
+    bool saved = config::starlet_enable_read_cache_serving;
+    DeferOp restore_config([&] { config::starlet_enable_read_cache_serving = saved; });
+
+    config::starlet_enable_read_cache_serving = true;
+    ASSERT_FALSE(staros::starlet::common::GFlagsUtils::UpdateFlagValue(
+                         "starlet_enable_read_cache_serving",
+                         std::to_string(config::starlet_enable_read_cache_serving))
+                         .empty());
+    std::string value;
+    ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
+    EXPECT_EQ("true", value);
+
+    config::starlet_enable_read_cache_serving = false;
+    ASSERT_FALSE(staros::starlet::common::GFlagsUtils::UpdateFlagValue(
+                         "starlet_enable_read_cache_serving",
+                         std::to_string(config::starlet_enable_read_cache_serving))
+                         .empty());
+    ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
+    EXPECT_EQ("false", value);
 }
 
 } // namespace starrocks
