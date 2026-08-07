@@ -351,8 +351,7 @@ TEST_F(StarOSWorkerTest, test_read_cache_serving_config_propagates_to_gflag) {
 
     config::starlet_enable_read_cache_serving = true;
     ASSERT_FALSE(staros::starlet::common::GFlagsUtils::UpdateFlagValue(
-                         "starlet_enable_read_cache_serving",
-                         std::to_string(config::starlet_enable_read_cache_serving))
+                         "starlet_enable_read_cache_serving", std::to_string(config::starlet_enable_read_cache_serving))
                          .empty());
     std::string value;
     ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
@@ -360,8 +359,7 @@ TEST_F(StarOSWorkerTest, test_read_cache_serving_config_propagates_to_gflag) {
 
     config::starlet_enable_read_cache_serving = false;
     ASSERT_FALSE(staros::starlet::common::GFlagsUtils::UpdateFlagValue(
-                         "starlet_enable_read_cache_serving",
-                         std::to_string(config::starlet_enable_read_cache_serving))
+                         "starlet_enable_read_cache_serving", std::to_string(config::starlet_enable_read_cache_serving))
                          .empty());
     ASSERT_TRUE(gflags::GetCommandLineOption("starlet_enable_read_cache_serving", &value));
     EXPECT_EQ("false", value);
@@ -493,11 +491,10 @@ TEST_F(StarOSWorkerTest, both_snapshot_fields_are_copied_under_one_lock_acquisit
 
     uint64_t gen_at_candidates = 0, gen_at_token = 0;
     int hits = 0;
-    SyncPoint::GetInstance()->SetCallBack("StarOSWorker::get_peer_read_options::gen_at_candidates",
-                                          [&](void* arg) {
-                                              gen_at_candidates = *static_cast<uint64_t*>(arg);
-                                              ++hits;
-                                          });
+    SyncPoint::GetInstance()->SetCallBack("StarOSWorker::get_peer_read_options::gen_at_candidates", [&](void* arg) {
+        gen_at_candidates = *static_cast<uint64_t*>(arg);
+        ++hits;
+    });
     SyncPoint::GetInstance()->SetCallBack("StarOSWorker::get_peer_read_options::gen_at_token", [&](void* arg) {
         gen_at_token = *static_cast<uint64_t*>(arg);
         ++hits;

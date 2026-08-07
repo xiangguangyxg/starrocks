@@ -150,8 +150,7 @@ StarOSWorker::PeerReadSnapshot StarOSWorker::get_peer_read_options(ShardId id) c
     // with another's token.
     PeerReadSnapshot snapshot;
     snapshot.candidates = it->second.peer_candidates;
-    TEST_SYNC_POINT_CALLBACK("StarOSWorker::get_peer_read_options::gen_at_candidates",
-                             const_cast<uint64_t*>(&my_gen));
+    TEST_SYNC_POINT_CALLBACK("StarOSWorker::get_peer_read_options::gen_at_candidates", const_cast<uint64_t*>(&my_gen));
     snapshot.shard_token = it->second.shard_token;
     TEST_SYNC_POINT_CALLBACK("StarOSWorker::get_peer_read_options::gen_at_token", const_cast<uint64_t*>(&my_gen));
     return snapshot;

@@ -54,7 +54,7 @@ namespace starrocks {
 
 class LakeTabletManagerTest : public testing::Test {
 public:
-    LakeTabletManagerTest() : _test_dir(){};
+    LakeTabletManagerTest() : _test_dir() {};
 
     ~LakeTabletManagerTest() override = default;
 

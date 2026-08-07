@@ -832,8 +832,8 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
                                                cache_opts.skip_peer_cache);
         }
     } else {
-        metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs,
-                                           cache_opts.skip_peer_cache);
+        metadata_or =
+                load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs, cache_opts.skip_peer_cache);
         if (metadata_or.status().is_not_found()) {
             metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs);
             if (metadata_or.ok() && cache_key.ok()) {
