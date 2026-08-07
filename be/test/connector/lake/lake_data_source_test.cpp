@@ -260,6 +260,11 @@ TEST_F(LakeDataSourceTest, test_convert_scan_range_to_morsel_queue) {
     auto plan_node = create_lake_plan_node();
     connector::LakeDataSourceProvider data_source_provider(plan_node);
     data_source_provider.set_lake_tablet_manager(_tablet_mgr);
+    // Production reaches this through ConnectorScanNode::init(), which always runs the provider's
+    // init() and so always leaves a RuntimeState behind. Constructing the provider directly skips
+    // that, so set it explicitly rather than exercising a state the plan can never produce.
+    auto runtime_state = create_runtime_state_for_test();
+    data_source_provider._runtime_state = runtime_state.get();
 
     ASSERT_FALSE(data_source_provider.always_shared_scan());
 

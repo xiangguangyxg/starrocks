@@ -81,9 +81,14 @@ lake::TabletManager* lake_tablet_manager() {
 // for a CACHE SELECT in either mode, and _params does not exist yet at either of the two points that
 // need this -- the provider's fragment-prepare reads and LakeDataSource::get_tablet().
 //
-// |runtime_state| may legitimately be null: LakeDataSourceProvider::_runtime_state is only set by
-// init(), and the prepare path can run without it. Treat that as "cannot know", which keeps the
-// pre-existing peer-allowed behavior rather than silently suppressing peer reads for ordinary scans.
+// The null check is defensive and unit-test-only -- production always has a RuntimeState here.
+// LakeDataSourceProvider::_runtime_state is set by its init(), which ConnectorScanNode::init() calls
+// unconditionally before the plan is executed, and there is no other route to the provider; a
+// LakeDataSource likewise only reaches this after open() assigned _runtime_state. Tests that
+// construct a provider directly can leave it null, and returning false there keeps the pre-existing
+// peer-allowed behavior instead of crashing. Do NOT read this as "null is a supported state":
+// _could_tablet_internal_parallel dereferences _runtime_state for the skew ratio and DCHECKs the
+// invariant on entry.
 bool query_is_cache_select(const RuntimeState* runtime_state) {
     if (runtime_state == nullptr) {
         return false;
@@ -1815,6 +1820,12 @@ StatusOr<bool> LakeDataSourceProvider::_could_tablet_internal_parallel(
         const std::vector<TScanRangeParams>& scan_ranges, int32_t pipeline_dop, size_t num_total_scan_ranges,
         TTabletInternalParallelMode::type tablet_internal_parallel_mode, int64_t* scan_parallelism,
         int64_t* splitted_scan_rows) const {
+    // ConnectorScanNode::init() calls the provider's init() unconditionally before the plan runs, so
+    // production always has a RuntimeState by now. Pinned here because two things below depend on it
+    // and neither fails loudly: the skew-ratio read dereferences it behind a short-circuit that a
+    // future edit could reorder, and the CACHE SELECT policy resolved for the row-count probe would
+    // quietly fall back to peer-allowed.
+    DCHECK(_runtime_state != nullptr);
     bool force_split = tablet_internal_parallel_mode == TTabletInternalParallelMode::type::FORCE_SPLIT;
     // Enough tablets to fill pipeline_dop normally means no split is needed. But that count-based gate is
     // blind to tablet-size skew: a single oversized tablet becomes an un-splittable morsel that one driver
