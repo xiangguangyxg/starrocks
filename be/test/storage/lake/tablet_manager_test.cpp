@@ -1786,6 +1786,13 @@ TEST_F(LakeTabletManagerTest, put_bundle_extends_then_preserves_mismatched_legac
 }
 
 TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
+    // Pin the write format rather than inheriting it: the corruption below targets the footer's
+    // crc32 field, which only exists in the checksummed layout.
+    auto old_checksum_flag = config::lake_enable_protobuf_file_checksum;
+    DeferOp restore_checksum_flag(
+            [old_checksum_flag]() { config::lake_enable_protobuf_file_checksum = old_checksum_flag; });
+    config::lake_enable_protobuf_file_checksum = true;
+
     // First, create a valid bundle metadata to get the file path
     auto tablet_id = next_id();
     std::map<int64_t, TabletMetadataPB> metadatas;
@@ -1821,12 +1828,18 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     ASSIGN_OR_ABORT(auto read_file, fs->new_random_access_file(bundle_path));
     ASSIGN_OR_ABORT(auto content, read_file->read_all());
 
-    // Corrupt the tablet metadata portion by replacing with invalid data
-    // Keep the bundle metadata at the end intact, but corrupt the tablet data
-    // Replace the first part (tablet metadata) with garbage
-    for (size_t i = 0; i < 5; i++) {
-        content[i] = static_cast<char>(0xFF);
-    }
+    // Corrupt the bundle header so the whole file fails to parse.
+    //
+    // The footer is [bundle_meta][crc32(4)][size64(8)], so size-12 is the first byte of the stored
+    // crc32 and flipping it always fails the header check. It has to be addressed from the end:
+    // this bundle holds one tablet, whose page is written with the schema stripped, so the page is
+    // 4 bytes while `tablet_id` fits in a one-byte varint and 5 bytes once it does not. `next_id()`
+    // is a process-global counter, so an offset measured from the *start* of the file selects the
+    // bundle header or a tablet page depending on how many tests ran first -- which is two
+    // different code paths, two different drop buckets, and a test that passes alone and fails in
+    // the whole binary.
+    ASSERT_GT(content.size(), sizeof(uint64_t) + sizeof(uint32_t));
+    content[content.size() - sizeof(uint64_t) - sizeof(uint32_t)] ^= 0xFF;
 
     // Write the corrupted content back
     ASSERT_OK(fs->delete_file(bundle_path));
@@ -1865,14 +1878,12 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     EXPECT_TRUE(res.status().is_corruption());
     EXPECT_TRUE(handler_called) << "corrupted_tablet_meta_handler should have been called";
 
-    // Despite the name, the five zeroed bytes above do not stay inside the tablet page. A bundled
-    // page is written with the schema stripped, so a single-tablet bundle's page is only a handful
-    // of bytes and the corruption runs off its end into the bundle header, failing the footer crc.
-    // This therefore exercises the whole-bundle parse failure, which is category-(a): the bundle is
-    // dropped as `other` and re-read. Nothing else covers the case where that re-read then *fails*,
-    // which is the pairing `self_heal_reread_success_total` exists to expose, so pin it here: one
-    // attempt, no success. `bundle_page` is asserted unchanged to keep the two apart -- corrupting
-    // a page precisely, so the bundle header survives, is what the checksum test below does.
+    // A bundle header that fails its crc is category-(a): the bundle is dropped as `other` and
+    // re-read. Nothing else in the tree covers the case where that re-read then *fails*, which is
+    // the pairing `self_heal_reread_success_total` exists to expose, so pin it here: one attempt,
+    // no success. The re-read pulls the same bytes off disk, so it cannot succeed. `bundle_page` is
+    // asserted unchanged to keep the two paths apart -- corrupting a single tablet page, leaving
+    // the header intact, is what the checksum test below does.
     EXPECT_EQ(other_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
     EXPECT_EQ(bundle_page_before, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
     EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
