@@ -1852,9 +1852,10 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     });
 
     auto* metrics = StorageMetrics::instance();
-    const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
     const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+    const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
     const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
 
     // Try to get metadata - should fail with corruption error
     auto res = _tablet_manager->get_tablet_metadata(tablet_id, 2);
@@ -1864,13 +1865,18 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     EXPECT_TRUE(res.status().is_corruption());
     EXPECT_TRUE(handler_called) << "corrupted_tablet_meta_handler should have been called";
 
-    // A per-tablet page failure inside an otherwise readable bundle is drop-only, and it is the
-    // one bucket nothing else pins positively: every other test asserts `bundle_page` does *not*
-    // move, so a slip to `other` here would leave the whole suite green while `other` quietly
-    // absorbed these failures.
-    EXPECT_EQ(bundle_page_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
-    EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
-    EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
+    // Despite the name, the five zeroed bytes above do not stay inside the tablet page. A bundled
+    // page is written with the schema stripped, so a single-tablet bundle's page is only a handful
+    // of bytes and the corruption runs off its end into the bundle header, failing the footer crc.
+    // This therefore exercises the whole-bundle parse failure, which is category-(a): the bundle is
+    // dropped as `other` and re-read. Nothing else covers the case where that re-read then *fails*,
+    // which is the pairing `self_heal_reread_success_total` exists to expose, so pin it here: one
+    // attempt, no success. `bundle_page` is asserted unchanged to keep the two apart -- corrupting
+    // a page precisely, so the bundle header survives, is what the checksum test below does.
+    EXPECT_EQ(other_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(bundle_page_before, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
+    EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before, metrics->self_heal_reread_success_total.value());
 }
 
 // Bundle tablet metadata checksum: the footer carries a crc32 over the bundle header plus a
@@ -2018,10 +2024,27 @@ TEST_F(LakeTabletManagerTest, put_bundle_tablet_metadata_checksum) {
         });
         SyncPoint::GetInstance()->SetCallBack("TabletManager::corrupted_tablet_meta_handler",
                                               [](void* arg) { *(Status*)arg = Status::OK(); });
+
+        // Deltas taken here rather than at the top of the test: the footer-crc block above already
+        // moved these counters, so only the page corruption below may move them again.
+        auto* metrics = StorageMetrics::instance();
+        const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
+        const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+        const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+
         auto res = _tablet_manager->get_tablet_metadata(page_id, 2);
         EXPECT_FALSE(res.ok());
         EXPECT_TRUE(res.status().is_corruption()) << res.status();
         EXPECT_THAT(res.status().to_string(), ::testing::HasSubstr("checksum"));
+
+        // This is the only positive pin on the `bundle_page` bucket. A single flipped byte leaves
+        // the bundle header intact, so the failure is the per-page checksum and the drop is
+        // drop-only: no re-read follows. The `other` assertion is what disambiguates it from the
+        // footer-crc failure above, which lands in `other` with a re-read -- the substring check
+        // cannot tell them apart, because both messages say "checksum".
+        EXPECT_EQ(bundle_page_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
+        EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+        EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
     }
 }
 
