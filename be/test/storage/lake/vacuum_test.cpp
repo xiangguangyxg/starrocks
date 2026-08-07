@@ -38,6 +38,7 @@
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/txn_log.h"
 #include "storage/lake/vacuum_full.h"
+#include "storage/storage_metrics.h"
 #include "test_util.h"
 
 namespace starrocks::lake {
@@ -2865,6 +2866,10 @@ TEST_P(LakeVacuumTest, test_drop_tablet_cache) {
         SyncPoint::GetInstance()->DisableProcessing();
     });
 
+    auto* metrics = StorageMetrics::instance();
+    const int64_t bulk_before = metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value();
+    const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+
     ASSERT_OK(drop_tablet_cache(_tablet_mgr.get(), kTabletId, 3));
 
     std::vector<std::string> expected{
@@ -2875,6 +2880,13 @@ TEST_P(LakeVacuumTest, test_drop_tablet_cache) {
     std::sort(dropped.begin(), dropped.end());
     std::sort(expected.begin(), expected.end());
     ASSERT_EQ(expected, dropped);
+
+    // This is why `bulk_cleanup` is its own bucket rather than part of `other`: one call evicts
+    // every file of every version, so folding it into `other` would bury the handful of corruption
+    // drops that bucket exists to make visible. Deltas, because the counters are process-global.
+    EXPECT_EQ(bulk_before + static_cast<int64_t>(dropped.size()),
+              metrics->invalidating_cache_drops(CacheDropSite::kBulkCleanup).value());
+    EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
 }
 
 TEST_P(LakeVacuumTest, test_vacuumed_version) {

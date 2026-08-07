@@ -240,6 +240,7 @@ TEST(StorageMetricsTest, InstallRegistersSelfHealMetrics) {
             {CacheDropSite::kSegmentFooter, "segment_footer"},
             {CacheDropSite::kGtidMismatch, "gtid_mismatch"},
             {CacheDropSite::kBundlePage, "bundle_page"},
+            {CacheDropSite::kBulkCleanup, "bulk_cleanup"},
             {CacheDropSite::kOther, "other"},
     };
     int64_t value = 100;
@@ -249,11 +250,11 @@ TEST(StorageMetricsTest, InstallRegistersSelfHealMetrics) {
                             std::to_string(value));
     }
 
-    // Every bucket must carry exactly one label, `site`, and there must be exactly six of them.
-    // The lookups above already pin the label set of each bucket -- the collector is keyed on the
-    // whole set, so an extra `cache_key` label would make them miss -- but enumerate the registry
-    // too, so a seventh bucket or a new label added later fails here instead of silently
-    // multiplying the exported series.
+    // Every bucket must carry exactly one label, `site`, and the registry must hold exactly the
+    // buckets listed above and no others. The lookups above already pin the label set of each
+    // bucket -- the collector is keyed on the whole set, so an extra `cache_key` label would make
+    // them miss -- but enumerate the registry too, so an unlisted bucket or a new label added
+    // later fails here instead of silently multiplying the exported series.
     LabelCollectingVisitor visitor("invalidating_cache_drops_total");
     registry.collect(&visitor);
     ASSERT_EQ(sites.size(), visitor.label_sets().size());

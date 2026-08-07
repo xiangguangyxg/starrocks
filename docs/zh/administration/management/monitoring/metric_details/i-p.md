@@ -239,8 +239,8 @@ import MetricsIP from '../../../../_assets/commonMarkdown/metrics_i_p.mdx'
 
 - 单位：计数
 - 类型：累积
-- 标签：`site`（`page_io`、`sstable`、`segment_footer`、`gtid_mismatch`、`bundle_page` 或 `other`）
-- 描述：存算分离集群中，读取路径因发现缓存数据损坏或过期而作废该文件本地缓存条目的总次数。`site` 表示发起丢弃的路径：`page_io` 表示数据页校验和失败，`segment_footer` 表示 Segment Footer 校验和失败，`sstable` 表示持久化索引 SST 文件读取失败，`gtid_mismatch` 表示 Tablet 元数据条目的 GTID 与请求的 GTID 不一致，`bundle_page` 表示 Bundle 元数据文件中单个 Tablet 对应的页，`other` 表示元数据文件损坏、修复 Tablet 元数据前的缓存清理，以及回收 Tablet 版本时的缓存清除。被丢弃文件的路径不会作为标签导出。该指标记录的是丢弃请求而非实际清除的数据，因此针对未被本地缓存的文件发起的请求同样会计数。`page_io`、`segment_footer` 和 `sstable` 这几个位置即使在 `lake_clear_corrupted_cache_data` 关闭、实际不会执行丢弃时也会统计所检测到的损坏；而元数据丢弃（`bundle_page` 以及 `other` 中属于元数据损坏的部分）仅在 `lake_clear_corrupted_cache_meta` 开启时才会计数，因为该参数决定是否尝试丢弃。
+- 标签：`site`（`page_io`、`sstable`、`segment_footer`、`gtid_mismatch`、`bundle_page`、`bulk_cleanup` 或 `other`）
+- 描述：存算分离集群中作废文件本地缓存条目的总次数。`site` 表示发起丢弃的路径：`page_io` 表示数据页校验和失败，`segment_footer` 表示 Segment Footer 校验和失败，`sstable` 表示持久化索引 SST 文件读取失败，`gtid_mismatch` 表示 Tablet 元数据条目的 GTID 与请求的 GTID 不一致，`bundle_page` 表示 Bundle 元数据文件中单个 Tablet 对应的页，`other` 表示 Tablet 元数据文件或 Bundle 元数据文件损坏。`bulk_cleanup` 与其他取值不同，它统计的不是损坏而是管理操作触发的批量清除，即修复 Tablet 元数据前的缓存清理，以及 drop-tablet-cache 请求触发的缓存清除。之所以单独分桶，是因为一次这样的请求会清除该 Tablet 所有版本的全部文件；若并入 `other`，会淹没该分桶本应暴露的少量损坏事件。被丢弃文件的路径不会作为标签导出。该指标记录的是丢弃请求而非实际清除的数据，因此针对未被本地缓存的文件发起的请求同样会计数。`page_io`、`segment_footer` 和 `sstable` 这几个位置即使在 `lake_clear_corrupted_cache_data` 关闭、实际不会执行丢弃时也会统计所检测到的损坏；而元数据丢弃（`bundle_page` 和 `other`）仅在 `lake_clear_corrupted_cache_meta` 开启时才会计数，因为该参数决定是否尝试丢弃。
 
 ## `jemalloc_active_bytes`
 

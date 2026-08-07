@@ -97,6 +97,8 @@ void StorageMetrics::install(MetricRegistry* registry) {
                               &invalidating_cache_drops_gtid_mismatch);
     registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "bundle_page"),
                               &invalidating_cache_drops_bundle_page);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "bulk_cleanup"),
+                              &invalidating_cache_drops_bulk_cleanup);
     registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "other"),
                               &invalidating_cache_drops_other);
     REGISTER_STORAGE_METRIC(self_heal_reread_attempts_total);
@@ -229,6 +231,8 @@ IntCounter& StorageMetrics::invalidating_cache_drops(CacheDropSite site) {
         return invalidating_cache_drops_gtid_mismatch;
     case CacheDropSite::kBundlePage:
         return invalidating_cache_drops_bundle_page;
+    case CacheDropSite::kBulkCleanup:
+        return invalidating_cache_drops_bulk_cleanup;
     case CacheDropSite::kOther:
         return invalidating_cache_drops_other;
     }

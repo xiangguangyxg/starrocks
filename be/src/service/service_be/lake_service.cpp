@@ -2106,7 +2106,8 @@ Status LakeServiceImpl::_cleanup_before_repair(const ::starrocks::RepairTabletMe
         auto tablet_metadata_location = _tablet_mgr->tablet_metadata_location(tablet_id, version);
 
         // drop local data cache
-        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kOther, tablet_metadata_location);
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kBulkCleanup,
+                                                                   tablet_metadata_location);
         auto st = _tablet_mgr->drop_local_cache(tablet_metadata_location);
         RETURN_IF(!st.ok() && !st.is_not_found(), st);
 
@@ -2129,7 +2130,7 @@ Status LakeServiceImpl::_cleanup_before_repair(const ::starrocks::RepairTabletMe
 
     // drop bundle local data cache
     auto bundle_location = _tablet_mgr->bundle_tablet_metadata_location(any_tablet_id, version);
-    StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kOther, bundle_location);
+    StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kBulkCleanup, bundle_location);
     auto st = _tablet_mgr->drop_local_cache(bundle_location);
     return st.is_not_found() ? Status::OK() : st;
 }

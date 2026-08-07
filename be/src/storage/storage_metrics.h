@@ -38,6 +38,10 @@ enum class CacheDropSite {
     kSegmentFooter,
     kGtidMismatch,
     kBundlePage,
+    // Administrative bulk eviction: metadata repair cleanup and the drop-tablet-cache RPC. Kept
+    // apart from kOther because one call evicts every file of every version of a tablet, which
+    // would bury the handful of corruption drops kOther exists to make visible.
+    kBulkCleanup,
     kOther,
 };
 
@@ -106,7 +110,7 @@ public:
     METRIC_DEFINE_INT_COUNTER(pk_index_sst_read_error_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(pk_index_sst_write_error_total, MetricUnit::REQUESTS);
 
-    // Self-heal observability. The six buckets below are the `site` label values of the single
+    // Self-heal observability. The buckets below are the `site` label values of the single
     // exported `invalidating_cache_drops_total`; only the three category-(a) sites that follow a
     // drop with a re-read move the reread counters.
     METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_page_io, MetricUnit::OPERATIONS);
@@ -114,6 +118,7 @@ public:
     METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_segment_footer, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_gtid_mismatch, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_bundle_page, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_bulk_cleanup, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_other, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(self_heal_reread_attempts_total, MetricUnit::OPERATIONS);
     METRIC_DEFINE_INT_COUNTER(self_heal_reread_success_total, MetricUnit::OPERATIONS);
