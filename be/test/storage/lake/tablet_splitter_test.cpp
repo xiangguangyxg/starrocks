@@ -1522,7 +1522,7 @@ StatusOr<std::shared_ptr<Segment>> write_and_open_int_key_segment(const std::sha
 
     FileInfo file_info{.path = path};
     ASSIGN_OR_RETURN(auto segment, Segment::open(fs, file_info, /*segment_id=*/0, schema));
-    RETURN_IF_ERROR(segment->load_index());
+    RETURN_IF_ERROR(segment->load_index({}));
     return segment;
 }
 

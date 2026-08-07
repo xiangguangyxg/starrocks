@@ -354,7 +354,8 @@ TEST_F(MetaFileTest, test_get_del_vec_propagates_skip_peer_cache) {
     DelVector out;
     LakeIOOptions suppressed_opts;
     suppressed_opts.skip_peer_cache = true;
-    ASSERT_TRUE(get_del_vec(_tablet_manager.get(), *meta, segment_id, /*fill_cache=*/false, suppressed_opts, &out).ok());
+    ASSERT_TRUE(
+            get_del_vec(_tablet_manager.get(), *meta, segment_id, /*fill_cache=*/false, suppressed_opts, &out).ok());
 
     LakeIOOptions default_opts;
     ASSERT_TRUE(get_del_vec(_tablet_manager.get(), *meta, segment_id, /*fill_cache=*/false, default_opts, &out).ok());

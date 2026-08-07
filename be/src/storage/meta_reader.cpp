@@ -217,7 +217,8 @@ StatusOr<std::shared_ptr<Segment>> SegmentMetaCollecter::_get_dcg_segment(uint32
         if (idx.first >= 0) {
             ASSIGN_OR_RETURN(auto column_file, dcg->column_file_by_idx(parent_name(_segment->file_name()), idx.first));
             if (_dcg_segments.count(column_file) == 0) {
-                ASSIGN_OR_RETURN(auto dcg_segment, _segment->new_dcg_segment(*dcg, idx.first, _params->tablet_schema));
+                ASSIGN_OR_RETURN(auto dcg_segment,
+                                 _segment->new_dcg_segment(*dcg, idx.first, _params->tablet_schema, {}));
                 _dcg_segments[column_file] = dcg_segment;
             }
             return _dcg_segments[column_file];

@@ -180,10 +180,9 @@ static StatusOr<SparseRange<>> build_initial_coarse_scan_range(const SegmentPtr&
                      block_aligned_rowid_range_from_seek_ranges(segment.get(), segment_read_options.ranges,
                                                                 segment_read_options.lake_io_opts));
     if (segment_read_options.tablet_range.has_value() && !segment_read_options.tablet_range->all_range()) {
-        ASSIGN_OR_RETURN(auto tablet_scan_range,
-                         block_aligned_rowid_range_from_seek_ranges(segment.get(),
-                                                                    {segment_read_options.tablet_range.value()},
-                                                                    segment_read_options.lake_io_opts));
+        ASSIGN_OR_RETURN(auto tablet_scan_range, block_aligned_rowid_range_from_seek_ranges(
+                                                         segment.get(), {segment_read_options.tablet_range.value()},
+                                                         segment_read_options.lake_io_opts));
         scan_range &= tablet_scan_range;
     }
     return scan_range;
@@ -412,6 +411,7 @@ Status TabletReader::open(const TabletReaderParams& read_params) {
         split_morsel_queue->set_key_ranges(read_params.range, read_params.end_range, read_params.start_key,
                                            read_params.end_key);
         split_morsel_queue->set_tablet_schema(_tablet_schema);
+        split_morsel_queue->set_lake_io_opts(read_params.lake_io_opts);
 
         while (true) {
             auto split_status_or = split_morsel_queue->try_get();

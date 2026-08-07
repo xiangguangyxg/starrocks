@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "exec_primitive/pipeline/scan/morsel_queue.h"
+#include "storage/options.h"
 #include "storage/tablet_reader_params.h"
 #include "storage/tablet_schema.h"
 #include "storage_primitive/olap_tuple.h"
@@ -58,11 +59,16 @@ public:
         DCHECK(tablet_schema != nullptr);
         _tablet_schema = tablet_schema;
     }
+    // The current query's lake IO policy (e.g. skip_peer_cache), so lazy per-segment loads
+    // triggered during split preparation (short-key index load, full-sort-key index load) carry it
+    // instead of silently defaulting to peer-allowed.
+    virtual void set_lake_io_opts(const LakeIOOptions& lake_io_opts) { _lake_io_opts = lake_io_opts; }
 
 protected:
     std::vector<BaseTabletSharedPtr> _tablets;
     std::vector<std::vector<BaseRowsetSharedPtr>> _tablet_rowsets;
     TabletSchemaCSPtr _tablet_schema = nullptr;
+    LakeIOOptions _lake_io_opts;
 };
 
 } // namespace pipeline

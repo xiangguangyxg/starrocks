@@ -42,6 +42,7 @@
 
 #include "base/failpoint/fail_point.h"
 #include "base/testutil/assert.h"
+#include "base/utility/defer_op.h"
 #include "column/chunk_factory.h"
 #include "column/datum_tuple.h"
 #include "common/config_exec_fwd.h"
@@ -98,7 +99,7 @@ public:
     }
 
     Status load(int64_t tablet_id, RowsetId rowsetid, uint32_t segment_id, int64_t version,
-               DeltaColumnGroupList* pdcgs) override {
+                DeltaColumnGroupList* pdcgs) override {
         *pdcgs = _dcgs;
         return Status::OK();
     }
@@ -322,7 +323,7 @@ TEST_F(SegmentReaderWriterTest, TestHorizontalWrite) {
         auto ep = KeyCache::instance().create_plain_random_encryption_meta_pair().value();
         DeltaColumnGroup dcg;
         dcg.init(1, {{1}}, {"abc0.cols"}, {ep.encryption_meta});
-        auto r = segment->new_dcg_segment(dcg, 0, nullptr);
+        auto r = segment->new_dcg_segment(dcg, 0, nullptr, {});
         ASSERT_FALSE(r.ok());
     }
 }
@@ -625,6 +626,11 @@ TEST_F(SegmentReaderWriterTest, TestCheckColumnUniqueIdUniqueness) {
     // enable hook_publish_primary_key_tablet
     auto fp = starrocks::failpoint::FailPointRegistry::GetInstance()->get("ingest_duplicate_column_unique_id");
     fp->setMode(trigger_mode);
+    DeferOp reset_fp([&] {
+        PFailPointTriggerMode disable_mode;
+        disable_mode.set_mode(FailPointTriggerModeType::DISABLE);
+        fp->setMode(disable_mode);
+    });
 
     static int seg_id = 0;
     std::string filename = strings::Substitute("$0/seg_$1.dat", kSegmentDir, seg_id++);
@@ -686,8 +692,8 @@ TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedAtOpenAndLoadIndex) {
         capture_fs->captured_skip_peer_cache.clear();
         LakeIOOptions lake_io_opts;
         lake_io_opts.skip_peer_cache = true;
-        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema, nullptr,
-                                                    nullptr, lake_io_opts));
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema, nullptr, nullptr,
+                                                    lake_io_opts));
         ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
         EXPECT_TRUE(capture_fs->captured_skip_peer_cache[file_name].back());
     }
@@ -712,7 +718,7 @@ TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedAtOpenAndLoadIndex) {
     {
         ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema));
         capture_fs->captured_skip_peer_cache.clear();
-        ASSERT_OK(segment->load_index());
+        ASSERT_OK(segment->load_index({}));
         ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
         EXPECT_FALSE(capture_fs->captured_skip_peer_cache[file_name].back());
     }
@@ -767,8 +773,8 @@ TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedThroughIteratorColumn
 
     DeltaColumnGroup dcg;
     dcg.init(/*version=*/1, {{2}}, {dcg_relative_file});
-    auto dcg_loader =
-            std::make_shared<FixedDeltaColumnGroupLoader>(DeltaColumnGroupList{std::make_shared<DeltaColumnGroup>(dcg)});
+    auto dcg_loader = std::make_shared<FixedDeltaColumnGroupLoader>(
+            DeltaColumnGroupList{std::make_shared<DeltaColumnGroup>(dcg)});
 
     auto run_scan = [&](bool skip_peer_cache) {
         ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{main_file}, 0, tablet_schema));
@@ -787,23 +793,26 @@ TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedThroughIteratorColumn
         EXPECT_EQ(5u, chunk->num_rows());
     };
 
-    // skip_peer_cache=true: both the normal column's data open and the DCG-covered column's data
-    // open carry suppression. (The DCG filename also records an earlier footer-read entry from
-    // opening the DCG child Segment through the parent's own _fs, which does not thread this
-    // query's policy -- that is the *other* leaf (segment.cpp's _open); .back() is the leaf under
-    // test here, the data open through SegmentReadOptions::fs.)
+    // skip_peer_cache=true: the normal column's data open, the DCG child segment's OWN footer open
+    // (Segment::new_dcg_segment -> Segment::open, through the parent's _fs) and the DCG-covered
+    // column's data open (through SegmentReadOptions::fs) all carry suppression. The DCG filename
+    // records exactly two opens -- the footer read and the data read -- both must match.
     run_scan(/*skip_peer_cache=*/true);
     ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[main_file].size());
     EXPECT_TRUE(capture_fs->captured_skip_peer_cache[main_file].back());
-    ASSERT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].empty());
-    EXPECT_TRUE(capture_fs->captured_skip_peer_cache[dcg_file].back());
+    ASSERT_EQ(2u, capture_fs->captured_skip_peer_cache[dcg_file].size());
+    for (bool suppressed : capture_fs->captured_skip_peer_cache[dcg_file]) {
+        EXPECT_TRUE(suppressed);
+    }
 
     // Control: default (peer allowed).
     run_scan(/*skip_peer_cache=*/false);
     ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[main_file].size());
     EXPECT_FALSE(capture_fs->captured_skip_peer_cache[main_file].back());
-    ASSERT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].empty());
-    EXPECT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].back());
+    ASSERT_EQ(2u, capture_fs->captured_skip_peer_cache[dcg_file].size());
+    for (bool suppressed : capture_fs->captured_skip_peer_cache[dcg_file]) {
+        EXPECT_FALSE(suppressed);
+    }
 }
 
 } // namespace starrocks

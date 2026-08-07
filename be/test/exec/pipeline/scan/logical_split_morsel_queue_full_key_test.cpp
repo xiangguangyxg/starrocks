@@ -213,7 +213,7 @@ public:
         std::string path = kDir + "/seg_" + std::to_string(_next_file_seq++) + ".dat";
         write_segment_file(schema, path, seg_id, begin, n, full_key);
         ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{path}, seg_id, schema));
-        CHECK_OK(segment->load_index());
+        CHECK_OK(segment->load_index({}));
         return segment;
     }
 
@@ -294,7 +294,7 @@ public:
         CHECK_OK(wf->close());
 
         ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{dst}, seg_id, schema));
-        CHECK_OK(segment->load_index());
+        CHECK_OK(segment->load_index({}));
         return segment;
     }
 

@@ -1677,7 +1677,8 @@ TEST_F(SegmentIteratorTest, PreparedRowRangeAndSeekHelpers) {
     }
 
     // Empty-range fast paths: no key bounds -> both helpers cover the whole segment without an index lookup.
-    ASSIGN_OR_ABORT(auto full_block_range, block_aligned_rowid_range_from_seek_ranges(segment.get(), {}, LakeIOOptions{}));
+    ASSIGN_OR_ABORT(auto full_block_range,
+                    block_aligned_rowid_range_from_seek_ranges(segment.get(), {}, LakeIOOptions{}));
     ASSERT_EQ(num_rows, full_block_range.span_size());
     ASSIGN_OR_ABORT(auto empty_rowid_ranges, segment_seek_ranges_to_rowid_ranges(segment, {}, LakeIOOptions{}));
     ASSERT_TRUE(empty_rowid_ranges.empty());
@@ -1686,7 +1687,7 @@ TEST_F(SegmentIteratorTest, PreparedRowRangeAndSeekHelpers) {
     // block_aligned_rowid_range_from_seek_ranges requires the index to be loaded first (per its contract);
     // segment_seek_ranges_to_rowid_ranges loads it internally.
     LakeIOOptions io_opts{.fill_data_cache = false};
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index(io_opts));
     // The SeekTuple key column must carry the segment's short-key length (INT index_length = 4). Without it
     // short_key_encode emits only a marker byte and every bound collapses to the same block (empty window).
     auto key_field = std::make_shared<Field>(0, "c0", TYPE_INT, -1, -1, false);
@@ -1810,7 +1811,7 @@ TEST_F(SegmentIteratorTest, FullSortKeyIndexSeekMatchesLegacyOnPointAndRangeQuer
     std::string file_name = kSegmentDir + "/full_sort_key_seek_dual";
     auto segment = write_and_open_segment(_fs, file_name, tablet_schema, *chunk, /*num_rows_per_block=*/10);
     ASSERT_EQ(num_rows, segment->num_rows());
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     // The dual-page write leaves the legacy page truncated; the full page is present.
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
 
@@ -1878,7 +1879,7 @@ TEST_F(SegmentIteratorTest, FullSortKeyIndexCharOverWidthSeekReturnsCorrectRows)
     ASSERT_EQ(num_rows, segment->num_rows());
 
     // Assert the dual-page write engaged the full-key index and it is usable under the read gate.
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
     ASSERT_TRUE(segment->use_full_sort_key_index({}));
     ASSERT_EQ(2U, segment->num_sort_key_columns());
@@ -1959,7 +1960,7 @@ TEST_F(SegmentIteratorTest, FullSortKeyIndexCharEmbeddedNulSeekReturnsCorrectRow
     ASSERT_EQ(num_rows, segment->num_rows());
 
     // Assert the dual-page write engaged the full-key index and it is usable under the read gate.
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
     ASSERT_TRUE(segment->use_full_sort_key_index({}));
     ASSERT_EQ(2U, segment->num_sort_key_columns());
@@ -2040,7 +2041,7 @@ TEST_F(SegmentIteratorTest, FullSortKeyIndexSchemaDriftBypassReturnsCorrectRows)
 
     // Assert the dual-page write engaged the full-key index (its own, non-drifted schema has a
     // single INT sort-key column) and it is usable under the read gate.
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
     ASSERT_TRUE(segment->use_full_sort_key_index({}));
     ASSERT_EQ(1U, segment->num_sort_key_columns());
@@ -2156,7 +2157,7 @@ TEST_F(SegmentIteratorTest, FullSortKeyIndexCharShortKeyRangeMatchesTypedSeek) {
     std::string file_name = kSegmentDir + "/full_sort_key_char_short_key_range";
     auto segment = write_and_open_segment(_fs, file_name, tablet_schema, *chunk, /*num_rows_per_block=*/group_size);
     ASSERT_EQ(num_rows, segment->num_rows());
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
     ASSERT_TRUE(segment->use_full_sort_key_index({}));
     ASSERT_EQ(2U, segment->num_sort_key_columns());

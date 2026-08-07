@@ -112,8 +112,12 @@ public:
                                                      const SegmentReadOptions& read_options,
                                                      ChunkIteratorPtr* reusable_slot);
 
+    // |lake_io_opts| is the CURRENT query's policy, threaded into the child segment's footer open
+    // (see Segment::open()'s own |lake_io_opts| caveat -- there is no once-per-Segment latching
+    // concern here since a fresh child Segment is opened on every call).
     StatusOr<std::shared_ptr<Segment>> new_dcg_segment(const DeltaColumnGroup& dcg, uint32_t idx,
-                                                       const TabletSchemaCSPtr& read_tablet_schema);
+                                                       const TabletSchemaCSPtr& read_tablet_schema,
+                                                       const LakeIOOptions& lake_io_opts);
 
     uint64_t id() const { return _segment_id; }
 
@@ -252,7 +256,9 @@ public:
 
     // Load and decode short key index.
     // May be called multiple times, subsequent calls will no op.
-    Status load_index(const LakeIOOptions& lake_io_opts = {});
+    // Required, not defaulted: a caller with no per-query policy must say so explicitly with `{}`,
+    // rather than silently defaulting to peer-allowed.
+    Status load_index(const LakeIOOptions& lake_io_opts);
     bool has_loaded_index() const;
 
     Status new_inverted_index_iterator(uint32_t cid, InvertedIndexIterator** iter, const SegmentReadOptions& opts,

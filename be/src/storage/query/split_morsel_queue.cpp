@@ -174,7 +174,8 @@ enum class TabletEncodingDecision { UNIFORM_LEGACY, UNIFORM_FULL_KEY, MIXED };
 // current sort-key signature must ALSO equal the segments' signature AND be full-key encodable; if either
 // fails, report MIXED so the tablet takes the unsplit fallback.
 StatusOr<TabletEncodingDecision> decide_tablet_encoding(const TabletSchemaCSPtr& tablet_schema,
-                                                        const std::vector<BaseRowsetSharedPtr>& rowsets) {
+                                                        const std::vector<BaseRowsetSharedPtr>& rowsets,
+                                                        const LakeIOOptions& lake_io_opts) {
     std::optional<SegmentEncodingSignature> ref;
     for (const auto& rowset : rowsets) {
         RETURN_IF_ERROR(rowset->load());
@@ -182,7 +183,7 @@ StatusOr<TabletEncodingDecision> decide_tablet_encoding(const TabletSchemaCSPtr&
             if (segment == nullptr || segment->num_rows() == 0) {
                 continue;
             }
-            RETURN_IF_ERROR(segment->load_index());
+            RETURN_IF_ERROR(segment->load_index(lake_io_opts));
 
             SegmentEncodingSignature sig;
             // Read gate: full-key only when the read config is on AND the full page is present, loads,
@@ -190,7 +191,7 @@ StatusOr<TabletEncodingDecision> decide_tablet_encoding(const TabletSchemaCSPtr&
             // corrupt/misordered full page, degrades this segment to legacy here -> UNIFORM_LEGACY
             // morsels (go-forward rollback / data-safe fallback). A true return also publishes the
             // full decoder, which _create_segment_group then binds into the SegmentGroup.
-            sig.is_full_key = segment->use_full_sort_key_index({});
+            sig.is_full_key = segment->use_full_sort_key_index(lake_io_opts);
             const auto& segment_schema = segment->tablet_schema();
             for (auto idx : segment_schema.sort_key_idxes()) {
                 const auto& column = segment_schema.column(idx);
@@ -475,11 +476,9 @@ Status PhysicalSplitMorselQueue::_init_segment() {
     if (_tablet_seek_ranges.empty()) {
         _segment_scan_range.add(Range<>(0, segment->num_rows()));
     } else {
-        RETURN_IF_ERROR(segment->load_index());
-        // No per-query LakeIOOptions is threaded into split planning; {} matches the pre-existing
-        // (peer-allowed) behavior of this path.
+        RETURN_IF_ERROR(segment->load_index(_lake_io_opts));
         ASSIGN_OR_RETURN(_segment_scan_range,
-                         block_aligned_rowid_range_from_seek_ranges(segment, _tablet_seek_ranges, LakeIOOptions{}));
+                         block_aligned_rowid_range_from_seek_ranges(segment, _tablet_seek_ranges, _lake_io_opts));
     }
 
     _segment_range_iter = _segment_scan_range.new_iterator();
@@ -793,8 +792,8 @@ StatusOr<SegmentGroupPtr> LogicalSplitMorselQueue::_create_segment_group(BaseRow
     }
 
     for (const auto& segment : segments) {
-        RETURN_IF_ERROR(segment->load_index());
-        if (_use_full_sort_key && !segment->ensure_full_sort_key_index_usable({})) {
+        RETURN_IF_ERROR(segment->load_index(_lake_io_opts));
+        if (_use_full_sort_key && !segment->ensure_full_sort_key_index_usable(_lake_io_opts)) {
             // decide_tablet_encoding only pins UNIFORM_FULL_KEY after every scanned segment reported a
             // usable full page, so this should not happen; if it does, fail rather than build the group
             // over a legacy decoder that would misread the full-key boundaries.
@@ -852,7 +851,8 @@ Status LogicalSplitMorselQueue::_init_tablet() {
     // the boundaries, BEFORE any merged SegmentGroup binary search. A mixed tablet cannot be logically
     // split: fall back to a single unsplit morsel (handled in try_get). A mismatched raw byte
     // comparison would silently drop rows, so this must never be approximated.
-    ASSIGN_OR_RETURN(auto encoding, decide_tablet_encoding(_tablet_schema, _tablet_rowsets[_tablet_idx]));
+    ASSIGN_OR_RETURN(auto encoding,
+                     decide_tablet_encoding(_tablet_schema, _tablet_rowsets[_tablet_idx], _lake_io_opts));
     if (encoding == TabletEncodingDecision::MIXED) {
         _tablet_unsplit = true;
         LOG(INFO) << "LogicalSplitMorselQueue: tablet " << _tablets[_tablet_idx]->tablet_id()

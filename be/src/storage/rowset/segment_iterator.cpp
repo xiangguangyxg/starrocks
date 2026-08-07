@@ -1905,7 +1905,8 @@ StatusOr<std::shared_ptr<Segment>> SegmentIterator::_get_dcg_segment(uint32_t uc
         if (idx.first >= 0) {
             ASSIGN_OR_RETURN(auto column_file, dcg->column_file_by_idx(parent_name(_segment->file_name()), idx.first));
             if (_dcg_segments.count(column_file) == 0) {
-                ASSIGN_OR_RETURN(auto dcg_segment, _segment->new_dcg_segment(*dcg, idx.first, _opts.tablet_schema));
+                ASSIGN_OR_RETURN(auto dcg_segment,
+                                 _segment->new_dcg_segment(*dcg, idx.first, _opts.tablet_schema, _opts.lake_io_opts));
                 _dcg_segments[column_file] = dcg_segment;
             }
             return _dcg_segments[column_file];
@@ -5093,7 +5094,8 @@ StatusOr<SparseRange<>> block_aligned_rowid_range_from_seek_ranges(Segment* segm
                                                           segment->num_rows(), lake_io_opts);
         }
         if (!range.lower().empty() && upper_rowid > 0) {
-            lower_rowid = lower_bound_block_aligned_rowid(segment, range.lower(), range.inclusive_lower(), lake_io_opts);
+            lower_rowid =
+                    lower_bound_block_aligned_rowid(segment, range.lower(), range.inclusive_lower(), lake_io_opts);
         }
         if (lower_rowid <= upper_rowid) {
             scan_range.add(Range<>(lower_rowid, upper_rowid));

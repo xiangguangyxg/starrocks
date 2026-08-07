@@ -312,7 +312,7 @@ TEST_F(SegmentFullSortKeyIndexTest, dual_page_presence_then_lazy_usable) {
     // Presence must not have loaded the full decoder yet.
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
 
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
     // Legacy load alone still must not touch the full page.
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
 
@@ -348,7 +348,7 @@ TEST_F(SegmentFullSortKeyIndexTest, read_off_never_reads_field11_and_malformed_f
         auto segment = open_segment(bad);
         EXPECT_TRUE(segment->has_full_sort_key_index_page()); // presence is footer-only
         EXPECT_FALSE(segment->use_full_sort_key_index({}));
-        ASSERT_OK(segment->load_index()); // reads field 9 only
+        ASSERT_OK(segment->load_index({})); // reads field 9 only
         std::vector<std::string> sk;
         ASSERT_OK(segment->get_short_key_index(&sk));
         EXPECT_FALSE(sk.empty());
@@ -361,7 +361,7 @@ TEST_F(SegmentFullSortKeyIndexTest, read_off_never_reads_field11_and_malformed_f
         EXPECT_FALSE(segment->use_full_sort_key_index({}));
         EXPECT_FALSE(segment->ensure_full_sort_key_index_usable({})); // permanent
         EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
-        ASSERT_OK(segment->load_index()); // legacy still fine
+        ASSERT_OK(segment->load_index({})); // legacy still fine
     }
 }
 
@@ -430,7 +430,7 @@ TEST_F(SegmentFullSortKeyIndexTest, concurrent_first_use_publishes_once) {
     config::enable_full_sort_key_index_read = true;
     auto path = write_segment("e_base", /*write_full=*/true);
     auto segment = open_segment(path);
-    ASSERT_OK(segment->load_index());
+    ASSERT_OK(segment->load_index({}));
 
     std::atomic<int> usable_count{0};
     auto worker = [&] {

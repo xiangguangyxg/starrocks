@@ -515,10 +515,10 @@ TEST_F(LakeScanTabletAdaptorCacheTest, QueryLevelPageCacheOffWins) {
 // somewhere along LakeScanCacheOptions -> LakeIOOptions -> RowsetReadOptions -> SegmentReadOptions.
 TEST_F(LakeScanTabletAdaptorCacheTest, SkipPeerCachePolicyIsHonored) {
     auto observed = run_lookup({.use_page_cache = true,
-                               .fill_data_cache = true,
-                               .fill_metadata_cache = true,
-                               .skip_disk_cache = false,
-                               .skip_peer_cache = true},
+                                .fill_data_cache = true,
+                                .fill_metadata_cache = true,
+                                .skip_disk_cache = false,
+                                .skip_peer_cache = true},
                                /*query_use_page_cache=*/true);
     ASSERT_TRUE(observed.seen);
     EXPECT_TRUE(observed.lake_io_opts.skip_peer_cache);

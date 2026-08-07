@@ -1362,7 +1362,7 @@ Status SegmentDump::dump_short_key_index(size_t key_column_count) {
         return st;
     }
 
-    st = _segment->load_index();
+    st = _segment->load_index({});
     if (!st.ok()) {
         std::cout << "load short key index failed: " << st << std::endl;
         return st;

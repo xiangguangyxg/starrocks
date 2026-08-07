@@ -616,7 +616,7 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
                                                          current_fileset_start_idx + 1 /* new fileset*/));
             }
         } // end Phase 2 per-segment loop
-    }     // end batch loop
+    } // end batch loop
     if (async_compact_cb) {
         TRACE_COUNTER_SCOPE_LATENCY_US("early_sst_compact_wait_us");
         RETURN_IF_ERROR(async_compact_cb->wait_for());
@@ -1712,7 +1712,7 @@ static StatusOr<std::shared_ptr<Segment>> get_lake_dcg_segment(GetDeltaColumnCon
         const auto& column_file = column_file_result.value();
 
         if (ctx.dcg_segments.count(column_file) == 0) {
-            auto dcg_segment_result = ctx.segment->new_dcg_segment(*dcg, idx.first, read_tablet_schema);
+            auto dcg_segment_result = ctx.segment->new_dcg_segment(*dcg, idx.first, read_tablet_schema, {});
             if (!dcg_segment_result.ok()) {
                 return Status::InternalError(fmt::format("Failed to create DCG segment for column {}: {}", ucid,
                                                          dcg_segment_result.status().to_string()));

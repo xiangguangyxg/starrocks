@@ -11512,7 +11512,7 @@ TEST_F(LakeTabletReshardTest, test_pk_tablet_splitting_full_sort_key_index_conse
         ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString(file_info.path));
         auto tablet_schema = TabletSchema::create(metadata.schema());
         ASSIGN_OR_ABORT(auto segment, Segment::open(fs, file_info, 0, tablet_schema));
-        ASSERT_OK(segment->load_index());
+        ASSERT_OK(segment->load_index({}));
         ASSERT_TRUE(segment->has_full_sort_key_index_page())
                 << "test setup bug: segment must carry the full sort-key short key index";
     }
@@ -11648,7 +11648,7 @@ TEST_F(LakeTabletReshardTest, test_pk_tablet_splitting_mixed_legacy_and_full_key
         file_info.path = _tablet_manager->segment_location(tablet_id, legacy_seg_name);
         ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString(file_info.path));
         ASSIGN_OR_ABORT(auto segment, Segment::open(fs, file_info, 0, tablet_schema));
-        ASSERT_OK(segment->load_index());
+        ASSERT_OK(segment->load_index({}));
         ASSERT_FALSE(segment->has_full_sort_key_index_page())
                 << "test setup bug: the legacy segment must NOT carry the full sort-key index";
     }
@@ -11657,7 +11657,7 @@ TEST_F(LakeTabletReshardTest, test_pk_tablet_splitting_mixed_legacy_and_full_key
         file_info.path = _tablet_manager->segment_location(tablet_id, full_key_seg_name);
         ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString(file_info.path));
         ASSIGN_OR_ABORT(auto segment, Segment::open(fs, file_info, 0, tablet_schema));
-        ASSERT_OK(segment->load_index());
+        ASSERT_OK(segment->load_index({}));
         ASSERT_TRUE(segment->has_full_sort_key_index_page())
                 << "test setup bug: this segment must carry the full sort-key index";
     }
