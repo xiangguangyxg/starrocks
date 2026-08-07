@@ -729,6 +729,63 @@ TEST_F(PersistentIndexSstableTest, test_sst_open_retry_after_clear_corrupted_cac
 
     ASSERT_OK(st);
 }
+
+// Self-heal: the retry above must not be allowed to re-read the bytes that were just dropped as
+// corrupted, so its open bypasses the local disk cache and peer BEs. The recovery test above
+// observes only the final Status and so cannot see the retry's options; observe them directly.
+TEST_F(PersistentIndexSstableTest, test_sst_open_retry_bypasses_disk_and_peer_cache) {
+    auto location_provider = std::make_shared<FixedLocationProvider>(kTestDir);
+    auto metadata = std::make_shared<TabletMetadata>();
+    TabletManager tablet_mgr(location_provider, 1024);
+    metadata->set_id(10002);
+    ASSERT_OK(fs::create_directories(lake::join_path(kTestDir, lake::kSegmentDirectoryName)));
+
+    const std::string filename = "open_retry_bypass_cache.sst";
+    const std::string path = tablet_mgr.sst_location(metadata->id(), filename);
+    uint64_t filesize = 0;
+    build_test_sst(path, &filesize);
+
+    bool old = config::lake_clear_corrupted_cache_data;
+    config::lake_clear_corrupted_cache_data = true;
+
+    bool injected = false;
+    int retry_opens = 0;
+    bool skip_disk_cache = false;
+    bool skip_peer_cache = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([old]() {
+        SyncPoint::GetInstance()->ClearCallBack("PersistentIndexSstable::init:table_open_error");
+        SyncPoint::GetInstance()->ClearCallBack("PersistentIndexSstable::drop_corrupted_cache");
+        SyncPoint::GetInstance()->ClearCallBack("PersistentIndexSstable::retry_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+        config::lake_clear_corrupted_cache_data = old;
+    });
+    SyncPoint::GetInstance()->SetCallBack("PersistentIndexSstable::init:table_open_error", [&](void* arg) {
+        if (!injected) {
+            injected = true;
+            *(Status*)arg = Status::Corruption("inject_open_corruption");
+        }
+    });
+    SyncPoint::GetInstance()->SetCallBack("PersistentIndexSstable::drop_corrupted_cache",
+                                          [](void* arg) { *(Status*)arg = Status::OK(); });
+    SyncPoint::GetInstance()->SetCallBack("PersistentIndexSstable::retry_open_options", [&](void* arg) {
+        retry_opens++;
+        const auto* opts = static_cast<RandomAccessFileOptions*>(arg);
+        skip_disk_cache = opts->skip_disk_cache;
+        skip_peer_cache = opts->skip_peer_cache;
+    });
+
+    auto sst = std::make_unique<PersistentIndexSstable>();
+    ASSIGN_OR_ABORT(auto rf, fs::new_random_access_file(path));
+    PersistentIndexSstablePB sstable_pb;
+    sstable_pb.set_filename(filename);
+    sstable_pb.set_filesize(filesize);
+    ASSERT_OK(sst->init(std::move(rf), sstable_pb, nullptr, true, nullptr, metadata, &tablet_mgr));
+
+    ASSERT_EQ(1, retry_opens); // positive control: the retry open really happened
+    EXPECT_TRUE(skip_disk_cache);
+    EXPECT_TRUE(skip_peer_cache);
+}
 #endif // USE_STAROS && !BUILD_FORMAT_LIB
 
 TEST_F(PersistentIndexSstableTest, test_metric_sst_multiget_read_error) {

@@ -2679,7 +2679,7 @@ TEST_F(LakeServiceTest, test_aggregate_compact_persisted_log_is_dual_written) {
     // after-load, which clears the legacy arrays). This mirrors how save_lake_protobuf wrote the file.
     CombinedTxnLogPB on_disk;
     ProtobufFileWithHeader file(path, LAKE_META_HEADER_MAGIC_NUMBER, /*allow_plain_protobuf_fallback=*/true);
-    ASSERT_OK(file.load(&on_disk, /*fill_cache=*/false));
+    ASSERT_OK(file.load(&on_disk, {.fill_cache = false}));
     ASSERT_EQ(1, on_disk.txn_logs_size());
     const auto& out_rs = on_disk.txn_logs(0).op_compaction().output_rowset();
     // The structured segment_metas is preserved, and the dual-write rebuilt the legacy array from it.

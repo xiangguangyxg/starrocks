@@ -1386,7 +1386,8 @@ static StatusOr<TabletMetadataPtr> get_tablet_metadata(const string& metadata_lo
     // Auto-detect the checksummed header format and fall back to legacy headerless protobuf.
     ProtobufFileWithHeader file(metadata_location, LAKE_META_HEADER_MAGIC_NUMBER,
                                 /*allow_plain_protobuf_fallback=*/true);
-    RETURN_IF_ERROR_WITH_WARN(file.load(metadata.get(), fill_cache), "Failed to load " + metadata_location);
+    RETURN_IF_ERROR_WITH_WARN(file.load(metadata.get(), {.fill_cache = fill_cache}),
+                              "Failed to load " + metadata_location);
     // Back-fill segment_metas from the deprecated legacy arrays for pre-feature metadata, so the
     // reference-file check below (which reads segment_metas) protects every live segment from GC.
     normalize_tablet_metadata_after_load(metadata.get());

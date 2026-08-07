@@ -92,10 +92,10 @@ static Status save_lake_protobuf(const std::string& path, const ::google::protob
 
 // Load a lake metadata/txn-log protobuf. Auto-detects the checksummed header format and
 // falls back to legacy headerless protobuf, regardless of lake_enable_protobuf_file_checksum.
-static Status load_lake_protobuf(const std::string& path, ::google::protobuf::Message* message, bool fill_cache,
-                                 const std::shared_ptr<FileSystem>& fs = nullptr, bool skip_peer_cache = false) {
+static Status load_lake_protobuf(const std::string& path, ::google::protobuf::Message* message,
+                                 const ProtobufFileReadOptions& opts, const std::shared_ptr<FileSystem>& fs = nullptr) {
     ProtobufFileWithHeader file(path, fs, LAKE_META_HEADER_MAGIC_NUMBER, /*allow_plain_protobuf_fallback=*/true);
-    return file.load(message, fill_cache, skip_peer_cache);
+    return file.load(message, opts);
 }
 
 #if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
@@ -730,13 +730,20 @@ StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& me
     TEST_ERROR_POINT("TabletManager::load_tablet_metadata");
     auto t0 = butil::gettimeofday_us();
     auto metadata = std::make_shared<TabletMetadataPB>();
-    auto s = load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs, skip_peer_cache);
+    auto s = load_lake_protobuf(metadata_location, metadata.get(),
+                                {.fill_cache = fill_data_cache, .skip_peer_cache = skip_peer_cache}, fs);
     if (!s.ok()) {
         RETURN_IF_ERROR(corrupted_tablet_meta_handler(s, metadata_location));
         // reset metadata
         metadata = std::make_shared<TabletMetadataPB>();
-        // read again
-        RETURN_IF_ERROR(load_lake_protobuf(metadata_location, metadata.get(), fill_data_cache, fs, skip_peer_cache));
+        // Read again, bypassing both the local disk cache and peer BEs. The handler above just
+        // dropped this file's corrupted local cache entry; without the bypass the re-read could be
+        // served the very bytes that were dropped -- from the entry a concurrent reader
+        // repopulated, or from a peer that cached the same corruption -- and self-heal would spin
+        // instead of converging on authoritative storage.
+        RETURN_IF_ERROR(load_lake_protobuf(
+                metadata_location, metadata.get(),
+                {.fill_cache = fill_data_cache, .skip_disk_cache = true, .skip_peer_cache = true}, fs));
     }
 
     // Back-fill segment_metas from the deprecated legacy arrays for rowsets written by a
@@ -1036,8 +1043,17 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
     auto bundle_metadata_status = parse_bundle_tablet_metadata(path, serialized_string);
     if (!bundle_metadata_status.ok()) {
         RETURN_IF_ERROR(corrupted_tablet_meta_handler(bundle_metadata_status.status(), path));
-        // read bundle metadata again
-        ASSIGN_OR_RETURN(auto input_file, file_system->new_random_access_file(opts, path));
+        // Read the bundle metadata again, bypassing both the local disk cache and peer BEs, so the
+        // retry cannot be served the corruption the handler above just dropped. Copy |opts| rather
+        // than rebuilding it, so the retry is the same open with the caches bypassed and inherits
+        // anything else the first read carried (encryption info, buffer size). It is a separate
+        // object rather than a mutation of |opts| because the bypass belongs to this one re-read,
+        // while |opts| is what the singleflight'd first read was issued with.
+        RandomAccessFileOptions retry_opts = opts;
+        retry_opts.skip_disk_cache = true;
+        retry_opts.skip_peer_cache = true;
+        TEST_SYNC_POINT_CALLBACK("TabletManager::metadata_retry_open_options", &retry_opts);
+        ASSIGN_OR_RETURN(auto input_file, file_system->new_random_access_file(retry_opts, path));
         ASSIGN_OR_RETURN(serialized_string, input_file->read_all());
         file_size = serialized_string.size();
         ASSIGN_OR_RETURN(bundle_metadata, parse_bundle_tablet_metadata(path, serialized_string));
@@ -1167,7 +1183,7 @@ StatusOr<TxnLogPtr> TabletManager::load_txn_log(const std::string& txn_log_path,
     TEST_ERROR_POINT("TabletManager::load_txn_log");
     auto t0 = butil::gettimeofday_us();
     auto meta = std::make_shared<TxnLog>();
-    RETURN_IF_ERROR(load_lake_protobuf(txn_log_path, meta.get(), fill_cache));
+    RETURN_IF_ERROR(load_lake_protobuf(txn_log_path, meta.get(), {.fill_cache = fill_cache}));
     // Back-fill the structured fields from the deprecated legacy arrays for logs written by a pre-feature BE.
     normalize_txn_log_after_load(meta.get());
     auto t1 = butil::gettimeofday_us();
@@ -1201,7 +1217,7 @@ StatusOr<TxnLogPtr> TabletManager::get_txn_log(const std::string& path, bool fil
 StatusOr<CombinedTxnLogPtr> TabletManager::load_combined_txn_log(const std::string& path, bool fill_cache) {
     TEST_ERROR_POINT("TabletManager::get_combined_txn_log");
     auto log = std::make_shared<CombinedTxnLogPB>();
-    RETURN_IF_ERROR(load_lake_protobuf(path, log.get(), fill_cache));
+    RETURN_IF_ERROR(load_lake_protobuf(path, log.get(), {.fill_cache = fill_cache}));
     // Back-fill the structured fields from the deprecated legacy arrays for logs written by a pre-feature BE.
     for (auto& txn_log : *log->mutable_txn_logs()) {
         normalize_txn_log_after_load(&txn_log);

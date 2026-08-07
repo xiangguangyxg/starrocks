@@ -329,4 +329,65 @@ TEST(LakeProtobufFileTest, empty_file_rejected_in_fallback) {
     }
 }
 
+// load() picks between a random-access and a sequential open, and the read policy has to survive
+// both. Both branches are live: the lake callers all enable the legacy fallback and so take the
+// random-access one, while the sequential one carries the shared-nothing reads (tablet meta, delta
+// column groups, replication txn meta). That split is what makes the sequential branch the place a
+// dropped field hides -- it is the branch the cache policy has no visible effect on today, and a
+// field consumed on the other branch produces no unused-parameter warning here. Pin it directly by
+// disabling the fallback.
+TEST(LakeProtobufFileTest, sequential_open_forwards_read_options) {
+    const std::string kFileName = lake_test_file_name();
+    DeferOp defer([&]() { std::filesystem::remove(kFileName); });
+
+    auto meta = make_sample_meta();
+    {
+        ProtobufFileWithHeader writer(kFileName, LAKE_META_HEADER_MAGIC_NUMBER,
+                                      /*allow_plain_protobuf_fallback=*/true);
+        ASSERT_OK(writer.save(meta, true));
+    }
+
+    int sequential_opens = 0;
+    int random_opens = 0;
+    bool skip_fill_local_cache = false;
+    bool skip_disk_cache = false;
+    bool skip_peer_cache = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp sync_defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::sequential_open_options");
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::sequential_open_options", [&](void* arg) {
+        sequential_opens++;
+        const auto* o = static_cast<SequentialFileOptions*>(arg);
+        skip_fill_local_cache = o->skip_fill_local_cache;
+        skip_disk_cache = o->skip_disk_cache;
+        skip_peer_cache = o->skip_peer_cache;
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options",
+                                          [&](void* /*arg*/) { random_opens++; });
+
+    // Fallback disabled => the sequential branch, and the file still reads because the magic matches.
+    ProtobufFileWithHeader file(kFileName, LAKE_META_HEADER_MAGIC_NUMBER, /*allow_plain_protobuf_fallback=*/false);
+
+    TabletMetaPB out;
+    ASSERT_OK(file.load(&out, {.fill_cache = false, .skip_disk_cache = true, .skip_peer_cache = true}));
+    expect_meta_eq(meta, out);
+    // Positive controls: the sequential open really happened, and the other branch was not taken.
+    ASSERT_EQ(1, sequential_opens);
+    ASSERT_EQ(0, random_opens);
+    EXPECT_TRUE(skip_fill_local_cache);
+    EXPECT_TRUE(skip_disk_cache);
+    EXPECT_TRUE(skip_peer_cache);
+
+    // Default options leave every bit off, so the assertions above cannot pass vacuously.
+    TabletMetaPB out2;
+    ASSERT_OK(file.load(&out2));
+    ASSERT_EQ(2, sequential_opens);
+    EXPECT_FALSE(skip_fill_local_cache);
+    EXPECT_FALSE(skip_disk_cache);
+    EXPECT_FALSE(skip_peer_cache);
+}
+
 } // namespace starrocks

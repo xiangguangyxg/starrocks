@@ -48,6 +48,21 @@ private:
     std::shared_ptr<FileSystem> _fs;
 };
 
+// Read policy for ProtobufFileWithHeader::load(). The fields mirror the same-named ones on
+// RandomAccessFileOptions / SequentialFileOptions (fs/fs.h); load() applies all of them to
+// whichever of the two it opens, so a policy cannot be honored on one branch and dropped on the
+// other. Passed as a struct rather than positional bools so every call site names what it sets.
+struct ProtobufFileReadOptions {
+    // false => open with skip_fill_local_cache, i.e. do not populate the local disk cache.
+    bool fill_cache = true;
+    // Read straight from authoritative storage, bypassing the local disk cache. Set by the
+    // self-heal re-read that follows dropping a corrupted cache entry.
+    bool skip_disk_cache = false;
+    // Skip cross-BE peer cache reads for this open. See RandomAccessFileOptions::skip_peer_cache
+    // (fs/fs.h) for the full rationale.
+    bool skip_peer_cache = false;
+};
+
 // Reads/writes a protobuf message prefixed with a FixedFileHeader that carries an Adler-32
 // checksum over the serialized message.
 //
@@ -76,7 +91,7 @@ public:
 
     Status save(const ::google::protobuf::Message& message, bool sync = true);
 
-    Status load(::google::protobuf::Message* message, bool fill_cache = true, bool skip_peer_cache = false);
+    Status load(::google::protobuf::Message* message, const ProtobufFileReadOptions& opts = {});
 
     static Status load_from_buffer(::google::protobuf::Message* message, std::string_view data,
                                    uint64_t magic = OLAP_FIX_HEADER_MAGIC_NUMBER,

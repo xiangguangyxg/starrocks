@@ -149,6 +149,136 @@ TEST_F(LakeTabletManagerTest, tablet_meta_read_corrupted_and_recover) {
     EXPECT_EQ(res.value()->version(), 2);
 }
 
+// Self-heal: once the corrupted metadata file has had its local cache entry dropped, the
+// immediately following re-read must bypass both the local disk cache and peer BEs, or it can be
+// handed back the very bytes that were just dropped. tablet_meta_read_corrupted_and_recover above
+// observes only the final Status; the open_options hook fires on *both* opens, so record them in
+// order and check the policy changed between them.
+TEST_F(LakeTabletManagerTest, tablet_meta_self_heal_reread_bypasses_disk_and_peer_cache) {
+    struct OpenPolicy {
+        bool skip_fill_local_cache;
+        bool skip_disk_cache;
+        bool skip_peer_cache;
+    };
+
+    auto read_with_first_open_corrupted = [&](bool fill_cache, std::vector<OpenPolicy>* opens) {
+        starrocks::TabletMetadata metadata;
+        auto tablet_id = next_id();
+        metadata.set_id(tablet_id);
+        metadata.set_version(2);
+        ASSERT_OK(_tablet_manager->put_tablet_metadata(metadata));
+        // put_tablet_metadata() warmed the metacache; prune so the read below is a genuinely cold
+        // open that reaches ProtobufFileWithHeader::load rather than a metacache hit.
+        _tablet_manager->metacache()->prune();
+
+        bool first_read = true;
+        SyncPoint::GetInstance()->EnableProcessing();
+        DeferOp defer([]() {
+            SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::load::corruption");
+            SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+            SyncPoint::GetInstance()->ClearCallBack("TabletManager::corrupted_tablet_meta_handler");
+            SyncPoint::GetInstance()->DisableProcessing();
+        });
+        SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+            const auto* o = static_cast<RandomAccessFileOptions*>(arg);
+            opens->push_back({o->skip_fill_local_cache, o->skip_disk_cache, o->skip_peer_cache});
+        });
+        SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::load::corruption", [&](void* arg) {
+            if (first_read) {
+                first_read = false;
+                *(Status*)arg = Status::Corruption("injected error");
+            }
+        });
+        SyncPoint::GetInstance()->SetCallBack("TabletManager::corrupted_tablet_meta_handler",
+                                              [](void* arg) { *(Status*)arg = Status::OK(); });
+
+        auto res = _tablet_manager->get_tablet_metadata(tablet_id, 2, fill_cache);
+        ASSERT_TRUE(res.ok()) << res.status();
+        ASSERT_EQ(tablet_id, res.value()->id());
+    };
+
+    std::vector<OpenPolicy> opens;
+    read_with_first_open_corrupted(/*fill_cache=*/true, &opens);
+    ASSERT_EQ(2u, opens.size()); // positive control: the first open plus the self-heal re-read
+    EXPECT_FALSE(opens[0].skip_disk_cache);
+    EXPECT_FALSE(opens[0].skip_peer_cache);
+    EXPECT_TRUE(opens[1].skip_disk_cache);
+    EXPECT_TRUE(opens[1].skip_peer_cache);
+    // The bypass is about where the bytes are *read* from; it does not stop the fresh bytes from
+    // being cached, so fill_cache=true still leaves skip_fill_local_cache off on the re-read.
+    EXPECT_FALSE(opens[0].skip_fill_local_cache);
+    EXPECT_FALSE(opens[1].skip_fill_local_cache);
+
+    // fill_cache=false: the bypass is layered on top of the caller's fill-cache policy rather than
+    // replacing it, so a metadata read that was already not populating the cache still self-heals.
+    std::vector<OpenPolicy> no_fill_opens;
+    read_with_first_open_corrupted(/*fill_cache=*/false, &no_fill_opens);
+    ASSERT_EQ(2u, no_fill_opens.size());
+    EXPECT_TRUE(no_fill_opens[0].skip_fill_local_cache);
+    EXPECT_TRUE(no_fill_opens[1].skip_fill_local_cache);
+    EXPECT_FALSE(no_fill_opens[0].skip_disk_cache);
+    EXPECT_TRUE(no_fill_opens[1].skip_disk_cache);
+    EXPECT_TRUE(no_fill_opens[1].skip_peer_cache);
+}
+
+// A cache write landing while the corrupted entry is being dropped must not change what the read
+// returns. The load-bearing assertion is that the re-read is still issued with the disk cache
+// bypassed, which is what keeps a repopulated on-disk entry -- invisible to a unit test, since
+// there is no real disk cache here -- out of the result.
+//
+// The returned-value assertion is a weaker guard, and worth naming as such: it holds today by
+// ordering rather than by the bypass, because this call passed the metacache lookup before the
+// handler runs and the loaded value overwrites the entry on the way out. It pins that ordering
+// against future change; it is not evidence of concurrency safety.
+TEST_F(LakeTabletManagerTest, tablet_meta_self_heal_reread_unaffected_by_cache_write_during_drop) {
+    constexpr int64_t kDurableCommitTime = 777;
+    constexpr int64_t kStaleCommitTime = 111;
+
+    starrocks::TabletMetadata metadata;
+    auto tablet_id = next_id();
+    metadata.set_id(tablet_id);
+    metadata.set_version(2);
+    metadata.set_commit_time(kDurableCommitTime);
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(metadata));
+    auto path = _tablet_manager->tablet_metadata_location(tablet_id, 2);
+    _tablet_manager->metacache()->prune();
+
+    bool first_read = true;
+    int bypassing_opens = 0;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::load::corruption");
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::corrupted_tablet_meta_handler");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::load::corruption", [&](void* arg) {
+        if (first_read) {
+            first_read = false;
+            *(Status*)arg = Status::Corruption("injected error");
+        }
+    });
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+        if (static_cast<RandomAccessFileOptions*>(arg)->skip_disk_cache) {
+            bypassing_opens++;
+        }
+    });
+    // Stands in for whatever writes the entry back while the drop is in progress.
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::corrupted_tablet_meta_handler", [&](void* arg) {
+        auto stale = std::make_shared<starrocks::TabletMetadataPB>();
+        stale->set_id(tablet_id);
+        stale->set_version(2);
+        stale->set_commit_time(kStaleCommitTime);
+        _tablet_manager->metacache()->cache_tablet_metadata(path, std::move(stale));
+        *(Status*)arg = Status::OK();
+    });
+
+    auto res = _tablet_manager->get_tablet_metadata(tablet_id, 2);
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(1, bypassing_opens); // positive control: the bypassing re-read actually happened
+    EXPECT_EQ(kDurableCommitTime, res.value()->commit_time()); // ordering guard, see above
+}
+
 // NOLINTNEXTLINE
 TEST_F(LakeTabletManagerTest, txnlog_write_and_read) {
     starrocks::TxnLog txnLog;
@@ -1292,6 +1422,88 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_propagates_skip_peer_ca
     ASSERT_TRUE(res.ok()) << res.status();
     ASSERT_EQ(2, callback_count);
     EXPECT_FALSE(captured_skip_peer_cache);
+}
+
+// Self-heal, bundled-metadata variant: the re-read after a dropped corrupted bundle must carry the
+// bypass on its own options object. The first read's options are shared with whatever other callers
+// the singleflight coalesced, so the bypass has to be scoped to this one retry.
+TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_peer_cache) {
+    auto tablet_id = next_id();
+    TabletSchemaPB schema_pb;
+    schema_pb.set_id(10);
+    schema_pb.set_num_short_key_columns(1);
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_rows_per_row_block(65535);
+    auto c0 = schema_pb.add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+
+    starrocks::TabletMetadataPB metadata1;
+    metadata1.set_id(tablet_id);
+    metadata1.set_version(2);
+    metadata1.mutable_schema()->CopyFrom(schema_pb);
+    (*metadata1.mutable_historical_schemas())[10].CopyFrom(schema_pb);
+
+    std::map<int64_t, TabletMetadataPB> metadatas;
+    metadatas.emplace(tablet_id, metadata1);
+    ASSERT_OK(_tablet_manager->put_bundle_tablet_metadata(metadatas));
+
+    int first_opens = 0;
+    int retry_opens = 0;
+    const void* first_opts_addr = nullptr;
+    const void* retry_opts_addr = nullptr;
+    bool first_skip_disk_cache = true;
+    bool retry_skip_disk_cache = false;
+    bool retry_skip_peer_cache = false;
+    bool inject_corruption = true;
+
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::parse_bundle_tablet_metadata::corruption");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::corrupted_tablet_meta_handler");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_retry_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::parse_bundle_tablet_metadata::corruption", [&](void* arg) {
+        if (inject_corruption) {
+            inject_corruption = false;
+            *(bool*)arg = true;
+        }
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::corrupted_tablet_meta_handler",
+                                          [](void* arg) { *(Status*)arg = Status::OK(); });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options", [&](void* arg) {
+        first_opens++;
+        first_opts_addr = arg;
+        first_skip_disk_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_disk_cache;
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_retry_open_options", [&](void* arg) {
+        retry_opens++;
+        retry_opts_addr = arg;
+        const auto* o = static_cast<RandomAccessFileOptions*>(arg);
+        retry_skip_disk_cache = o->skip_disk_cache;
+        retry_skip_peer_cache = o->skip_peer_cache;
+    });
+
+    // put_bundle_tablet_metadata() warmed the metacache; prune so the read below really opens the
+    // bundle file instead of returning the cached per-tablet metadata.
+    _tablet_manager->metacache()->prune();
+    auto res = _tablet_manager->get_single_tablet_metadata(tablet_id, 2);
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(tablet_id, res.value()->id());
+
+    // Positive controls: both opens happened, exactly once each.
+    ASSERT_EQ(1, first_opens);
+    ASSERT_EQ(1, retry_opens);
+    EXPECT_FALSE(first_skip_disk_cache);
+    EXPECT_TRUE(retry_skip_disk_cache);
+    EXPECT_TRUE(retry_skip_peer_cache);
+    // ...and the retry did not simply reuse (or mutate) the first read's options object.
+    EXPECT_NE(first_opts_addr, retry_opts_addr);
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {

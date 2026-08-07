@@ -71,7 +71,7 @@ Status ProtobufFileWithHeader::save(const ::google::protobuf::Message& message, 
     return Status::OK();
 }
 
-Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool fill_cache, bool skip_peer_cache) {
+Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, const ProtobufFileReadOptions& opts) {
     std::shared_ptr<FileSystem> fs;
     if (_fs) {
         fs = _fs;
@@ -83,9 +83,11 @@ Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool f
     // shorter than the header or simply lack the magic, in which case the whole content has to be
     // parsed as a plain protobuf. Read it all and dispatch through the buffer-based loader.
     if (_allow_plain_protobuf_fallback) {
-        RandomAccessFileOptions opts{.skip_fill_local_cache = !fill_cache, .skip_peer_cache = skip_peer_cache};
-        TEST_SYNC_POINT_CALLBACK("ProtobufFileWithHeader::open_options", &opts);
-        ASSIGN_OR_RETURN(auto input_file, fs->new_random_access_file(opts, _path));
+        RandomAccessFileOptions file_opts{.skip_fill_local_cache = !opts.fill_cache,
+                                          .skip_disk_cache = opts.skip_disk_cache,
+                                          .skip_peer_cache = opts.skip_peer_cache};
+        TEST_SYNC_POINT_CALLBACK("ProtobufFileWithHeader::open_options", &file_opts);
+        ASSIGN_OR_RETURN(auto input_file, fs->new_random_access_file(file_opts, _path));
         ASSIGN_OR_RETURN(auto content, input_file->read_all());
         Status st = load_from_buffer(message, content, _magic, /*allow_plain_protobuf_fallback=*/true);
 #ifdef BE_TEST
@@ -94,8 +96,14 @@ Status ProtobufFileWithHeader::load(::google::protobuf::Message* message, bool f
         return st;
     }
 
-    SequentialFileOptions opts{.skip_fill_local_cache = !fill_cache};
-    ASSIGN_OR_RETURN(auto input_file, fs->new_sequential_file(opts, _path));
+    SequentialFileOptions file_opts{.skip_fill_local_cache = !opts.fill_cache,
+                                    .skip_disk_cache = opts.skip_disk_cache,
+                                    .skip_peer_cache = opts.skip_peer_cache};
+    // Deliberately a different sync point name from the branch above: the argument type differs
+    // (SequentialFileOptions vs RandomAccessFileOptions), so a shared name would hand existing
+    // callbacks a pointer of the wrong type.
+    TEST_SYNC_POINT_CALLBACK("ProtobufFileWithHeader::sequential_open_options", &file_opts);
+    ASSIGN_OR_RETURN(auto input_file, fs->new_sequential_file(file_opts, _path));
 
     FixedFileHeader header;
     ASSIGN_OR_RETURN(auto nread, input_file->read(&header, sizeof(header)));

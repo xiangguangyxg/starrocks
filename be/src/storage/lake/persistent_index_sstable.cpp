@@ -86,11 +86,16 @@ Status PersistentIndexSstable::init(std::unique_ptr<RandomAccessFile> rf, const 
             if (tablet_mgr == nullptr) {
                 return Status::InvalidArgument("tablet_mgr is null when loading sst file");
             }
-            RandomAccessFileOptions opts;
+            // Re-open bypassing both the local disk cache and peer BEs: drop_corrupted_sstable_cache
+            // above just dropped this file's corrupted local cache entry, and without the bypass the
+            // retry could be handed the same bytes back -- from the entry a concurrent reader
+            // repopulated, or from a peer that cached the same corruption.
+            RandomAccessFileOptions opts{.skip_disk_cache = true, .skip_peer_cache = true};
             if (!sstable_pb.encryption_meta().empty()) {
                 ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(sstable_pb.encryption_meta()));
                 opts.encryption_info = std::move(info);
             }
+            TEST_SYNC_POINT_CALLBACK("PersistentIndexSstable::retry_open_options", &opts);
             ASSIGN_OR_RETURN(rf, fs::new_random_access_file(
                                          opts, tablet_mgr->sst_location(metadata->id(), sstable_pb.filename())));
             open_st = sstable::Table::Open(options, rf.get(), sstable_pb.filesize(), table);

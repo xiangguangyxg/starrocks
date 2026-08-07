@@ -351,9 +351,9 @@ public:
         if (info.size.has_value()) {
             opt.file_size = info.size.value();
         }
-        // skip_disk_cache is included deliberately: the §12.4 self-heal re-read sets it, and
-        // that read must be provably peer-free at this boundary rather than relying on starlet
-        // to suppress it later.
+        // skip_disk_cache is included deliberately: the self-heal re-read that follows an
+        // invalidating cache drop sets it, and that read must be provably peer-free at this
+        // boundary rather than relying on starlet to suppress it later.
         if (!opts.skip_peer_cache && !opts.skip_disk_cache) {
             auto snapshot = get_staros_worker()->get_peer_read_options(pair.second);
             opt.peer_candidates = std::move(snapshot.candidates);
@@ -386,9 +386,9 @@ public:
         opt.skip_fill_local_cache = opts.skip_fill_local_cache;
         opt.buffer_size = opts.buffer_size;
         opt.skip_read_local_cache = opts.skip_disk_cache;
-        // skip_disk_cache is included deliberately: the §12.4 self-heal re-read sets it, and
-        // that read must be provably peer-free at this boundary rather than relying on starlet
-        // to suppress it later.
+        // skip_disk_cache is included deliberately: the self-heal re-read that follows an
+        // invalidating cache drop sets it, and that read must be provably peer-free at this
+        // boundary rather than relying on starlet to suppress it later.
         if (!opts.skip_peer_cache && !opts.skip_disk_cache) {
             auto snapshot = get_staros_worker()->get_peer_read_options(pair.second);
             opt.peer_candidates = std::move(snapshot.candidates);
