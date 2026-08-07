@@ -765,7 +765,7 @@ StatusOr<std::vector<SegmentSharedPtr>> Rowset::get_segments_checked() {
     }
     // Propagate a transient load failure as its real (retryable) Status instead of swallowing it;
     // _segments_loaded stays false so a later call retries.
-    ASSIGN_OR_RETURN(auto segs, segments(true));
+    ASSIGN_OR_RETURN(auto segs, segments(_lake_io_opts));
     _segments = std::move(segs);
     _segments_loaded = true;
     return _segments;

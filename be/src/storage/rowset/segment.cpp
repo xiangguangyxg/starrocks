@@ -43,6 +43,7 @@
 #include "base/failpoint/fail_point.h"
 #include "base/hash/crc32c.h"
 #include "base/string/slice.h"
+#include "base/testutil/sync_point.h"
 #include "base/utility/defer_op.h"
 #include "column/column_access_path.h"
 #include "column/flat_json/json_flat_path.h"
@@ -273,6 +274,9 @@ Status Segment::_open(size_t* footer_length_hint, const FooterPointerPB* partial
     RandomAccessFileOptions opts{.skip_fill_local_cache = !lake_io_opts.fill_data_cache,
                                  .buffer_size = lake_io_opts.buffer_size,
                                  .skip_peer_cache = lake_io_opts.skip_peer_cache};
+    // Exposed so tests reading through a real (non-injectable) filesystem, e.g. lake::Rowset's
+    // footer opens, can still observe the constructed RandomAccessFileOptions. No-op outside BE_TEST.
+    TEST_SYNC_POINT_CALLBACK("Segment::open_options", &opts);
 
     if (!_segment_file_info.encryption_meta.empty()) {
         ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(_segment_file_info.encryption_meta));

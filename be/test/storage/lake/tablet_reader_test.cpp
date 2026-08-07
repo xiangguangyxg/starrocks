@@ -35,6 +35,7 @@
 #include "common/config_lake_fwd.h"
 #include "common/logging.h"
 #include "exec/pipeline/scan/morsel.h"
+#include "fs/fs.h"
 #include "gen_cpp/InternalService_types.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/rowset.h"
@@ -857,6 +858,109 @@ TEST_F(LakeTabletReaderSpit, test_reader_split) {
         ASSERT_TRUE(reader->get_next(read_chunk_ptr.get()).is_end_of_file());
 
         reader->close();
+    }
+}
+
+// TabletReader::open()'s physical-split preparation path (_need_split=true) reaches each rowset's
+// segments via BaseRowset::get_segments_checked()/get_non_null_segments()
+// (PhysicalSplitMorselQueue::_init_segment() -> Rowset::get_segments_checked()), which used to open
+// every segment footer with a hardcoded, always-peer-allowed LakeIOOptions regardless of the
+// query's own policy -- and since get_segments_checked() latches _segments for the Rowset's
+// lifetime, a later call could never retry under the right policy either. Verifies
+// TabletReader::open() now threads params.lake_io_opts onto each Rowset via
+// Rowset::set_lake_io_opts() before the split queue ever touches its segments.
+TEST_F(LakeTabletReaderSpit, test_reader_split_propagates_skip_peer_cache) {
+    std::vector<int> k0{1, 2, 3, 4, 5};
+    std::vector<int> v0{10, 20, 30, 40, 50};
+    auto c0 = Int32Column::create();
+    auto c1 = Int32Column::create();
+    c0->append_numbers(k0.data(), k0.size() * sizeof(int));
+    c1->append_numbers(v0.data(), v0.size() * sizeof(int));
+    Chunk chunk({std::move(c0), std::move(c1)}, _schema);
+
+    VersionedTablet tablet(_tablet_mgr.get(), _tablet_metadata);
+    {
+        int64_t txn_id = next_id();
+        ASSIGN_OR_ABORT(auto writer, tablet.new_writer(kHorizontal, txn_id));
+        ASSERT_OK(writer->open());
+        // Two segments, so get_segments_checked() has more than one footer to open.
+        ASSERT_OK(writer->write(chunk));
+        ASSERT_OK(writer->finish());
+        ASSERT_OK(writer->write(chunk));
+        ASSERT_OK(writer->finish());
+
+        const auto& files = writer->segments();
+        ASSERT_EQ(2, files.size());
+        auto* rowset = _tablet_metadata->add_rowsets();
+        rowset->set_overlapped(true);
+        rowset->set_id(1);
+        rowset->set_num_rows(2 * chunk.num_rows());
+        for (const auto& file : writer->segments()) {
+            auto* segment_meta = rowset->add_segment_metas();
+            segment_meta->set_filename(file.path);
+            segment_meta->set_size(file.size.value());
+        }
+        writer->close();
+    }
+    _tablet_metadata->set_version(2);
+    CHECK_OK(_tablet_mgr->put_tablet_metadata(*_tablet_metadata));
+
+    TInternalScanRange internal_scan_range;
+    internal_scan_range.__set_tablet_id(_tablet_metadata->id());
+    internal_scan_range.__set_version(std::to_string(_tablet_metadata->version()));
+    TScanRange scan_range;
+    scan_range.__set_internal_scan_range(internal_scan_range);
+
+    std::vector<bool> captured_skip_peer_cache;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer_sync_point([] {
+        SyncPoint::GetInstance()->ClearCallBack("Segment::open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("Segment::open_options", [&](void* arg) {
+        captured_skip_peer_cache.push_back(static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache);
+    });
+
+    // CACHE-SELECT-style policy: peer reads suppressed. fill_metadata_cache is turned off too:
+    // TabletManager::load_segment() looks up its Segment metacache unconditionally (only the
+    // WRITE side is gated by fill_meta_cache), so leaving TabletReaderParams::lake_io_opts's
+    // default fill_metadata_cache=true would cache this run's Segment objects and let the control
+    // run below reuse them (Segment::open() is a once-per-instance no-op on a cache hit) without
+    // ever reaching Segment::_open() -- exactly the kind of cache pre-warming that hid the
+    // MetaFileTest.test_get_del_vec_propagates_skip_peer_cache failure earlier in this task.
+    {
+        auto reader = std::make_shared<TabletReader>(_tablet_mgr.get(), _tablet_metadata, *_schema,
+                                                     /*need_split=*/true, /*could_split_physically=*/true);
+        auto params = generate_tablet_reader_params(&scan_range);
+        params.lake_io_opts.fill_data_cache = false;
+        params.lake_io_opts.fill_metadata_cache = false;
+        params.lake_io_opts.skip_peer_cache = true;
+        ASSERT_OK(reader->prepare());
+        ASSERT_OK(reader->open(params));
+        reader->close();
+    }
+    ASSERT_FALSE(captured_skip_peer_cache.empty());
+    for (bool suppressed : captured_skip_peer_cache) {
+        EXPECT_TRUE(suppressed);
+    }
+
+    // Control: default (peer-allowed) policy, same fill_metadata_cache=false to keep this run
+    // uncached too (irrelevant here since nothing upstream cached these segments, but keeps both
+    // runs symmetric).
+    captured_skip_peer_cache.clear();
+    {
+        auto reader = std::make_shared<TabletReader>(_tablet_mgr.get(), _tablet_metadata, *_schema,
+                                                     /*need_split=*/true, /*could_split_physically=*/true);
+        auto params = generate_tablet_reader_params(&scan_range);
+        params.lake_io_opts.fill_data_cache = false;
+        params.lake_io_opts.fill_metadata_cache = false;
+        ASSERT_OK(reader->prepare());
+        ASSERT_OK(reader->open(params));
+        reader->close();
+    }
+    ASSERT_FALSE(captured_skip_peer_cache.empty());
+    for (bool suppressed : captured_skip_peer_cache) {
+        EXPECT_FALSE(suppressed);
     }
 }
 

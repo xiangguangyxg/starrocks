@@ -169,6 +169,20 @@ private:
     size_t _num_rows;
 };
 
+// Records the skip_peer_cache flag of every RandomAccessFileOptions this filesystem builds a
+// reader from. Used to pin that LogicalSplitMorselQueue::set_lake_io_opts() actually reaches the
+// segment opens split preparation performs (short-key index load, full-sort-key index load).
+class SkipPeerCacheCapturingFileSystem : public MemoryFileSystem {
+public:
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                       const std::string& fname) override {
+        captured_skip_peer_cache.push_back(opts.skip_peer_cache);
+        return MemoryFileSystem::new_random_access_file(opts, fname);
+    }
+
+    std::vector<bool> captured_skip_peer_cache;
+};
+
 class LogicalSplitMorselQueueFullKeyTest : public ::testing::Test {
 public:
     void SetUp() override {
@@ -1055,6 +1069,55 @@ TEST_F(LogicalSplitMorselQueueFullKeyTest, key_order_corrupt_full_page_falls_bac
         }
     }
     EXPECT_EQ(sorted(expected_rows(0, 100)), sorted(collected));
+}
+
+// Regression: LogicalSplitMorselQueue::set_lake_io_opts() has exactly one production caller
+// (lake::TabletReader::open(), threading the query's LakeIOOptions) and was otherwise unpinned --
+// deleting that one call site would leave this suite green. Segments are opened but their legacy
+// short-key index is deliberately left UNLOADED, so the queue's own lazy load
+// (decide_tablet_encoding()'s segment->load_index() call) is the first, capturable one.
+TEST_F(LogicalSplitMorselQueueFullKeyTest, set_lake_io_opts_reaches_short_key_index_load) {
+    auto capture_fs = std::make_shared<SkipPeerCacheCapturingFileSystem>();
+    ASSERT_OK(capture_fs->create_dir(kDir));
+    _fs = capture_fs;
+
+    auto schema = make_schema();
+    auto run_split = [&](bool skip_peer_cache) {
+        std::string path = kDir + "/seg_" + std::to_string(_next_file_seq++) + ".dat";
+        write_segment_file(schema, path, /*seg_id=*/0, /*begin=*/0, /*n=*/50, /*full_key=*/true);
+        ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{path}, 0, schema));
+        // Deliberately no load_index() here -- the queue's own lazy load must be the one observed.
+
+        auto rowset =
+                std::make_shared<FakeRowset>(std::vector<SegmentSharedPtr>{segment}, /*overlapped=*/false, /*id=*/1);
+        std::vector<std::vector<BaseRowsetSharedPtr>> tablet_rowsets = {{rowset}};
+        std::vector<BaseTabletSharedPtr> tablets = {std::make_shared<FakeTablet>(90001, 50)};
+
+        Morsels morsels;
+        morsels.emplace_back(std::make_unique<ScanMorsel>(1, make_scan_range(90001)));
+        LogicalSplitMorselQueue queue(std::move(morsels), 1, /*splitted_scan_rows=*/1000);
+        queue.set_tablets(tablets);
+        queue.set_tablet_rowsets(tablet_rowsets);
+        queue.set_tablet_schema(schema);
+        queue.set_lake_io_opts(LakeIOOptions{.skip_peer_cache = skip_peer_cache});
+        queue.set_ticket_checker(std::make_shared<SplitMorselTicketChecker>());
+
+        capture_fs->captured_skip_peer_cache.clear();
+        ASSIGN_OR_ABORT(auto morsel, queue.try_get());
+        ASSERT_NE(nullptr, morsel);
+    };
+
+    run_split(/*skip_peer_cache=*/true);
+    ASSERT_FALSE(capture_fs->captured_skip_peer_cache.empty());
+    for (bool suppressed : capture_fs->captured_skip_peer_cache) {
+        EXPECT_TRUE(suppressed);
+    }
+
+    run_split(/*skip_peer_cache=*/false);
+    ASSERT_FALSE(capture_fs->captured_skip_peer_cache.empty());
+    for (bool suppressed : capture_fs->captured_skip_peer_cache) {
+        EXPECT_FALSE(suppressed);
+    }
 }
 
 } // namespace starrocks::pipeline

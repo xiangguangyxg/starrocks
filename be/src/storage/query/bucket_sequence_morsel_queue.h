@@ -67,6 +67,10 @@ public:
         _olap_morsel_queue()->set_tablet_schema(tablet_schema);
     }
 
+    void set_lake_io_opts(const LakeIOOptions& lake_io_opts) override {
+        _olap_morsel_queue()->set_lake_io_opts(lake_io_opts);
+    }
+
 private:
     OlapMorselQueue* _olap_morsel_queue() const {
         auto* olap_morsel_queue = dynamic_cast<OlapMorselQueue*>(_morsel_queue.get());

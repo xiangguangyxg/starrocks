@@ -60,8 +60,10 @@ public:
         _tablet_schema = tablet_schema;
     }
     // The current query's lake IO policy (e.g. skip_peer_cache), so lazy per-segment loads
-    // triggered during split preparation (short-key index load, full-sort-key index load) carry it
-    // instead of silently defaulting to peer-allowed.
+    // triggered during split preparation (the rowset's segment footer open, the short-key index
+    // load, and the full-sort-key index load) carry it instead of silently defaulting to
+    // peer-allowed. Subclasses that wrap another OlapMorselQueue (e.g. BucketSequenceMorselQueue)
+    // must forward this to the wrapped queue, same as the other preparation setters.
     virtual void set_lake_io_opts(const LakeIOOptions& lake_io_opts) { _lake_io_opts = lake_io_opts; }
 
 protected:

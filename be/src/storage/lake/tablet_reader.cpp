@@ -362,6 +362,12 @@ Status TabletReader::open(const TabletReaderParams& read_params) {
         int64_t tablet_num_rows = 0;
         for (auto& rowset : _rowsets) {
             tablet_num_rows += rowset->num_rows();
+            // Split preparation reaches segments via BaseRowset::get_segments_checked()/
+            // get_non_null_segments(), which have no LakeIOOptions parameter; store the current
+            // query's policy on the Rowset itself so the footer opens those trigger (and the
+            // legacy/full-sort-key index loads split_morsel_queue.cpp performs afterward) are not
+            // silently peer-allowed. Must happen before any segment access on this Rowset.
+            rowset->set_lake_io_opts(read_params.lake_io_opts);
             rss.emplace_back(rowset);
         }
 

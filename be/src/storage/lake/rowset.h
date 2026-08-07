@@ -263,6 +263,17 @@ public:
     [[nodiscard]] std::vector<SegmentSharedPtr> get_segments() override;
     [[nodiscard]] StatusOr<std::vector<SegmentSharedPtr>> get_segments_checked() override;
 
+    // The current query's lake IO policy (e.g. skip_peer_cache), consulted by get_segments_checked()
+    // the first time it materializes _segments. Must be called before the first get_segments()/
+    // get_segments_checked()/get_non_null_segments() (directly or via BaseRowset), since that first
+    // call latches _segments for the lifetime of this Rowset object. Safe against the same
+    // cross-query latching Segment::use_full_sort_key_index() had to avoid: unlike Segment (cached
+    // by TabletManager across queries), Rowset::get_rowsets() constructs a fresh Rowset per call, so
+    // this object's lifetime is scoped to one query. Callers with no per-query policy (compaction,
+    // schema tools) simply never call this, leaving the pre-existing fill_data_cache=true,
+    // fill_metadata_cache=true, peer-allowed default.
+    void set_lake_io_opts(const LakeIOOptions& lake_io_opts) { _lake_io_opts = lake_io_opts; }
+
     StatusOr<std::vector<SegmentPtr>> segments(bool fill_cache);
 
     [[nodiscard]] StatusOr<std::vector<SegmentPtr>> segments(const LakeIOOptions& lake_io_opts);
@@ -323,6 +334,9 @@ private:
     // _segments.empty()) so a zero-segment rowset loads once, and stays false on a transient
     // failure so a retry re-attempts it (issue #75203).
     bool _segments_loaded = false;
+    // Policy for the get_segments_checked() lazy load; see set_lake_io_opts(). Matches the
+    // pre-existing segments(true) default until a caller opts in.
+    LakeIOOptions _lake_io_opts{.fill_data_cache = true, .fill_metadata_cache = true};
     bool _parallel_load;
     // only takes effect when rowset is overlapped, tells how many segments will be used in compaction,
     // default is 0 means every segment will be used.
