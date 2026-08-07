@@ -775,6 +775,11 @@ TEST_F(PersistentIndexSstableTest, test_sst_open_retry_bypasses_disk_and_peer_ca
         skip_peer_cache = opts->skip_peer_cache;
     });
 
+    auto* metrics = StorageMetrics::instance();
+    const int64_t sstable_before = metrics->invalidating_cache_drops(CacheDropSite::kSstable).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
+
     auto sst = std::make_unique<PersistentIndexSstable>();
     ASSIGN_OR_ABORT(auto rf, fs::new_random_access_file(path));
     PersistentIndexSstablePB sstable_pb;
@@ -785,6 +790,12 @@ TEST_F(PersistentIndexSstableTest, test_sst_open_retry_bypasses_disk_and_peer_ca
     ASSERT_EQ(1, retry_opens); // positive control: the retry open really happened
     EXPECT_TRUE(skip_disk_cache);
     EXPECT_TRUE(skip_peer_cache);
+
+    // The open retry is a category-(a) site: one `sstable` drop, and one re-read that succeeded.
+    // Deltas, because these counters are process-global and other tests in this binary move them.
+    EXPECT_EQ(sstable_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kSstable).value());
+    EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
 }
 #endif // USE_STAROS && !BUILD_FORMAT_LIB
 

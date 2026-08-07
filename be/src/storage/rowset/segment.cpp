@@ -201,6 +201,8 @@ StatusOr<size_t> Segment::parse_segment_footer(RandomAccessFile* read_file, Segm
     }
 #if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
     if (s.status().is_corruption()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kSegmentFooter,
+                                                                   read_file->filename());
         auto drop_status = drop_local_cache_data(read_file->filename());
         if (!drop_status.ok()) {
             return s; // return first read error

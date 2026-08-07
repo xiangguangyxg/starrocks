@@ -228,6 +228,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 変更可能: はい
 - 説明: 共有データクラスタでの主キーテーブル軽量コンパクション publish 時、`RowsMapperIterator` のパイプライン化された `.lcrm` 読み取りにおける sub-chunk の粒度。各出力 segment は `ceil(segment_bytes / lake_rows_mapper_sub_chunk_bytes)` 個の sub-chunk に分割され、独立してパイプライン化されます。値を小さくするほど、少数の大きな出力 segment で達成可能な並列度が上がりますが、その代わりに範囲読み取りが増え、consume 時に追加の memcpy が発生します。デフォルトは 4 MiB で、starcache のディスク層 block サイズと一致させています。
 
+### lake_track_repeated_cache_invalidation
+
+- デフォルト: false
+- タイプ: Boolean
+- 単位: -
+- 変更可能: はい
+- 説明: 同一ファイルのローカルキャッシュエントリが 60 秒以内に複数回無効化された回数を追跡し、`repeated_invalidation_in_window` メトリックとして出力するかどうかを指定します。この値が増え続ける場合、破棄と再読み取りのサイクルが正しいバイト列に収束していないことを意味します。デフォルトでは無効です。これは自己修復ループが疑われる場合の診断用であり、正常なクラスターが読み取りパスでコストを払う必要はないためです。有効にすると、トラッカーはキャッシュキーのハッシュを 1024 個の固定テーブルで保持するため、メモリコストは一定で、ファイルパスは保存されません。負荷の高いノードでは、スロットがすでに別のファイルに使われている場合、繰り返しを取りこぼすことがあります。
+- 導入バージョン: -
+
 ### lake_vacuum_min_batch_delete_size
 
 - デフォルト: 200

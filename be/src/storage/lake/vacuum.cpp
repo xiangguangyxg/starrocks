@@ -48,6 +48,7 @@
 #include "storage/protobuf_file.h"
 #include "storage/storage_cleanup_executor.h"
 #include "storage/storage_engine.h"
+#include "storage/storage_metrics.h"
 
 namespace starrocks::lake {
 
@@ -1798,6 +1799,7 @@ Status drop_tablet_cache(TabletManager* tablet_mgr, int64_t tablet_id, int64_t v
     auto drop_cache_func = [&](std::string& path, int64_t offset, int64_t size) {
         auto fs_or = FileSystemFactory::CreateSharedFromString(path);
         if (fs_or.ok()) {
+            StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kOther, path);
             TEST_SYNC_POINT_CALLBACK("drop_tablet_cache:drop_local_cache", &path);
             auto result = (*fs_or)->drop_local_cache(path, offset, size);
             if (!result.ok()) {

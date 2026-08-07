@@ -28,6 +28,7 @@
 #include "io/seekable_input_stream.h"
 #include "storage/rowset/binary_plain_page.h"
 #include "storage/rowset/bitshuffle_page.h"
+#include "storage/storage_metrics.h"
 
 namespace starrocks {
 
@@ -326,6 +327,44 @@ TEST_F(PageIOTest, test_corrupted_cache) {
     Status s = PageIO::read_and_decompress_page(read_opts, &handle, &body, &read_footer);
     ASSERT_TRUE(s.is_corruption());
 }
+
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
+// page_io is a same-stream retry site: it invalidates the corrupted entry and re-runs the read on
+// the stream it already holds. So it moves its own drop bucket, and must never move the self-heal
+// re-read counters, which only count the sites that re-open the file.
+//
+// Deltas, not absolute values: these are process-global counters and other tests in this binary
+// move them.
+TEST_F(PageIOTest, test_corrupted_page_counts_page_io_cache_drop) {
+    WritableFileOptions write_opts;
+    write_opts.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE;
+    ASSIGN_OR_ASSERT_FAIL(auto write_file, _fs->new_writable_file(write_opts, "/test_corrupt_metric"));
+
+    // A page with no footer: parsing it fails with Corruption, which is what reaches the drop.
+    std::vector<int32_t> values{1, 2, 3};
+    OwnedSlice page = _build_data_page(values);
+    ASSERT_OK(write_file->append(page.slice()));
+    ASSERT_OK(write_file->close());
+    uint64_t file_size = write_file->size();
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t drops_before = metrics->invalidating_cache_drops(CacheDropSite::kPageIo).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
+
+    ASSIGN_OR_ASSERT_FAIL(auto read_file, _fs->new_random_access_file("/test_corrupt_metric"));
+    PageReadOptions read_opts = _build_read_options(read_file.get(), 0, file_size, false);
+    PageHandle handle;
+    Slice body;
+    PageFooterPB read_footer;
+    Status s = PageIO::read_and_decompress_page(read_opts, &handle, &body, &read_footer);
+    ASSERT_TRUE(s.is_corruption()) << s; // positive control: the drop branch was actually reached
+
+    EXPECT_EQ(drops_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kPageIo).value());
+    EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before, metrics->self_heal_reread_success_total.value());
+}
+#endif
 
 // Two slices of the same bundled data file must not collide in the page cache.
 //

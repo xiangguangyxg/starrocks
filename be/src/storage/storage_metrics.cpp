@@ -14,6 +14,10 @@
 
 #include "storage/storage_metrics.h"
 
+#include <functional>
+
+#include "base/time/time.h"
+#include "common/config_lake_fwd.h"
 #include "common/thread/threadpool.h"
 #include "gutil/macros.h"
 
@@ -82,6 +86,22 @@ void StorageMetrics::install(MetricRegistry* registry) {
     REGISTER_STORAGE_METRIC(primary_key_wait_apply_done_total);
     REGISTER_STORAGE_METRIC(pk_index_sst_read_error_total);
     REGISTER_STORAGE_METRIC(pk_index_sst_write_error_total);
+
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "page_io"),
+                              &invalidating_cache_drops_page_io);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "sstable"),
+                              &invalidating_cache_drops_sstable);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "segment_footer"),
+                              &invalidating_cache_drops_segment_footer);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "gtid_mismatch"),
+                              &invalidating_cache_drops_gtid_mismatch);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "bundle_page"),
+                              &invalidating_cache_drops_bundle_page);
+    registry->register_metric("invalidating_cache_drops_total", MetricLabels().add("site", "other"),
+                              &invalidating_cache_drops_other);
+    REGISTER_STORAGE_METRIC(self_heal_reread_attempts_total);
+    REGISTER_STORAGE_METRIC(self_heal_reread_success_total);
+    REGISTER_STORAGE_METRIC(repeated_invalidation_in_window);
 
     REGISTER_STORAGE_METRIC(readable_blocks_total);
     REGISTER_STORAGE_METRIC(writable_blocks_total);
@@ -195,6 +215,51 @@ void StorageMetrics::install(MetricRegistry* registry) {
 
 #undef REGISTER_ENGINE_REQUEST_METRIC
 #undef REGISTER_STORAGE_METRIC
+}
+
+IntCounter& StorageMetrics::invalidating_cache_drops(CacheDropSite site) {
+    switch (site) {
+    case CacheDropSite::kPageIo:
+        return invalidating_cache_drops_page_io;
+    case CacheDropSite::kSstable:
+        return invalidating_cache_drops_sstable;
+    case CacheDropSite::kSegmentFooter:
+        return invalidating_cache_drops_segment_footer;
+    case CacheDropSite::kGtidMismatch:
+        return invalidating_cache_drops_gtid_mismatch;
+    case CacheDropSite::kBundlePage:
+        return invalidating_cache_drops_bundle_page;
+    case CacheDropSite::kOther:
+        return invalidating_cache_drops_other;
+    }
+    // Every enumerator is returned above; this only catches a value cast in from outside the enum.
+    return invalidating_cache_drops_other;
+}
+
+void StorageMetrics::record_invalidating_cache_drop(CacheDropSite site, std::string_view cache_key) {
+    invalidating_cache_drops(site).increment(1);
+    if (config::lake_track_repeated_cache_invalidation) {
+        _observe_repeated_invalidation(cache_key);
+    }
+}
+
+void StorageMetrics::_observe_repeated_invalidation(std::string_view cache_key) {
+    // The key is hashed on the way in and only the hash is kept, so nothing here can be turned
+    // back into a path and nothing here is exported as a label.
+    const uint64_t key_hash = std::hash<std::string_view>{}(cache_key);
+    const int64_t now_ms = MonotonicMillis();
+    auto& slot = _invalidation_slots[key_hash % kInvalidationSlotCount];
+    // Relaxed, unsynchronised load/store pairs: two threads landing on the same slot can interleave
+    // and one of them then sees the other's write instead of its own predecessor. The cost is at
+    // most one lost observation of a diagnostic counter that drives no decision, which is why no
+    // lock or CAS is warranted on a read path.
+    const uint64_t previous_hash = slot.key_hash.load(std::memory_order_relaxed);
+    const int64_t previous_ms = slot.last_seen_ms.load(std::memory_order_relaxed);
+    if (previous_ms != 0 && previous_hash == key_hash && now_ms - previous_ms <= kInvalidationWindowMs) {
+        repeated_invalidation_in_window.increment(1);
+    }
+    slot.key_hash.store(key_hash, std::memory_order_relaxed);
+    slot.last_seen_ms.store(now_ms, std::memory_order_relaxed);
 }
 
 void StorageMetrics::register_thread_pool_metrics(const std::string& name, ThreadPoolMetricGroup* metric_group,

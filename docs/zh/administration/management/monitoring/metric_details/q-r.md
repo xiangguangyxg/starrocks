@@ -114,6 +114,12 @@ description: "Alphabetical q - r"
 - 单位：个
 - 描述：FE Catalog 回收站中当前保留的表数量。
 
+## `repeated_invalidation_in_window`
+
+- 单位：计数
+- 类型：累积
+- 描述：存算分离集群中，同一个文件的本地缓存条目在 60 秒内被多次作废的总次数，说明丢弃缓存并重读的循环没有收敛到正确的数据。仅在 `lake_track_repeated_cache_invalidation` 开启时才会统计。统计器使用固定的 1024 个缓存键哈希槽位，不会保存或导出任何文件路径；在繁忙的节点上，如果槽位已被其他文件占用，可能会漏掉一次重复。
+
 ## `resource_group_bigquery_count`
 
 - 单位：计数

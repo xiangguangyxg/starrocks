@@ -36,6 +36,18 @@ description: "Alphabetical s"
 - 单位：字节
 - 描述：segment zonemap使用的内存。
 
+## `self_heal_reread_attempts_total`
+
+- 单位：计数
+- 类型：累积
+- 描述：存算分离集群中，作废损坏的本地缓存条目后重新读取文件的总次数。仅统计会重新打开文件的位置：Tablet 元数据文件损坏、Bundle 元数据文件损坏，以及持久化索引 SST 文件打开失败。在已持有的流上重试的位置，以及只丢弃缓存条目而不重读的位置，不计入该指标，因此该值不会超过 `invalidating_cache_drops_total`。
+
+## `self_heal_reread_success_total`
+
+- 单位：计数
+- 类型：累积
+- 描述：`self_heal_reread_attempts_total` 所统计的自愈重读中，成功读取到可用数据的总次数。两者长期存在差值，说明自愈没有恢复成功，读取会以错误返回给调用方。
+
 ## `short_key_index_mem_bytes`
 
 - 单位：字节

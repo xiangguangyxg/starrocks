@@ -81,11 +81,13 @@ Status PersistentIndexSstable::init(std::unique_ptr<RandomAccessFile> rf, const 
     auto open_st = sstable::Table::Open(options, rf.get(), sstable_pb.filesize(), table);
     TEST_SYNC_POINT_CALLBACK("PersistentIndexSstable::init:table_open_error", &open_st);
     if (open_st.is_corruption()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kSstable, rf->filename());
         auto drop_status = drop_corrupted_sstable_cache(rf->filename());
         if (drop_status.ok()) {
             if (tablet_mgr == nullptr) {
                 return Status::InvalidArgument("tablet_mgr is null when loading sst file");
             }
+            StorageMetrics::instance()->self_heal_reread_attempts_total.increment(1);
             // Re-open bypassing both the local disk cache and peer BEs: drop_corrupted_sstable_cache
             // above just dropped this file's corrupted local cache entry, and without the bypass the
             // retry could be handed the same bytes back -- from the entry a concurrent reader
@@ -100,6 +102,9 @@ Status PersistentIndexSstable::init(std::unique_ptr<RandomAccessFile> rf, const 
                                          opts, tablet_mgr->sst_location(metadata->id(), sstable_pb.filename())));
             open_st = sstable::Table::Open(options, rf.get(), sstable_pb.filesize(), table);
             TEST_SYNC_POINT_CALLBACK("PersistentIndexSstable::init:table_open_retry_error", &open_st);
+            if (open_st.ok()) {
+                StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
+            }
         }
     }
     if (!open_st.ok()) {
@@ -191,6 +196,7 @@ Status PersistentIndexSstable::multi_get(const Slice* keys, const KeyIndexSet& k
     auto multiget_st = _sst->MultiGet(options, keys, key_indexes.begin(), key_indexes.end(), &index_value_with_vers);
     TEST_SYNC_POINT_CALLBACK("PersistentIndexSstable::multi_get:error", &multiget_st);
     if (multiget_st.is_corruption()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kSstable, _rf->filename());
         auto drop_status = drop_corrupted_sstable_cache(_rf->filename());
         if (drop_status.ok()) {
             multiget_st = _sst->MultiGet(options, keys, key_indexes.begin(), key_indexes.end(), &index_value_with_vers);

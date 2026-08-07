@@ -59,6 +59,7 @@
 #include "runtime/raw_container_checked.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/storage_page_decoder.h"
+#include "storage/storage_metrics.h"
 
 namespace starrocks {
 
@@ -350,6 +351,7 @@ Status PageIO::read_and_decompress_page(const PageReadOptions& opts, PageHandle*
     }
 #if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
     if (s.is_corruption()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kPageIo, opts.read_file->filename());
         auto drop_status = drop_local_cache_data(opts.read_file->filename());
         if (!drop_status.ok()) {
             return s; // return first read error

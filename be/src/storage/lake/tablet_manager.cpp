@@ -58,6 +58,7 @@
 #include "storage/metadata_util.h"
 #include "storage/protobuf_file.h"
 #include "storage/rowset/segment.h"
+#include "storage/storage_metrics.h"
 #include "storage/tablet_schema_map.h"
 #include "storage/utils.h"
 #include "storage_primitive/tablet_basic_info.h"
@@ -707,8 +708,10 @@ Status TabletManager::put_bundle_tablet_metadata(std::map<int64_t, TabletMetadat
     return Status::OK();
 }
 
-Status TabletManager::corrupted_tablet_meta_handler(const Status& s, const std::string& metadata_location) {
+Status TabletManager::corrupted_tablet_meta_handler(const Status& s, const std::string& metadata_location,
+                                                    CacheDropSite site) {
     if (s.is_corruption() && config::lake_clear_corrupted_cache_meta) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(site, metadata_location);
         auto drop_status = drop_local_cache(metadata_location);
         TEST_SYNC_POINT_CALLBACK("TabletManager::corrupted_tablet_meta_handler", &drop_status);
         if (!drop_status.ok()) {
@@ -733,7 +736,7 @@ StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& me
     auto s = load_lake_protobuf(metadata_location, metadata.get(),
                                 {.fill_cache = fill_data_cache, .skip_peer_cache = skip_peer_cache}, fs);
     if (!s.ok()) {
-        RETURN_IF_ERROR(corrupted_tablet_meta_handler(s, metadata_location));
+        RETURN_IF_ERROR(corrupted_tablet_meta_handler(s, metadata_location, CacheDropSite::kOther));
         // reset metadata
         metadata = std::make_shared<TabletMetadataPB>();
         // Read again, bypassing both the local disk cache and peer BEs. The handler above just
@@ -741,9 +744,11 @@ StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& me
         // served the very bytes that were dropped -- from the entry a concurrent reader
         // repopulated, or from a peer that cached the same corruption -- and self-heal would spin
         // instead of converging on authoritative storage.
+        StorageMetrics::instance()->self_heal_reread_attempts_total.increment(1);
         RETURN_IF_ERROR(load_lake_protobuf(
                 metadata_location, metadata.get(),
                 {.fill_cache = fill_data_cache, .skip_disk_cache = true, .skip_peer_cache = true}, fs));
+        StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
     }
 
     // Back-fill segment_metas from the deprecated legacy arrays for rowsets written by a
@@ -751,6 +756,7 @@ StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& me
     normalize_tablet_metadata_after_load(metadata.get());
 
     if (expected_gtid > 0 && metadata->gtid() > 0 && expected_gtid != metadata->gtid()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, metadata_location);
         auto drop_status = drop_local_cache(metadata_location);
         if (!drop_status.ok()) {
             LOG(WARNING) << "clear dirty cache for " << metadata_location << " failed, "
@@ -1042,7 +1048,11 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
     BundleTabletMetadataPtr bundle_metadata;
     auto bundle_metadata_status = parse_bundle_tablet_metadata(path, serialized_string);
     if (!bundle_metadata_status.ok()) {
-        RETURN_IF_ERROR(corrupted_tablet_meta_handler(bundle_metadata_status.status(), path));
+        // The whole bundle file failed to parse, which is the same kind of failure as a corrupted
+        // single-tablet metadata file, so it shares that bucket. `bundle_page` is reserved for the
+        // two per-tablet page failures further down, which drop without a re-read.
+        RETURN_IF_ERROR(corrupted_tablet_meta_handler(bundle_metadata_status.status(), path, CacheDropSite::kOther));
+        StorageMetrics::instance()->self_heal_reread_attempts_total.increment(1);
         // Read the bundle metadata again, bypassing both the local disk cache and peer BEs, so the
         // retry cannot be served the corruption the handler above just dropped. Copy |opts| rather
         // than rebuilding it, so the retry is the same open with the caches bypassed and inherits
@@ -1057,6 +1067,7 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         ASSIGN_OR_RETURN(serialized_string, input_file->read_all());
         file_size = serialized_string.size();
         ASSIGN_OR_RETURN(bundle_metadata, parse_bundle_tablet_metadata(path, serialized_string));
+        StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
     } else {
         bundle_metadata = bundle_metadata_status.value();
     }
@@ -1085,13 +1096,13 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         olap_adler32(ADLER32_INIT, metadata_str.data(), size) != crc_it->second) {
         auto corrupted_status = Status::Corruption(
                 strings::Substitute("mismatched checksum of tablet $0 metadata in shared metadata", tablet_id));
-        (void)corrupted_tablet_meta_handler(corrupted_status, path);
+        (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
         return corrupted_status;
     }
     if (!metadata->ParseFromArray(metadata_str.data(), size)) {
         auto corrupted_status =
                 Status::Corruption(strings::Substitute("deserialized tablet $0 metadata failed", tablet_id));
-        (void)corrupted_tablet_meta_handler(corrupted_status, path);
+        (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
         return corrupted_status;
     }
     normalize_tablet_metadata_after_load(metadata.get());
@@ -1129,6 +1140,7 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
     }
 
     if (expected_gtid > 0 && metadata->gtid() > 0 && expected_gtid != metadata->gtid()) {
+        StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, tablet_path);
         auto drop_status = drop_local_cache(tablet_path);
         if (!drop_status.ok()) {
             LOG(WARNING) << "clear dirty cache for " << tablet_path << " failed, "

@@ -18,12 +18,38 @@
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "base/utility/defer_op.h"
+#include "common/config_lake_fwd.h"
 #include "common/thread/threadpool.h"
 
 namespace starrocks {
 
 namespace {
+
+// Collects every label set registered under one metric name, so a test can assert "exactly these
+// labels and nothing else" instead of "at least these".
+class LabelCollectingVisitor : public MetricsVisitor {
+public:
+    explicit LabelCollectingVisitor(std::string metric_name) : _metric_name(std::move(metric_name)) {}
+
+    void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) override {
+        if (name != _metric_name) {
+            return;
+        }
+        for (const auto& [labels, metric] : collector->metrics()) {
+            _label_sets.push_back(labels);
+        }
+    }
+
+    const std::vector<MetricLabels>& label_sets() const { return _label_sets; }
+
+private:
+    const std::string _metric_name;
+    std::vector<MetricLabels> _label_sets;
+};
 
 void assert_metric_value(MetricRegistry* registry, const std::string& name, const std::string& value) {
     auto* metric = registry->get_metric(name);
@@ -202,6 +228,80 @@ TEST(StorageMetricsTest, InstallRegistersBlockManagerMetrics) {
 
     metrics.blocks_open_writing.set_value(33);
     assert_metric_value(&registry, "blocks_open_writing", "33");
+}
+
+TEST(StorageMetricsTest, InstallRegistersSelfHealMetrics) {
+    MetricRegistry registry("test_registry");
+    StorageMetrics metrics(&registry);
+
+    const std::vector<std::pair<CacheDropSite, std::string>> sites = {
+            {CacheDropSite::kPageIo, "page_io"},
+            {CacheDropSite::kSstable, "sstable"},
+            {CacheDropSite::kSegmentFooter, "segment_footer"},
+            {CacheDropSite::kGtidMismatch, "gtid_mismatch"},
+            {CacheDropSite::kBundlePage, "bundle_page"},
+            {CacheDropSite::kOther, "other"},
+    };
+    int64_t value = 100;
+    for (const auto& [site, label] : sites) {
+        metrics.invalidating_cache_drops(site).increment(++value);
+        assert_metric_value(&registry, "invalidating_cache_drops_total", MetricLabels().add("site", label),
+                            std::to_string(value));
+    }
+
+    // Every bucket must carry exactly one label, `site`, and there must be exactly six of them.
+    // The lookups above already pin the label set of each bucket -- the collector is keyed on the
+    // whole set, so an extra `cache_key` label would make them miss -- but enumerate the registry
+    // too, so a seventh bucket or a new label added later fails here instead of silently
+    // multiplying the exported series.
+    LabelCollectingVisitor visitor("invalidating_cache_drops_total");
+    registry.collect(&visitor);
+    ASSERT_EQ(sites.size(), visitor.label_sets().size());
+    for (const auto& labels : visitor.label_sets()) {
+        ASSERT_EQ(1u, labels.labels.size());
+        EXPECT_EQ("site", labels.labels.begin()->name);
+    }
+
+    metrics.self_heal_reread_attempts_total.increment(48);
+    assert_metric_value(&registry, "self_heal_reread_attempts_total", "48");
+
+    metrics.self_heal_reread_success_total.increment(49);
+    assert_metric_value(&registry, "self_heal_reread_success_total", "49");
+
+    metrics.repeated_invalidation_in_window.increment(50);
+    assert_metric_value(&registry, "repeated_invalidation_in_window", "50");
+}
+
+TEST(StorageMetricsTest, RepeatedInvalidationObserverIsOffByDefault) {
+    MetricRegistry registry("test_registry");
+    StorageMetrics metrics(&registry);
+    ASSERT_FALSE(config::lake_track_repeated_cache_invalidation);
+
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000001.meta");
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000001.meta");
+
+    // The drops themselves are always counted; only the observer is gated by the config.
+    EXPECT_EQ(2, metrics.invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(0, metrics.repeated_invalidation_in_window.value());
+}
+
+TEST(StorageMetricsTest, RepeatedInvalidationObserverCountsSameKeyWithinWindow) {
+    MetricRegistry registry("test_registry");
+    StorageMetrics metrics(&registry);
+    const bool saved = config::lake_track_repeated_cache_invalidation;
+    DeferOp restore([&] { config::lake_track_repeated_cache_invalidation = saved; });
+    config::lake_track_repeated_cache_invalidation = true;
+
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000001.meta");
+    EXPECT_EQ(0, metrics.repeated_invalidation_in_window.value()); // a first sighting is not a repeat
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000001.meta");
+    EXPECT_EQ(1, metrics.repeated_invalidation_in_window.value());
+
+    // Two other keys inside the same window are two more first sightings. This holds even if one
+    // of them hashes into the slot just used, because the stored hash is compared, not the index.
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000002.meta");
+    metrics.record_invalidating_cache_drop(CacheDropSite::kOther, "s3://bucket/db/tbl/0000003.meta");
+    EXPECT_EQ(1, metrics.repeated_invalidation_in_window.value());
 }
 
 TEST(StorageMetricsTest, RegisterGaugeHooksBeforeInstall) {

@@ -228,6 +228,15 @@ This topic introduces the following types of BE configurations:
 - Is mutable: Yes
 - Description: Sub-chunk granularity for `RowsMapperIterator` pipelined reads of `.lcrm` files during light Primary Key compaction publish in a shared-data cluster. Each output segment is split into `ceil(segment_bytes / lake_rows_mapper_sub_chunk_bytes)` sub-chunks pipelined independently. Smaller values raise the achievable parallelism for few-but-large output segments at the cost of more range reads and an extra memcpy on consume. Defaults to 4 MiB to align with the starcache disk-tier block size.
 
+### lake_track_repeated_cache_invalidation
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether to track how often the same file has its local cache entry invalidated more than once within 60 seconds, and report that count as the `repeated_invalidation_in_window` metric. A rising count means a drop-and-re-read cycle is not converging on good bytes. This is disabled by default because it is a diagnostic for a suspected self-heal loop rather than something a healthy cluster needs to pay for on the read path. When enabled, the tracker keeps a fixed table of 1024 cache key hashes, so its memory cost is constant and no file path is stored; on a busy node a repeat can be missed if its slot has already been taken by another file.
+- Introduced in: -
+
 ### lake_vacuum_min_batch_delete_size
 
 - Default: 200

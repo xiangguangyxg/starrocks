@@ -1631,6 +1631,13 @@ CONF_mBool(lake_enable_protobuf_file_checksum, "true");
 CONF_mBool(lake_clear_corrupted_cache_meta, "true");
 // clear *.data cache for lake table
 CONF_mBool(lake_clear_corrupted_cache_data, "false");
+// When true, every invalidating local-cache drop is also fed to a small in-memory observer that
+// reports, as `repeated_invalidation_in_window`, how often the same file was invalidated more than
+// once within 60 seconds. That signal means a drop-and-re-read cycle is not converging on good
+// bytes. Off by default: the observer is a diagnostic for a suspected self-heal loop, not
+// something a healthy cluster needs to pay for on the read path. Only the hash of the file's cache
+// key is kept, in a fixed 1024-entry table, so the memory cost is constant and no path is stored.
+CONF_mBool(lake_track_repeated_cache_invalidation, "false");
 // The maximum number of files which need to rebuilt in cloud native pk index.
 // If files which need to rebuilt larger than this, we will flush memtable immediately.
 CONF_mInt32(cloud_native_pk_index_rebuild_files_threshold, "50");

@@ -225,6 +225,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 是否动态：是
 - 描述：存算分离集群下，主键表轻量 Compaction 发布阶段，`RowsMapperIterator` 流水化读取 `.lcrm` 文件时使用的 sub-chunk 粒度。每个输出 segment 被切分为 `ceil(segment_bytes / lake_rows_mapper_sub_chunk_bytes)` 个 sub-chunk，独立流水化。值越小，少而大的输出 segment 能获得越高的并发度，但代价是更多的范围读取和消费时一次额外的 memcpy。默认 4 MiB，与 starcache 磁盘层 block 大小对齐。
 
+### lake_track_repeated_cache_invalidation
+
+- 默认值：false
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：是否统计同一个文件的本地缓存条目在 60 秒内被多次作废的次数，并通过 `repeated_invalidation_in_window` 指标上报。该计数持续上升，说明丢弃缓存并重读的循环没有收敛到正确的数据。默认关闭，因为它只是排查疑似自愈循环时使用的诊断手段，健康的集群不需要在读取路径上承担这份开销。开启后，统计器使用固定的 1024 个缓存键哈希槽位，因此内存开销恒定，且不会保存任何文件路径；在繁忙的节点上，如果槽位已被其他文件占用，可能会漏掉一次重复。
+- 引入版本：-
+
 ### lake_vacuum_min_batch_delete_size
 
 - 默认值：200

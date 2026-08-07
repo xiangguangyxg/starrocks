@@ -114,6 +114,12 @@ description: "Alphabetical q - r"
 - Unit: Count
 - Description: Number of tables currently held in the FE catalog recycle bin.
 
+## `repeated_invalidation_in_window`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Total number of times the same file had its local cache entry invalidated more than once within 60 seconds in a shared-data cluster, which means a drop-and-re-read cycle is not converging on good bytes. Counted only while `lake_track_repeated_cache_invalidation` is enabled. The tracker keeps a fixed table of 1024 cache key hashes and never stores or exports a file path, so on a busy node a repeat can be missed if its slot has already been taken by another file.
+
 ## `resource_group_bigquery_count`
 
 - Unit: Count

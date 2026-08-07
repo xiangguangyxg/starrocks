@@ -40,6 +40,7 @@
 #include "storage/lake/update_manager.h"
 #include "storage/lake/versioned_tablet.h"
 #include "storage/rowset/segment.h"
+#include "storage/storage_metrics.h"
 #include "storage/tablet_schema.h"
 #include "test_util.h"
 
@@ -277,6 +278,101 @@ TEST_F(LakeTabletManagerTest, tablet_meta_self_heal_reread_unaffected_by_cache_w
     ASSERT_TRUE(res.ok()) << res.status();
     ASSERT_EQ(1, bypassing_opens); // positive control: the bypassing re-read actually happened
     EXPECT_EQ(kDurableCommitTime, res.value()->commit_time()); // ordering guard, see above
+}
+
+// A metadata corruption is a category-(a) site: the entry is invalidated and the file is
+// immediately re-read, so it moves the `other` drop bucket and both self-heal re-read counters.
+//
+// All assertions are deltas around the read. These are process-global counters and other tests in
+// this binary move them, so absolute values would be meaningless.
+TEST_F(LakeTabletManagerTest, tablet_meta_corruption_counts_other_drop_and_reread) {
+    starrocks::TabletMetadata metadata;
+    auto tablet_id = next_id();
+    metadata.set_id(tablet_id);
+    metadata.set_version(2);
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(metadata));
+    // put_tablet_metadata() warmed the metacache; prune so the read below is a genuinely cold open
+    // that reaches the load path instead of being answered from the metacache.
+    _tablet_manager->metacache()->prune();
+
+    bool first_read = true;
+    bool handler_ran = false;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFile::load::corruption");
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::load::corruption");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::corrupted_tablet_meta_handler");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    // The metadata may be read with the legacy headerless format or the checksummed header format
+    // depending on lake_enable_protobuf_file_checksum, so inject the first-read corruption on both.
+    auto inject_first_read_corruption = [&](void* arg) {
+        if (first_read) {
+            first_read = false;
+            *(Status*)arg = Status::Corruption("injected error");
+        }
+    };
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFile::load::corruption", inject_first_read_corruption);
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::load::corruption", inject_first_read_corruption);
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::corrupted_tablet_meta_handler", [&](void* arg) {
+        handler_ran = true;
+        *(Status*)arg = Status::OK();
+    });
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+    const int64_t gtid_before = metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value();
+    const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
+
+    auto res = _tablet_manager->get_tablet_metadata(tablet_id, 2);
+    ASSERT_TRUE(res.ok()) << res.status();
+    ASSERT_EQ(tablet_id, res.value()->id());
+    ASSERT_TRUE(handler_ran); // positive control: the drop really happened, the read did not just succeed
+
+    EXPECT_EQ(other_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(gtid_before, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    EXPECT_EQ(bundle_page_before, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
+    EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
+}
+
+// A GTID mismatch is a drop-only site: the stale entry is invalidated and the caller is told
+// NotFound, with no re-read on this path to observe. So it moves its own bucket and neither
+// self-heal re-read counter.
+TEST_F(LakeTabletManagerTest, tablet_meta_gtid_mismatch_counts_drop_without_reread) {
+    constexpr int64_t kDurableGtid = 1000;
+    constexpr int64_t kRequestedGtid = 1001;
+
+    starrocks::TabletMetadata metadata;
+    auto tablet_id = next_id();
+    metadata.set_id(tablet_id);
+    metadata.set_version(2);
+    metadata.set_gtid(kDurableGtid);
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(metadata));
+    _tablet_manager->metacache()->prune();
+
+    auto path = _tablet_manager->tablet_metadata_location(tablet_id, 2);
+    // Positive control: with the matching gtid the same call reads the file fine, so the NotFound
+    // below is the gtid rejection and not a read that never found anything. fill_cache=false keeps
+    // this probe out of the metacache, so the real read still goes to the file.
+    auto probe = _tablet_manager->get_tablet_metadata(path, /*fill_cache=*/false, kDurableGtid);
+    ASSERT_TRUE(probe.ok()) << probe.status();
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t gtid_before = metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value();
+    const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
+
+    auto res = _tablet_manager->get_tablet_metadata(path, /*fill_cache=*/false, kRequestedGtid);
+    ASSERT_TRUE(res.status().is_not_found()) << res.status();
+
+    EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    EXPECT_EQ(other_before, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(attempts_before, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before, metrics->self_heal_reread_success_total.value());
 }
 
 // NOLINTNEXTLINE
@@ -1489,6 +1585,12 @@ TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_pee
         retry_skip_peer_cache = o->skip_peer_cache;
     });
 
+    auto* metrics = StorageMetrics::instance();
+    const int64_t other_before = metrics->invalidating_cache_drops(CacheDropSite::kOther).value();
+    const int64_t bundle_page_before = metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
+
     // put_bundle_tablet_metadata() warmed the metacache; prune so the read below really opens the
     // bundle file instead of returning the cached per-tablet metadata.
     _tablet_manager->metacache()->prune();
@@ -1504,6 +1606,15 @@ TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_pee
     EXPECT_TRUE(retry_skip_peer_cache);
     // ...and the retry did not simply reuse (or mutate) the first read's options object.
     EXPECT_NE(first_opts_addr, retry_opts_addr);
+
+    // A whole bundle file that fails to parse is the same kind of failure as a corrupted
+    // single-tablet metadata file, so it is bucketed `other` and pairs with a re-read.
+    // `bundle_page` stays put: that bucket is only for the two per-tablet page failures, which
+    // drop without re-reading. Deltas, because these counters are process-global.
+    EXPECT_EQ(other_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());
+    EXPECT_EQ(bundle_page_before, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
+    EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {

@@ -14,8 +14,12 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "base/metrics.h"
@@ -24,6 +28,18 @@
 namespace starrocks {
 
 class ThreadPool;
+
+// The read path that invalidated a local cache entry. Becomes the `site` label of
+// `invalidating_cache_drops_total`. The dropped cache key is deliberately not part of the
+// identity of a bucket: it is unbounded and would blow up the label cardinality.
+enum class CacheDropSite {
+    kPageIo,
+    kSstable,
+    kSegmentFooter,
+    kGtidMismatch,
+    kBundlePage,
+    kOther,
+};
 
 class StorageMetrics {
 public:
@@ -39,6 +55,14 @@ public:
     void register_metadata_cache_bytes_total_hook(std::function<int64_t()> value_fn);
     void register_unused_rowsets_count_hook(std::function<uint64_t()> value_fn);
     void register_rowset_count_generated_and_in_use_hook(std::function<uint64_t()> value_fn);
+
+    // Records one invalidating local-cache drop requested by |site|, and feeds the
+    // repeated-invalidation observer. |cache_key| is only ever hashed: it is not stored, not
+    // logged here, and never becomes a metric label.
+    void record_invalidating_cache_drop(CacheDropSite site, std::string_view cache_key);
+
+    // The `invalidating_cache_drops_total` bucket for |site|.
+    IntCounter& invalidating_cache_drops(CacheDropSite site);
 
     METRIC_DEFINE_INT_COUNTER(push_requests_success_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(push_requests_fail_total, MetricUnit::REQUESTS);
@@ -81,6 +105,19 @@ public:
     METRIC_DEFINE_INT_COUNTER(primary_key_wait_apply_done_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(pk_index_sst_read_error_total, MetricUnit::REQUESTS);
     METRIC_DEFINE_INT_COUNTER(pk_index_sst_write_error_total, MetricUnit::REQUESTS);
+
+    // Self-heal observability. The six buckets below are the `site` label values of the single
+    // exported `invalidating_cache_drops_total`; only the three category-(a) sites that follow a
+    // drop with a re-read move the reread counters.
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_page_io, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_sstable, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_segment_footer, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_gtid_mismatch, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_bundle_page, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(invalidating_cache_drops_other, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(self_heal_reread_attempts_total, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(self_heal_reread_success_total, MetricUnit::OPERATIONS);
+    METRIC_DEFINE_INT_COUNTER(repeated_invalidation_in_window, MetricUnit::OPERATIONS);
 
     METRIC_DEFINE_INT_COUNTER(readable_blocks_total, MetricUnit::BLOCKS);
     METRIC_DEFINE_INT_COUNTER(writable_blocks_total, MetricUnit::BLOCKS);
@@ -189,6 +226,19 @@ public:
     METRICS_DEFINE_THREAD_POOL(cloud_native_pk_index_compact);
 
 private:
+    // Repeated-invalidation observer, behind config::lake_track_repeated_cache_invalidation.
+    // A fixed table indexed by `key hash % kInvalidationSlotCount`: no allocation, no growth, and
+    // no eviction policy -- a slot simply holds whichever key hashed to it last.
+    static constexpr size_t kInvalidationSlotCount = 1024;
+    static constexpr int64_t kInvalidationWindowMs = 60 * 1000;
+
+    struct InvalidationSlot {
+        // Only the hash of the cache key is kept, never the key itself.
+        std::atomic<uint64_t> key_hash{0};
+        // 0 means "slot never used"; a real observation always stores a non-zero millisecond clock.
+        std::atomic<int64_t> last_seen_ms{0};
+    };
+
     struct PendingThreadPoolMetrics {
         std::string name;
         ThreadPoolMetricGroup* metric_group;
@@ -211,8 +261,10 @@ private:
                                        ThreadPool* threadpool);
     void _register_int_gauge_hook(const std::string& name, IntGauge* metric, std::function<int64_t()> value_fn);
     void _register_uint_gauge_hook(const std::string& name, UIntGauge* metric, std::function<uint64_t()> value_fn);
+    void _observe_repeated_invalidation(std::string_view cache_key);
 
     MetricRegistry* _registry = nullptr;
+    std::array<InvalidationSlot, kInvalidationSlotCount> _invalidation_slots;
     std::vector<PendingThreadPoolMetrics> _pending_thread_pool_metrics;
     std::vector<PendingIntGaugeHook> _pending_int_gauge_hooks;
     std::vector<PendingUIntGaugeHook> _pending_uint_gauge_hooks;

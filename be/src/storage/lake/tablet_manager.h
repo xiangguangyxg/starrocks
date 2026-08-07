@@ -42,6 +42,8 @@ class Segment;
 class TabletSchemaPB;
 class TCreateTabletReq;
 class TGetTabletMetadataResponse;
+// Defined in storage/storage_metrics.h; only named in a signature here.
+enum class CacheDropSite;
 } // namespace starrocks
 
 namespace starrocks::lake {
@@ -343,7 +345,11 @@ private:
                                          int64_t* table_id, int64_t* partition_id, int64_t* index_id);
     StatusOr<TxnLogPtr> load_txn_log(const std::string& txn_log_location, bool fill_cache);
     StatusOr<CombinedTxnLogPtr> load_combined_txn_log(const std::string& path, bool fill_cache);
-    Status corrupted_tablet_meta_handler(const Status& s, const std::string& metadata_location);
+    // |site| is the `invalidating_cache_drops_total` bucket the drop below is counted in. It is
+    // required rather than defaulted: this handler owns the only metadata-cache drop for four
+    // different call sites, so a default would silently lump a new caller into someone else's
+    // bucket and make the label useless.
+    Status corrupted_tablet_meta_handler(const Status& s, const std::string& metadata_location, CacheDropSite site);
 
 #if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
     StatusOr<TabletBasicInfo> get_tablet_basic_info(int64_t tablet_id, int64_t table_id, int64_t partition_id,

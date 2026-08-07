@@ -36,6 +36,18 @@ description: "Alphabetical s"
 - Unit: Bytes
 - Description: Memory used by segment zonemap.
 
+## `self_heal_reread_attempts_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Total number of times a shared-data read re-read a file after invalidating its corrupt local cache entry. Only the sites that re-open the file are counted: a corrupted tablet metadata file, a corrupted bundled metadata file, and a persistent index SST that failed to open. Sites that retry on the stream they already hold, and sites that only drop the entry without re-reading, are not counted, so this never exceeds `invalidating_cache_drops_total`.
+
+## `self_heal_reread_success_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Total number of the self-heal re-reads counted by `self_heal_reread_attempts_total` that returned usable bytes. A persistent gap between the two means self-heal is not recovering and the read is being returned to the caller as an error.
+
 ## `short_key_index_mem_bytes`
 
 - Unit: Bytes

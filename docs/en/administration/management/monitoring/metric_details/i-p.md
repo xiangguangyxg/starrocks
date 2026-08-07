@@ -235,6 +235,13 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Unit: Bytes
 - Description: Memory used by the INT8 column pool.
 
+## `invalidating_cache_drops_total`
+
+- Unit: Count
+- Type: Cumulative
+- Labels: `site` (`page_io`, `sstable`, `segment_footer`, `gtid_mismatch`, `bundle_page`, or `other`)
+- Description: Total number of times a read path in a shared-data cluster invalidated a file's local cache entry because the cached bytes were corrupt or stale. `site` names the path that requested the drop: `page_io` for a data page checksum failure, `segment_footer` for a segment footer checksum failure, `sstable` for a persistent index SST failure, `gtid_mismatch` for a tablet metadata entry whose GTID did not match the one requested, `bundle_page` for a single tablet's page inside a bundled metadata file, and `other` for a corrupted metadata file, the cache cleanup performed before a tablet metadata repair, and the cache eviction performed when a tablet version is garbage collected. The path of the dropped file is never exported as a label. This metric records the request rather than the bytes removed, so a request against a file that is not cached locally still counts. The `page_io`, `segment_footer`, and `sstable` sites count the corruption they detected even when `lake_clear_corrupted_cache_data` is disabled and no drop follows, whereas the metadata corruption drops (`bundle_page`, and that part of `other`) are counted only while `lake_clear_corrupted_cache_meta` is enabled, because that setting decides whether the drop is attempted at all.
+
 ## `jemalloc_active_bytes`
 
 - Unit: Bytes
