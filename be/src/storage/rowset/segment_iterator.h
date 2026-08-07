@@ -49,8 +49,11 @@ StatusOr<SparseRange<>> get_prepared_pruned_row_ranges(const std::shared_ptr<Seg
 
 // Build a block-aligned rowid range from key-space SeekRanges. The segment's
 // short-key index must be loaded before calling this when |ranges| is non-empty.
+// |lake_io_opts| threads the current query's policy (e.g. skip_peer_cache) into any lazy full sort
+// key index load this triggers.
 StatusOr<SparseRange<>> block_aligned_rowid_range_from_seek_ranges(Segment* segment,
-                                                                   const std::vector<SeekRange>& ranges);
+                                                                   const std::vector<SeekRange>& ranges,
+                                                                   const LakeIOOptions& lake_io_opts);
 
 // Resolve key-space SeekRanges to corresponding rowid ranges within |segment|.
 // This wraps SegmentIterator's lookup machinery so callers outside the scan

@@ -21,7 +21,9 @@
 
 #include "base/testutil/assert.h"
 #include "base/testutil/id_generator.h"
+#include "base/testutil/sync_point.h"
 #include "base/uid_util.h"
+#include "base/utility/defer_op.h"
 #include "common/config_lake_fwd.h"
 #include "fs/fs.h"
 #include "fs/fs_util.h"
@@ -30,6 +32,7 @@
 #include "storage/lake/column_mode_partial_update_handler.h"
 #include "storage/lake/fixed_location_provider.h"
 #include "storage/lake/join_path.h"
+#include "storage/lake/metacache.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/txn_log.h"
@@ -306,6 +309,59 @@ TEST_F(MetaFileTest, test_delvec_rw) {
 
     iter2 = version_to_file_map.find(new_version);
     EXPECT_TRUE(iter2 != version_to_file_map.end());
+}
+
+// get_del_vec()'s default read path (no lake_io_opts.fs/location_provider) reads the delvec file
+// through fs::new_random_access_file() against the real local test filesystem, so a test cannot
+// observe the constructed RandomAccessFileOptions by injecting a filesystem double; hook the
+// SyncPoint the open site fires instead.
+TEST_F(MetaFileTest, test_get_del_vec_propagates_skip_peer_cache) {
+    const int64_t tablet_id = 10099;
+    const uint32_t segment_id = 1;
+    const int64_t version = 1;
+    auto tablet = std::make_shared<Tablet>(_tablet_manager.get(), tablet_id);
+    auto metadata = std::make_shared<TabletMetadata>();
+    metadata->set_id(tablet_id);
+    metadata->set_version(version);
+    metadata->set_next_rowset_id(1);
+    metadata->mutable_schema()->set_keys_type(PRIMARY_KEYS);
+
+    MetaFileBuilder builder(*tablet, metadata);
+    DelVector dv;
+    dv.set_empty();
+    std::shared_ptr<DelVector> ndv;
+    std::vector<uint32_t> dels = {1, 2, 3};
+    dv.add_dels_as_new_version(dels, version, &ndv);
+    builder.append_delvec(ndv, segment_id);
+    ASSERT_TRUE(builder.finalize(next_id()).ok());
+    // MetaFileBuilder::finalize() proactively warms the delvec metacache (_fill_delvec_cache()),
+    // under the exact cache key get_del_vec() checks first. Without evicting it, both calls below
+    // would hit that cache and never reach the file open this test is trying to observe.
+    _tablet_manager->metacache()->prune();
+
+    ASSIGN_OR_ABORT(auto meta, _tablet_manager->get_tablet_metadata(tablet_id, version));
+
+    std::vector<bool> captured_skip_peer_cache;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer_sync_point([] {
+        SyncPoint::GetInstance()->ClearCallBack("MetaFile::get_del_vec_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("MetaFile::get_del_vec_options", [&](void* arg) {
+        captured_skip_peer_cache.push_back(static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache);
+    });
+
+    DelVector out;
+    LakeIOOptions suppressed_opts;
+    suppressed_opts.skip_peer_cache = true;
+    ASSERT_TRUE(get_del_vec(_tablet_manager.get(), *meta, segment_id, /*fill_cache=*/false, suppressed_opts, &out).ok());
+
+    LakeIOOptions default_opts;
+    ASSERT_TRUE(get_del_vec(_tablet_manager.get(), *meta, segment_id, /*fill_cache=*/false, default_opts, &out).ok());
+
+    ASSERT_EQ(2u, captured_skip_peer_cache.size());
+    EXPECT_TRUE(captured_skip_peer_cache[0]);
+    EXPECT_FALSE(captured_skip_peer_cache[1]);
 }
 
 TEST_F(MetaFileTest, test_delvec_read_loop) {

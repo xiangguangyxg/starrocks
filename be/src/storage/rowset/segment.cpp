@@ -271,7 +271,8 @@ Status Segment::_open(size_t* footer_length_hint, const FooterPointerPB* partial
                       const LakeIOOptions& lake_io_opts) {
     SegmentFooterPB footer;
     RandomAccessFileOptions opts{.skip_fill_local_cache = !lake_io_opts.fill_data_cache,
-                                 .buffer_size = lake_io_opts.buffer_size};
+                                 .buffer_size = lake_io_opts.buffer_size,
+                                 .skip_peer_cache = lake_io_opts.skip_peer_cache};
 
     if (!_segment_file_info.encryption_meta.empty()) {
         ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(_segment_file_info.encryption_meta));
@@ -414,7 +415,8 @@ Status Segment::load_index(const LakeIOOptions& lake_io_opts) {
 Status Segment::_load_index(const LakeIOOptions& lake_io_opts) {
     // read and parse short key index page
     RandomAccessFileOptions file_opts{.skip_fill_local_cache = !lake_io_opts.fill_data_cache,
-                                      .buffer_size = lake_io_opts.buffer_size};
+                                      .buffer_size = lake_io_opts.buffer_size,
+                                      .skip_peer_cache = lake_io_opts.skip_peer_cache};
     if (_encryption_info) {
         file_opts.encryption_info = *_encryption_info;
     } else if (!_segment_file_info.encryption_meta.empty()) {
@@ -454,17 +456,17 @@ bool Segment::has_loaded_index() const {
     return invoked(_load_index_once);
 }
 
-bool Segment::use_full_sort_key_index() {
-    return config::enable_full_sort_key_index_read && ensure_full_sort_key_index_usable();
+bool Segment::use_full_sort_key_index(const LakeIOOptions& lake_io_opts) {
+    return config::enable_full_sort_key_index_read && ensure_full_sort_key_index_usable(lake_io_opts);
 }
 
-bool Segment::ensure_full_sort_key_index_usable() {
+bool Segment::ensure_full_sort_key_index_usable(const LakeIOOptions& lake_io_opts) {
     if (invoked(_load_full_sk_index_once)) {
         return _full_sort_key_index_usable.load(std::memory_order_acquire) == FullSortKeyIndexUsability::USABLE;
     }
     invoke_once(_load_full_sk_index_once, [&] {
         SCOPED_THREAD_LOCAL_CHECK_MEM_LIMIT_SETTER(false);
-        Status st = _has_full_sort_key_index_page ? _load_full_sort_key_index()
+        Status st = _has_full_sort_key_index_page ? _load_full_sort_key_index(lake_io_opts)
                                                   : Status::NotFound("segment has no full sort key index page");
         if (st.ok()) {
             _full_sort_key_index_usable.store(FullSortKeyIndexUsability::USABLE, std::memory_order_release);
@@ -482,20 +484,21 @@ bool Segment::ensure_full_sort_key_index_usable() {
     return _full_sort_key_index_usable.load(std::memory_order_acquire) == FullSortKeyIndexUsability::USABLE;
 }
 
-Status Segment::_load_full_sort_key_index() {
+Status Segment::_load_full_sort_key_index(const LakeIOOptions& lake_io_opts) {
     DCHECK(_has_full_sort_key_index_page);
 
     // The geometry validation below compares against the legacy short key page, so make sure it is
-    // loaded first. load_index() is idempotent; a query reaching here has typically loaded it
-    // already for the legacy seek path.
-    RETURN_IF_ERROR(load_index());
+    // loaded first, under the SAME lake_io_opts: if the legacy index is not already loaded, this is
+    // the open that loads it, and it must not silently fall back to a default (peer-allowed) policy.
+    RETURN_IF_ERROR(load_index(lake_io_opts));
     DCHECK(_sk_index_decoder != nullptr);
 
-    // This lazy, once-per-segment load has no caller LakeIOOptions to thread through, so do not fill
-    // the local data cache with this one-time index-page read: the page is retained in-memory by the
-    // decoder, and filling the disk cache here would evict useful data for the common
-    // fill_data_cache=false path (the legacy short key index honors that flag via _load_index).
-    RandomAccessFileOptions file_opts{.skip_fill_local_cache = true};
+    // This lazy, once-per-segment read never fills the local data cache regardless of the caller's
+    // fill_data_cache: the page is retained in-memory by the decoder, and filling the disk cache here
+    // would evict useful data for the common fill_data_cache=false path (the legacy short key index
+    // honors that flag via _load_index). skip_peer_cache is still threaded through, though, so a
+    // CACHE-SELECT-triggered load doesn't leak a peer read.
+    RandomAccessFileOptions file_opts{.skip_fill_local_cache = true, .skip_peer_cache = lake_io_opts.skip_peer_cache};
     if (_encryption_info) {
         file_opts.encryption_info = *_encryption_info;
     } else if (!_segment_file_info.encryption_meta.empty()) {

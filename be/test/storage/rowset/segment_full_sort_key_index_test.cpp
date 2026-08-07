@@ -85,6 +85,24 @@ static std::shared_ptr<TabletSchema> make_int_float_sortkey_schema() {
     return std::make_shared<TabletSchema>(pb);
 }
 
+namespace {
+
+// Records the skip_peer_cache flag of every RandomAccessFileOptions this filesystem builds a
+// reader from, in call order. Every file this test suite reads through it is the same segment, so
+// call order alone (not filename) distinguishes the legacy-index open from the full-key-page open.
+class OrderedSkipPeerCacheCapturingFileSystem : public MemoryFileSystem {
+public:
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                       const std::string& fname) override {
+        captured_skip_peer_cache.push_back(opts.skip_peer_cache);
+        return MemoryFileSystem::new_random_access_file(opts, fname);
+    }
+
+    std::vector<bool> captured_skip_peer_cache;
+};
+
+} // namespace
+
 // A 4-byte big-endian encoding, so numeric order == lexicographic byte order.
 static std::string be32(uint32_t v) {
     std::string s(4, '\0');
@@ -298,7 +316,7 @@ TEST_F(SegmentFullSortKeyIndexTest, dual_page_presence_then_lazy_usable) {
     // Legacy load alone still must not touch the full page.
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
 
-    EXPECT_TRUE(segment->use_full_sort_key_index());
+    EXPECT_TRUE(segment->use_full_sort_key_index({}));
     ASSERT_NE(nullptr, segment->full_sort_key_index_decoder());
     EXPECT_EQ(2U, segment->num_sort_key_columns());
     // Shared geometry: rows-per-block comes from the legacy decoder.
@@ -312,7 +330,7 @@ TEST_F(SegmentFullSortKeyIndexTest, legacy_only_not_present_not_usable) {
     auto segment = open_segment(path);
 
     EXPECT_FALSE(segment->has_full_sort_key_index_page());
-    EXPECT_FALSE(segment->use_full_sort_key_index());
+    EXPECT_FALSE(segment->use_full_sort_key_index({}));
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
 }
 
@@ -329,7 +347,7 @@ TEST_F(SegmentFullSortKeyIndexTest, read_off_never_reads_field11_and_malformed_f
         config::enable_full_sort_key_index_read = false;
         auto segment = open_segment(bad);
         EXPECT_TRUE(segment->has_full_sort_key_index_page()); // presence is footer-only
-        EXPECT_FALSE(segment->use_full_sort_key_index());
+        EXPECT_FALSE(segment->use_full_sort_key_index({}));
         ASSERT_OK(segment->load_index()); // reads field 9 only
         std::vector<std::string> sk;
         ASSERT_OK(segment->get_short_key_index(&sk));
@@ -340,8 +358,8 @@ TEST_F(SegmentFullSortKeyIndexTest, read_off_never_reads_field11_and_malformed_f
     {
         config::enable_full_sort_key_index_read = true;
         auto segment = open_segment(bad);
-        EXPECT_FALSE(segment->use_full_sort_key_index());
-        EXPECT_FALSE(segment->ensure_full_sort_key_index_usable()); // permanent
+        EXPECT_FALSE(segment->use_full_sort_key_index({}));
+        EXPECT_FALSE(segment->ensure_full_sort_key_index_usable({})); // permanent
         EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
         ASSERT_OK(segment->load_index()); // legacy still fine
     }
@@ -363,7 +381,7 @@ TEST_F(SegmentFullSortKeyIndexTest, geometry_or_arity_mismatch_unusable) {
                                         /*full_sort_key=*/true, /*arity=*/2, sorted_keys(items));
         auto segment = open_segment(p);
         EXPECT_TRUE(segment->has_full_sort_key_index_page());
-        EXPECT_FALSE(segment->use_full_sort_key_index());
+        EXPECT_FALSE(segment->use_full_sort_key_index({}));
         EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
     }
     // Arity mismatch: num_sort_key_columns != schema sort-key arity (2).
@@ -372,7 +390,7 @@ TEST_F(SegmentFullSortKeyIndexTest, geometry_or_arity_mismatch_unusable) {
                                         /*arity=*/1, sorted_keys(items));
         auto segment = open_segment(p);
         EXPECT_TRUE(segment->has_full_sort_key_index_page());
-        EXPECT_FALSE(segment->use_full_sort_key_index());
+        EXPECT_FALSE(segment->use_full_sort_key_index({}));
         EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
     }
     // Also: a legacy SHORT_KEY_PAGE placed in field 11 (wrong page type) is unusable.
@@ -380,7 +398,7 @@ TEST_F(SegmentFullSortKeyIndexTest, geometry_or_arity_mismatch_unusable) {
         auto p = rewrite_with_full_page("d_enc", base, rpb, seg_rows, /*full_sort_key=*/false,
                                         /*arity=*/2, sorted_keys(items));
         auto segment = open_segment(p);
-        EXPECT_FALSE(segment->use_full_sort_key_index());
+        EXPECT_FALSE(segment->use_full_sort_key_index({}));
     }
 }
 
@@ -403,7 +421,7 @@ TEST_F(SegmentFullSortKeyIndexTest, key_order_corrupt_unusable) {
                                     /*full_sort_key=*/true, /*arity=*/2, keys);
     auto segment = open_segment(p);
     EXPECT_TRUE(segment->has_full_sort_key_index_page());
-    EXPECT_FALSE(segment->use_full_sort_key_index());
+    EXPECT_FALSE(segment->use_full_sort_key_index({}));
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
 }
 
@@ -416,7 +434,7 @@ TEST_F(SegmentFullSortKeyIndexTest, concurrent_first_use_publishes_once) {
 
     std::atomic<int> usable_count{0};
     auto worker = [&] {
-        if (segment->use_full_sort_key_index()) {
+        if (segment->use_full_sort_key_index({})) {
             usable_count.fetch_add(1);
         }
     };
@@ -453,8 +471,65 @@ TEST_F(SegmentFullSortKeyIndexTest, nonencodable_sortkey_schema_unusable) {
                                     /*full_sort_key=*/true, /*arity=*/2, sorted_keys(legacy.num_items()));
     auto segment = open_segment(p);
     EXPECT_TRUE(segment->has_full_sort_key_index_page());
-    EXPECT_FALSE(segment->use_full_sort_key_index());
+    EXPECT_FALSE(segment->use_full_sort_key_index({}));
     EXPECT_EQ(nullptr, segment->full_sort_key_index_decoder());
+}
+
+// Required regression: a Segment cached by TabletManager must not latch the policy of the query
+// that first opened it. A normal (peer-allowed) scan opens the Segment and leaves its legacy short
+// key index unloaded; a LATER CACHE SELECT query is the one that triggers the lazy full-sort-key
+// load, and that load must carry ITS policy (peer suppressed) into BOTH the legacy-index open (the
+// prerequisite _load_full_sort_key_index() performs internally via load_index()) and the
+// full-sort-key page open itself -- not the normal scan's peer-allowed policy from open() time. A
+// test using one policy per Segment, or that watches only the final open, would pass against a
+// design that latches open()'s policy on the Segment; this one does not.
+TEST_F(SegmentFullSortKeyIndexTest, cache_select_lazy_load_does_not_inherit_open_time_policy) {
+    config::enable_full_sort_key_index_read = true;
+    auto capture_fs = std::make_shared<OrderedSkipPeerCacheCapturingFileSystem>();
+    ASSERT_OK(capture_fs->create_dir(kDir));
+    _fs = capture_fs;
+
+    auto path = write_segment("h_base", /*write_full=*/true);
+
+    // A normal (peer-allowed) scan opens and caches the Segment, as TabletManager would, but never
+    // loads the legacy short key index -- exactly the state a freshly cached Segment is in before
+    // its first query.
+    auto segment = open_segment(path);
+    ASSERT_FALSE(segment->has_loaded_index());
+
+    // Record every open from here on: a LATER CACHE SELECT is the first query to request the full
+    // sort key index, triggering both the prerequisite legacy-index load and the full-key page load
+    // in one lazy pass.
+    capture_fs->captured_skip_peer_cache.clear();
+    LakeIOOptions cache_select_opts;
+    cache_select_opts.skip_peer_cache = true;
+    EXPECT_TRUE(segment->use_full_sort_key_index(cache_select_opts));
+
+    ASSERT_GE(capture_fs->captured_skip_peer_cache.size(), 2u); // legacy-index open + full-key open
+    for (bool suppressed : capture_fs->captured_skip_peer_cache) {
+        EXPECT_TRUE(suppressed);
+    }
+}
+
+// Control: with no later CACHE SELECT, a peer-allowed query's lazy load keeps peer reads allowed
+// for both the legacy-index open and the full-key open.
+TEST_F(SegmentFullSortKeyIndexTest, normal_query_lazy_load_keeps_peer_allowed) {
+    config::enable_full_sort_key_index_read = true;
+    auto capture_fs = std::make_shared<OrderedSkipPeerCacheCapturingFileSystem>();
+    ASSERT_OK(capture_fs->create_dir(kDir));
+    _fs = capture_fs;
+
+    auto path = write_segment("h_control", /*write_full=*/true);
+    auto segment = open_segment(path);
+    ASSERT_FALSE(segment->has_loaded_index());
+
+    capture_fs->captured_skip_peer_cache.clear();
+    EXPECT_TRUE(segment->use_full_sort_key_index({}));
+
+    ASSERT_GE(capture_fs->captured_skip_peer_cache.size(), 2u);
+    for (bool suppressed : capture_fs->captured_skip_peer_cache) {
+        EXPECT_FALSE(suppressed);
+    }
 }
 
 } // namespace starrocks

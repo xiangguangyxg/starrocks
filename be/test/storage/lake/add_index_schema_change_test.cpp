@@ -21,6 +21,7 @@
 
 #include "base/testutil/assert.h"
 #include "base/testutil/id_generator.h"
+#include "base/testutil/sync_point.h"
 #include "base/utility/defer_op.h"
 #include "column/binary_column.h"
 #include "column/chunk.h"
@@ -740,13 +741,38 @@ TEST_F(AddIndexSchemaChangeTest, idg_backed_bitmap_iterator_smoke) {
     ix_opts.query_version = version;
     ix_opts.col_unique_id = _c1_uid;
 
+    // The .idx sidecar opens via FileSystemFactory::CreateSharedFromString(idx_path), not
+    // ix_opts.lake_io_opts.fs, so a test cannot observe the constructed RandomAccessFileOptions by
+    // injecting a filesystem double; hook the SyncPoint the open site fires instead.
+    std::vector<bool> captured_skip_peer_cache;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer_sync_point([] {
+        SyncPoint::GetInstance()->ClearCallBack("ColumnReader::idg_sidecar_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ColumnReader::idg_sidecar_open_options", [&](void* arg) {
+        captured_skip_peer_cache.push_back(static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache);
+    });
+
     // 4. Construct the IDG-backed iterator. Just opening it exercises the
     //    helper; we don't need to drive a query.
+    ix_opts.lake_io_opts.skip_peer_cache = true;
     BitmapIndexIterator* iter = nullptr;
     auto* reader = const_cast<ColumnReader*>(reader_const);
     ASSERT_OK(reader->new_bitmap_index_iterator(ix_opts, &iter));
     ASSERT_TRUE(iter != nullptr);
     delete iter;
+
+    // Control: default (peer allowed).
+    ix_opts.lake_io_opts.skip_peer_cache = false;
+    BitmapIndexIterator* iter2 = nullptr;
+    ASSERT_OK(reader->new_bitmap_index_iterator(ix_opts, &iter2));
+    ASSERT_TRUE(iter2 != nullptr);
+    delete iter2;
+
+    ASSERT_EQ(2u, captured_skip_peer_cache.size());
+    EXPECT_TRUE(captured_skip_peer_cache[0]);
+    EXPECT_FALSE(captured_skip_peer_cache[1]);
 }
 
 // End-to-end read-side coverage for column_reader.cpp's IDG-backed
@@ -821,6 +847,18 @@ TEST_F(AddIndexSchemaChangeTest, idg_backed_bloom_filter_smoke) {
     ix_opts.query_version = version;
     ix_opts.col_unique_id = _c2_uid;
 
+    // Same capture rationale as idg_backed_bitmap_iterator_smoke: the .idx sidecar open cannot be
+    // observed via ix_opts.lake_io_opts.fs, so hook the SyncPoint the open site fires instead.
+    std::vector<bool> captured_skip_peer_cache;
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer_sync_point([] {
+        SyncPoint::GetInstance()->ClearCallBack("ColumnReader::idg_sidecar_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ColumnReader::idg_sidecar_open_options", [&](void* arg) {
+        captured_skip_peer_cache.push_back(static_cast<RandomAccessFileOptions*>(arg)->skip_peer_cache);
+    });
+
     // 4. Invoke the IDG-backed BF path. Empty predicates + empty row_ranges
     //    cause the for-loop in the function body to be a no-op, so we don't
     //    need a real predicate construction; the IDG branch above still
@@ -829,7 +867,16 @@ TEST_F(AddIndexSchemaChangeTest, idg_backed_bloom_filter_smoke) {
     std::vector<const ColumnPredicate*> empty_predicates;
     SparseRange<> empty_ranges;
     auto* reader = const_cast<ColumnReader*>(reader_const);
+    ix_opts.lake_io_opts.skip_peer_cache = true;
     ASSERT_OK(reader->ngram_bloom_filter(empty_predicates, &empty_ranges, ix_opts));
+
+    // Control: default (peer allowed).
+    ix_opts.lake_io_opts.skip_peer_cache = false;
+    ASSERT_OK(reader->ngram_bloom_filter(empty_predicates, &empty_ranges, ix_opts));
+
+    ASSERT_EQ(2u, captured_skip_peer_cache.size());
+    EXPECT_TRUE(captured_skip_peer_cache[0]);
+    EXPECT_FALSE(captured_skip_peer_cache[1]);
 }
 
 // Regression for the IDG bloom-filter build-vs-read granularity mismatch.

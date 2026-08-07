@@ -31,6 +31,7 @@ struct LakeScanCacheOptions {
     bool fill_data_cache = false;
     bool fill_metadata_cache = false;
     bool skip_disk_cache = false;
+    bool skip_peer_cache = false;
 };
 
 class LakeScanLazyMaterializationContext : public GlobalLateMaterilizationContext {

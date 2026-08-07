@@ -1197,7 +1197,9 @@ Status get_del_vec(TabletManager* tablet_mgr, const TabletMetadata& metadata, co
         return Status::InternalError("Can't find delvec file name");
     }
     const auto& delvec_name = iter->second.name();
-    RandomAccessFileOptions opts{.skip_fill_local_cache = !lake_io_opts.fill_data_cache};
+    RandomAccessFileOptions opts{.skip_fill_local_cache = !lake_io_opts.fill_data_cache,
+                                 .skip_peer_cache = lake_io_opts.skip_peer_cache};
+    TEST_SYNC_POINT_CALLBACK("MetaFile::get_del_vec_options", &opts);
     {
         TRACE_COUNTER_SCOPE_LATENCY_US("delvec_file_read_latency_us");
         std::unique_ptr<RandomAccessFile> rf;

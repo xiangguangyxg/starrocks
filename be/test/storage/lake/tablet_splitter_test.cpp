@@ -1561,7 +1561,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, FewerThanTwoBlocksYieldsEmptySamplesA
                         write_and_open_int_key_segment(_fs, kDir + "/seg_" + std::to_string(num_rows) + ".dat", _schema,
                                                        num_rows));
         ASSERT_TRUE(segment->has_full_sort_key_index_page());
-        ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+        ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
 
         SegmentSplitInfo info;
         info.num_rows = num_rows;
@@ -1582,7 +1582,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, OrderedRowsNonDecreasingSamplesPartia
     const int64_t num_rows = 250;
     ASSIGN_OR_ABORT(auto segment, write_and_open_int_key_segment(_fs, kDir + "/seg_ordered.dat", _schema, num_rows));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
-    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
     ASSERT_EQ(100u, segment->num_rows_per_block());
 
     SegmentSplitInfo info;
@@ -1609,7 +1609,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, ExactlyBlockAligned) {
     const int64_t num_rows = 300;
     ASSIGN_OR_ABORT(auto segment, write_and_open_int_key_segment(_fs, kDir + "/seg_aligned.dat", _schema, num_rows));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
-    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
 
     SegmentSplitInfo info;
     info.num_rows = num_rows;
@@ -1632,7 +1632,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, ArityMismatchReturnsFalseAndLeavesSam
     const int64_t num_rows = 250;
     ASSIGN_OR_ABORT(auto segment, write_and_open_int_key_segment(_fs, kDir + "/seg_arity.dat", _schema, num_rows));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
-    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
     ASSERT_EQ(1u, segment->num_sort_key_columns());
 
     SegmentSplitInfo info;
@@ -1655,7 +1655,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, OutOfRangeSamplesReturnFalseAndLeaveS
     const int64_t num_rows = 250;
     ASSIGN_OR_ABORT(auto segment, write_and_open_int_key_segment(_fs, kDir + "/seg_oor.dat", _schema, num_rows));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
-    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
 
     SegmentSplitInfo info;
     info.num_rows = num_rows;
@@ -1678,7 +1678,7 @@ TEST_F(FullSortKeyShortKeyIndexLoaderTest, BoundariesMatchMetadataSamplePath) {
     const int64_t num_rows = 250;
     ASSIGN_OR_ABORT(auto segment, write_and_open_int_key_segment(_fs, kDir + "/seg_cmp.dat", _schema, num_rows));
     ASSERT_TRUE(segment->has_full_sort_key_index_page());
-    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable());
+    ASSERT_TRUE(segment->ensure_full_sort_key_index_usable({}));
 
     SegmentSplitInfo from_index = make_int32_seg(0, static_cast<int32_t>(num_rows - 1), num_rows, /*data_size=*/2500,
                                                  /*source_id=*/1);

@@ -160,13 +160,18 @@ public:
     // Query read gate. True only when the read config is on AND the full sort key index page is
     // present, loads, and passes validation (encoding/geometry/arity/order). Triggers the lazy
     // load+validate on first call; a true return guarantees a non-null validated full decoder.
-    bool use_full_sort_key_index();
+    // |lake_io_opts| is the CURRENT query's policy: the lazy load fires at most once per segment, so
+    // whichever caller wins the race is the one whose lake_io_opts (e.g. skip_peer_cache) governs the
+    // resulting file opens. Do not latch a policy on the Segment itself -- Segments are cached by
+    // TabletManager and this load can be triggered by a later, differently-policied query.
+    bool use_full_sort_key_index(const LakeIOOptions& lake_io_opts);
 
     // Lazily read+parse+validate the full sort key index page (footer field 11) exactly once in a
     // thread-safe way. On success publishes the full decoder and charges its memory; on any failure
     // records permanent unusability (no retained allocation) and falls back to the legacy page.
-    // Returns whether the full page is usable.
-    bool ensure_full_sort_key_index_usable();
+    // Returns whether the full page is usable. See use_full_sort_key_index() for the |lake_io_opts|
+    // once-wins-the-race caveat.
+    bool ensure_full_sort_key_index_usable(const LakeIOOptions& lake_io_opts);
 
     // Number of sort key columns encoded by the full sort key index page. Only valid after
     // ensure_full_sort_key_index_usable() has published the full decoder.
@@ -328,7 +333,7 @@ private:
 
     // Read+parse+validate the full sort key index page into _full_sk_index_handle/_decoder and
     // charge its incremental memory. Called at most once via ensure_full_sort_key_index_usable().
-    Status _load_full_sort_key_index();
+    Status _load_full_sort_key_index(const LakeIOOptions& lake_io_opts);
 
     void _reset();
 

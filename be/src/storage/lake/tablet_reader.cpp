@@ -177,10 +177,13 @@ static StatusOr<SparseRange<>> build_initial_coarse_scan_range(const SegmentPtr&
         RETURN_IF_ERROR(segment->load_index(segment_read_options.lake_io_opts));
     }
     ASSIGN_OR_RETURN(auto scan_range,
-                     block_aligned_rowid_range_from_seek_ranges(segment.get(), segment_read_options.ranges));
+                     block_aligned_rowid_range_from_seek_ranges(segment.get(), segment_read_options.ranges,
+                                                                segment_read_options.lake_io_opts));
     if (segment_read_options.tablet_range.has_value() && !segment_read_options.tablet_range->all_range()) {
-        ASSIGN_OR_RETURN(auto tablet_scan_range, block_aligned_rowid_range_from_seek_ranges(
-                                                         segment.get(), {segment_read_options.tablet_range.value()}));
+        ASSIGN_OR_RETURN(auto tablet_scan_range,
+                         block_aligned_rowid_range_from_seek_ranges(segment.get(),
+                                                                    {segment_read_options.tablet_range.value()},
+                                                                    segment_read_options.lake_io_opts));
         scan_range &= tablet_scan_range;
     }
     return scan_range;

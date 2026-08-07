@@ -2023,7 +2023,8 @@ Status SegmentIterator::_init_column_iterator_by_cid(const ColumnId cid, const C
 
     RandomAccessFileOptions opts{.skip_fill_local_cache = !_opts.lake_io_opts.fill_data_cache,
                                  .buffer_size = _opts.lake_io_opts.buffer_size,
-                                 .skip_disk_cache = _opts.lake_io_opts.skip_disk_cache};
+                                 .skip_disk_cache = _opts.lake_io_opts.skip_disk_cache,
+                                 .skip_peer_cache = _opts.lake_io_opts.skip_peer_cache};
 
     std::string dcg_filename;
     FileEncryptionInfo dcg_encryption_info;
@@ -2635,7 +2636,7 @@ Status SegmentIterator::_lookup_ordinal(const SeekTuple& key, bool lower, rowid_
     // safe to read use_full_sort_key_index() directly (go-forward rollback: a newly-started query
     // seeks off the legacy page whenever the read config is off or the full page is unusable). A true
     // return guarantees the full decoder is published, so lower_bound_full/upper_bound_full are valid.
-    const bool use_full_sort_key = _segment->use_full_sort_key_index();
+    const bool use_full_sort_key = _segment->use_full_sort_key_index(_opts.lake_io_opts);
     bool use_index = true;
     std::string index_key;
     if (use_full_sort_key) {
@@ -2714,7 +2715,7 @@ Status SegmentIterator::_lookup_ordinal(const Slice& index_key, const Schema& sh
     // ShortKeyOption::use_full_sort_key (short_key_encode vs. full_sort_key_encode); |is_full_sort_key|
     // is that pin. It selects BOTH the short key decoder and the row re-encode below -- never a fresh
     // read-config read -- so a mid-flight config flip cannot desync the producer from this consumer.
-    if (is_full_sort_key && !_segment->ensure_full_sort_key_index_usable()) {
+    if (is_full_sort_key && !_segment->ensure_full_sort_key_index_usable(_opts.lake_io_opts)) {
         // The producer only pins FULL after a usability request succeeded; if the full page is
         // unexpectedly unusable now, never reinterpret full-key bytes with the legacy decoder.
         return Status::InternalError("full sort key index page is not usable for a full-key pinned boundary");
@@ -5015,10 +5016,11 @@ StatusOr<SparseRange<>> get_prepared_pruned_row_ranges(const std::shared_ptr<Seg
     return iter.prepared_pruned_row_ranges();
 }
 
-static rowid_t lower_bound_block_aligned_rowid(Segment* segment, const SeekTuple& key, bool lower) {
+static rowid_t lower_bound_block_aligned_rowid(Segment* segment, const SeekTuple& key, bool lower,
+                                               const LakeIOOptions& lake_io_opts) {
     // Live read gate (physical split producer==consumer, no time gap): a true return guarantees the
     // full decoder is published, so lower_bound_full is valid; read off => legacy page (rollback).
-    const bool use_full_sort_key = segment->use_full_sort_key_index();
+    const bool use_full_sort_key = segment->use_full_sort_key_index(lake_io_opts);
     std::string index_key;
     if (use_full_sort_key) {
         auto encoded = encode_full_sort_key_search_key(segment, key, lower);
@@ -5047,9 +5049,10 @@ static rowid_t lower_bound_block_aligned_rowid(Segment* segment, const SeekTuple
     return start_block_id * segment->num_rows_per_block();
 }
 
-static rowid_t upper_bound_block_aligned_rowid(Segment* segment, const SeekTuple& key, bool lower, rowid_t end) {
+static rowid_t upper_bound_block_aligned_rowid(Segment* segment, const SeekTuple& key, bool lower, rowid_t end,
+                                               const LakeIOOptions& lake_io_opts) {
     // Live read gate (physical split producer==consumer, no time gap); read off => legacy page.
-    const bool use_full_sort_key = segment->use_full_sort_key_index();
+    const bool use_full_sort_key = segment->use_full_sort_key_index(lake_io_opts);
     std::string index_key;
     if (use_full_sort_key) {
         auto encoded = encode_full_sort_key_search_key(segment, key, lower);
@@ -5070,7 +5073,8 @@ static rowid_t upper_bound_block_aligned_rowid(Segment* segment, const SeekTuple
 }
 
 StatusOr<SparseRange<>> block_aligned_rowid_range_from_seek_ranges(Segment* segment,
-                                                                   const std::vector<SeekRange>& ranges) {
+                                                                   const std::vector<SeekRange>& ranges,
+                                                                   const LakeIOOptions& lake_io_opts) {
     if (segment == nullptr) {
         return Status::InvalidArgument("segment is null");
     }
@@ -5086,10 +5090,10 @@ StatusOr<SparseRange<>> block_aligned_rowid_range_from_seek_ranges(Segment* segm
         rowid_t upper_rowid = segment->num_rows();
         if (!range.upper().empty()) {
             upper_rowid = upper_bound_block_aligned_rowid(segment, range.upper(), !range.inclusive_upper(),
-                                                          segment->num_rows());
+                                                          segment->num_rows(), lake_io_opts);
         }
         if (!range.lower().empty() && upper_rowid > 0) {
-            lower_rowid = lower_bound_block_aligned_rowid(segment, range.lower(), range.inclusive_lower());
+            lower_rowid = lower_bound_block_aligned_rowid(segment, range.lower(), range.inclusive_lower(), lake_io_opts);
         }
         if (lower_rowid <= upper_rowid) {
             scan_range.add(Range<>(lower_rowid, upper_rowid));

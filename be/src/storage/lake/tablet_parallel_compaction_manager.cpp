@@ -2487,7 +2487,7 @@ StatusOr<std::vector<SegmentSplitInfo>> TabletParallelCompactionManager::_collec
             // full page when it exists and validates. ensure_full_sort_key_index_usable() lazily
             // reads/validates it.
             if (opened_segment != nullptr && opened_segment->load_index().ok() &&
-                opened_segment->has_full_sort_key_index_page() && opened_segment->ensure_full_sort_key_index_usable()) {
+                opened_segment->has_full_sort_key_index_page() && opened_segment->ensure_full_sort_key_index_usable({})) {
                 ASSIGN_OR_RETURN(const bool loaded, segment.load_samples_from_short_key_index(
                                                             *opened_segment, rowset_schema, sort_key_idxes));
                 // Data-safe fallback: a full page whose decoded samples fail runtime validation yields

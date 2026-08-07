@@ -510,4 +510,18 @@ TEST_F(LakeScanTabletAdaptorCacheTest, QueryLevelPageCacheOffWins) {
     EXPECT_TRUE(observed.lake_io_opts.fill_data_cache);
 }
 
+// The scan range's peer-cache policy must reach the lookup's reads too: a CACHE SELECT that
+// suppressed peer reads must not have the GLM lookup silently re-enable them by dropping the flag
+// somewhere along LakeScanCacheOptions -> LakeIOOptions -> RowsetReadOptions -> SegmentReadOptions.
+TEST_F(LakeScanTabletAdaptorCacheTest, SkipPeerCachePolicyIsHonored) {
+    auto observed = run_lookup({.use_page_cache = true,
+                               .fill_data_cache = true,
+                               .fill_metadata_cache = true,
+                               .skip_disk_cache = false,
+                               .skip_peer_cache = true},
+                               /*query_use_page_cache=*/true);
+    ASSERT_TRUE(observed.seen);
+    EXPECT_TRUE(observed.lake_io_opts.skip_peer_cache);
+}
+
 } // namespace starrocks

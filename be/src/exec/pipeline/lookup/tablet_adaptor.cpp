@@ -278,6 +278,7 @@ Status LakeScanTabletAdaptor::init_schema(RuntimeState* state) {
     _lake_io_opts.fill_data_cache = cache_options.fill_data_cache;
     _lake_io_opts.fill_metadata_cache = cache_options.fill_metadata_cache;
     _lake_io_opts.skip_disk_cache = cache_options.skip_disk_cache;
+    _lake_io_opts.skip_peer_cache = cache_options.skip_peer_cache;
     auto* tablet_mgr = StorageEnv::GetInstance()->lake_tablet_manager();
     const auto& lake_scan_node = _glm_ctx->scan_node();
 

@@ -38,6 +38,7 @@
 
 #include <functional>
 #include <iostream>
+#include <unordered_map>
 
 #include "base/failpoint/fail_point.h"
 #include "base/testutil/assert.h"
@@ -68,6 +69,45 @@ using std::shared_ptr;
 using std::vector;
 
 using ValueGenerator = std::function<Datum(size_t rid, int cid, int block_id)>;
+
+namespace {
+
+// Records the skip_peer_cache flag of every RandomAccessFileOptions this filesystem builds a
+// reader from, keyed by filename. Used to assert that Segment/SegmentIterator thread
+// LakeIOOptions::skip_peer_cache into the RandomAccessFileOptions of every leaf file open.
+class PerFileSkipPeerCacheCapturingFileSystem : public MemoryFileSystem {
+public:
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                       const std::string& fname) override {
+        captured_skip_peer_cache[fname].push_back(opts.skip_peer_cache);
+        return MemoryFileSystem::new_random_access_file(opts, fname);
+    }
+
+    std::unordered_map<std::string, std::vector<bool>> captured_skip_peer_cache;
+};
+
+// Minimal DeltaColumnGroupLoader stub that always returns a fixed, caller-supplied list, bypassing
+// the RocksDB-backed LocalDeltaColumnGroupLoader used in production.
+class FixedDeltaColumnGroupLoader : public DeltaColumnGroupLoader {
+public:
+    explicit FixedDeltaColumnGroupLoader(DeltaColumnGroupList dcgs) : _dcgs(std::move(dcgs)) {}
+
+    Status load(const TabletSegmentId& tsid, int64_t version, DeltaColumnGroupList* pdcgs) override {
+        *pdcgs = _dcgs;
+        return Status::OK();
+    }
+
+    Status load(int64_t tablet_id, RowsetId rowsetid, uint32_t segment_id, int64_t version,
+               DeltaColumnGroupList* pdcgs) override {
+        *pdcgs = _dcgs;
+        return Status::OK();
+    }
+
+private:
+    DeltaColumnGroupList _dcgs;
+};
+
+} // namespace
 
 // 0,  1,  2,  3
 // 10, 11, 12, 13
@@ -613,6 +653,157 @@ TEST_F(SegmentReaderWriterTest, TestCheckColumnUniqueIdUniqueness) {
             << "Expected InternalError, got: " << st.code() << ", message: " << st.message();
     EXPECT_EQ(st.message(), "Duplicate column id found in tablet schema")
             << "Error message should indicate duplicate column id in tablet schema.";
+}
+
+// Segment::_open() and Segment::_load_index() read through the Segment's own _fs, not
+// lake_io_opts.fs, so the capturing double must be the fs the Segment is opened with.
+TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedAtOpenAndLoadIndex) {
+    auto capture_fs = std::make_shared<PerFileSkipPeerCacheCapturingFileSystem>();
+    ASSERT_TRUE(capture_fs->create_dir(kSegmentDir).ok());
+
+    std::shared_ptr<TabletSchema> tablet_schema =
+            TabletSchemaHelper::create_tablet_schema({create_int_key_pb(1), create_int_value_pb(2)});
+    std::string file_name = kSegmentDir + "/skip_peer_cache_case";
+    {
+        SegmentWriterOptions opts;
+        ASSIGN_OR_ABORT(auto wfile, capture_fs->new_writable_file(file_name));
+        SegmentWriter writer(std::move(wfile), 0, tablet_schema, opts);
+        ASSERT_OK(writer.init());
+        auto schema = ChunkHelper::convert_schema(tablet_schema);
+        auto chunk = ChunkFactory::new_chunk(schema, 10);
+        for (size_t rid = 0; rid < 10; ++rid) {
+            auto cols = chunk->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid)));
+            cols[1]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid + 1)));
+        }
+        ASSERT_OK(writer.append_chunk(*chunk));
+        uint64_t file_size, index_size, footer_position;
+        ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+    }
+
+    // _open(): the footer read's RandomAccessFileOptions carries skip_peer_cache=true.
+    {
+        capture_fs->captured_skip_peer_cache.clear();
+        LakeIOOptions lake_io_opts;
+        lake_io_opts.skip_peer_cache = true;
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema, nullptr,
+                                                    nullptr, lake_io_opts));
+        ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
+        EXPECT_TRUE(capture_fs->captured_skip_peer_cache[file_name].back());
+    }
+    // Control: default LakeIOOptions leave peer reads allowed.
+    {
+        capture_fs->captured_skip_peer_cache.clear();
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema));
+        ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
+        EXPECT_FALSE(capture_fs->captured_skip_peer_cache[file_name].back());
+    }
+    // load_index(): the short key index page's RandomAccessFileOptions carries skip_peer_cache=true.
+    {
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema));
+        capture_fs->captured_skip_peer_cache.clear();
+        LakeIOOptions lake_io_opts;
+        lake_io_opts.skip_peer_cache = true;
+        ASSERT_OK(segment->load_index(lake_io_opts));
+        ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
+        EXPECT_TRUE(capture_fs->captured_skip_peer_cache[file_name].back());
+    }
+    // Control: default LakeIOOptions leave peer reads allowed.
+    {
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{file_name}, 0, tablet_schema));
+        capture_fs->captured_skip_peer_cache.clear();
+        ASSERT_OK(segment->load_index());
+        ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[file_name].size());
+        EXPECT_FALSE(capture_fs->captured_skip_peer_cache[file_name].back());
+    }
+}
+
+// SegmentIterator's column open (segment_iterator.cpp's _init_column_iterator_by_cid) and the
+// DCG-covered column's data open both read through SegmentReadOptions::fs, not lake_io_opts.fs.
+TEST_F(SegmentReaderWriterTest, TestSkipPeerCachePropagatedThroughIteratorColumnAndDcgOpens) {
+    auto capture_fs = std::make_shared<PerFileSkipPeerCacheCapturingFileSystem>();
+    ASSERT_TRUE(capture_fs->create_dir(kSegmentDir).ok());
+
+    // Main segment: col 1 (read normally) + col 2 (overridden by a delta column group).
+    std::shared_ptr<TabletSchema> tablet_schema =
+            TabletSchemaHelper::create_tablet_schema({create_int_key_pb(1), create_int_value_pb(2)});
+    std::string main_file = kSegmentDir + "/iter_main.dat";
+    {
+        SegmentWriterOptions opts;
+        ASSIGN_OR_ABORT(auto wfile, capture_fs->new_writable_file(main_file));
+        SegmentWriter writer(std::move(wfile), 0, tablet_schema, opts);
+        ASSERT_OK(writer.init());
+        auto schema = ChunkHelper::convert_schema(tablet_schema);
+        auto chunk = ChunkFactory::new_chunk(schema, 5);
+        for (size_t rid = 0; rid < 5; ++rid) {
+            auto cols = chunk->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid)));
+            cols[1]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid + 1)));
+        }
+        ASSERT_OK(writer.append_chunk(*chunk));
+        uint64_t file_size, index_size, footer_position;
+        ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+    }
+
+    // Delta column group file: just column 2's overriding values, as its own mini segment (the
+    // real "column mode partial update" layout).
+    std::shared_ptr<TabletSchema> dcg_schema = TabletSchemaHelper::create_tablet_schema({create_int_value_pb(2)});
+    std::string dcg_relative_file = "iter_dcg.cols";
+    std::string dcg_file = kSegmentDir + "/" + dcg_relative_file;
+    {
+        SegmentWriterOptions opts;
+        ASSIGN_OR_ABORT(auto wfile, capture_fs->new_writable_file(dcg_file));
+        SegmentWriter writer(std::move(wfile), 0, dcg_schema, opts);
+        ASSERT_OK(writer.init());
+        auto schema = ChunkHelper::convert_schema(dcg_schema);
+        auto chunk = ChunkFactory::new_chunk(schema, 5);
+        for (size_t rid = 0; rid < 5; ++rid) {
+            chunk->columns()[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid + 100)));
+        }
+        ASSERT_OK(writer.append_chunk(*chunk));
+        uint64_t file_size, index_size, footer_position;
+        ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+    }
+
+    DeltaColumnGroup dcg;
+    dcg.init(/*version=*/1, {{2}}, {dcg_relative_file});
+    auto dcg_loader =
+            std::make_shared<FixedDeltaColumnGroupLoader>(DeltaColumnGroupList{std::make_shared<DeltaColumnGroup>(dcg)});
+
+    auto run_scan = [&](bool skip_peer_cache) {
+        ASSIGN_OR_ABORT(auto segment, Segment::open(capture_fs, FileInfo{main_file}, 0, tablet_schema));
+        capture_fs->captured_skip_peer_cache.clear();
+
+        SegmentReadOptions seg_options;
+        seg_options.fs = capture_fs;
+        OlapReaderStatistics stats;
+        seg_options.stats = &stats;
+        seg_options.dcg_loader = dcg_loader;
+        seg_options.lake_io_opts.skip_peer_cache = skip_peer_cache;
+        auto schema = ChunkHelper::convert_schema(tablet_schema);
+        ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(schema, seg_options));
+        auto chunk = ChunkFactory::new_chunk(schema, 10);
+        ASSERT_OK(seg_iter->get_next(chunk.get()));
+        EXPECT_EQ(5u, chunk->num_rows());
+    };
+
+    // skip_peer_cache=true: both the normal column's data open and the DCG-covered column's data
+    // open carry suppression. (The DCG filename also records an earlier footer-read entry from
+    // opening the DCG child Segment through the parent's own _fs, which does not thread this
+    // query's policy -- that is the *other* leaf (segment.cpp's _open); .back() is the leaf under
+    // test here, the data open through SegmentReadOptions::fs.)
+    run_scan(/*skip_peer_cache=*/true);
+    ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[main_file].size());
+    EXPECT_TRUE(capture_fs->captured_skip_peer_cache[main_file].back());
+    ASSERT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].empty());
+    EXPECT_TRUE(capture_fs->captured_skip_peer_cache[dcg_file].back());
+
+    // Control: default (peer allowed).
+    run_scan(/*skip_peer_cache=*/false);
+    ASSERT_EQ(1u, capture_fs->captured_skip_peer_cache[main_file].size());
+    EXPECT_FALSE(capture_fs->captured_skip_peer_cache[main_file].back());
+    ASSERT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].empty());
+    EXPECT_FALSE(capture_fs->captured_skip_peer_cache[dcg_file].back());
 }
 
 } // namespace starrocks

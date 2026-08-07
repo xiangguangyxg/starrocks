@@ -619,7 +619,8 @@ Status LakeDataSource::init_tablet_reader(RuntimeState* runtime_state, bool use_
                                  LakeScanCacheOptions{.use_page_cache = _params.use_page_cache,
                                                       .fill_data_cache = _params.lake_io_opts.fill_data_cache,
                                                       .fill_metadata_cache = _params.lake_io_opts.fill_metadata_cache,
-                                                      .skip_disk_cache = _params.lake_io_opts.skip_disk_cache});
+                                                      .skip_disk_cache = _params.lake_io_opts.skip_disk_cache,
+                                                      .skip_peer_cache = _params.lake_io_opts.skip_peer_cache});
     }
 
     // Setup SST warmup callback for CACHE SELECT on PK tables

@@ -190,7 +190,7 @@ StatusOr<TabletEncodingDecision> decide_tablet_encoding(const TabletSchemaCSPtr&
             // corrupt/misordered full page, degrades this segment to legacy here -> UNIFORM_LEGACY
             // morsels (go-forward rollback / data-safe fallback). A true return also publishes the
             // full decoder, which _create_segment_group then binds into the SegmentGroup.
-            sig.is_full_key = segment->use_full_sort_key_index();
+            sig.is_full_key = segment->use_full_sort_key_index({});
             const auto& segment_schema = segment->tablet_schema();
             for (auto idx : segment_schema.sort_key_idxes()) {
                 const auto& column = segment_schema.column(idx);
@@ -476,7 +476,10 @@ Status PhysicalSplitMorselQueue::_init_segment() {
         _segment_scan_range.add(Range<>(0, segment->num_rows()));
     } else {
         RETURN_IF_ERROR(segment->load_index());
-        ASSIGN_OR_RETURN(_segment_scan_range, block_aligned_rowid_range_from_seek_ranges(segment, _tablet_seek_ranges));
+        // No per-query LakeIOOptions is threaded into split planning; {} matches the pre-existing
+        // (peer-allowed) behavior of this path.
+        ASSIGN_OR_RETURN(_segment_scan_range,
+                         block_aligned_rowid_range_from_seek_ranges(segment, _tablet_seek_ranges, LakeIOOptions{}));
     }
 
     _segment_range_iter = _segment_scan_range.new_iterator();
@@ -791,7 +794,7 @@ StatusOr<SegmentGroupPtr> LogicalSplitMorselQueue::_create_segment_group(BaseRow
 
     for (const auto& segment : segments) {
         RETURN_IF_ERROR(segment->load_index());
-        if (_use_full_sort_key && !segment->ensure_full_sort_key_index_usable()) {
+        if (_use_full_sort_key && !segment->ensure_full_sort_key_index_usable({})) {
             // decide_tablet_encoding only pins UNIFORM_FULL_KEY after every scanned segment reported a
             // usable full page, so this should not happen; if it does, fail rather than build the group
             // over a legacy decoder that would misread the full-key boundaries.

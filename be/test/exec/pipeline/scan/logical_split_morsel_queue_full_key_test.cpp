@@ -389,7 +389,7 @@ TEST_F(LogicalSplitMorselQueueFullKeyTest, uniform_full_key_logical_split_matche
                                             write_segment(schema, 1, 50, 50, /*full_key=*/true)};
     // Dual-page segments, read gate on -> the logical split takes the full-key path.
     ASSERT_TRUE(a_segs[0]->has_full_sort_key_index_page());
-    ASSERT_TRUE(a_segs[0]->use_full_sort_key_index());
+    ASSERT_TRUE(a_segs[0]->use_full_sort_key_index({}));
     auto rowset_a = std::make_shared<FakeRowset>(a_segs, /*overlapped=*/false, /*id=*/1);
     // Rowset B (non-overlapped, 1 segment): i in [100, 150) -- above A's window.
     std::vector<SegmentSharedPtr> b_segs = {write_segment(schema, 0, 100, 50, /*full_key=*/true)};
@@ -925,7 +925,7 @@ TEST_F(LogicalSplitMorselQueueFullKeyTest, dual_page_read_off_uses_legacy_morsel
                                           write_segment(schema, 1, 50, 50, /*full_key=*/true)};
     // The full page is present, but the read gate is off, so the split must not use it.
     ASSERT_TRUE(segs[0]->has_full_sort_key_index_page());
-    ASSERT_FALSE(segs[0]->use_full_sort_key_index());
+    ASSERT_FALSE(segs[0]->use_full_sort_key_index({}));
     auto rowset = std::make_shared<FakeRowset>(segs, /*overlapped=*/false, /*id=*/1);
 
     std::vector<std::vector<BaseRowsetSharedPtr>> tablet_rowsets = {{rowset}};
@@ -1024,7 +1024,7 @@ TEST_F(LogicalSplitMorselQueueFullKeyTest, key_order_corrupt_full_page_falls_bac
     auto corrupt = write_segment_with_corrupt_full_page(schema, /*seg_id=*/0, /*begin=*/0, /*n=*/100);
     // Present but permanently unusable: usability validation rejects the misordered page.
     EXPECT_TRUE(corrupt->has_full_sort_key_index_page());
-    EXPECT_FALSE(corrupt->use_full_sort_key_index());
+    EXPECT_FALSE(corrupt->use_full_sort_key_index({}));
 
     auto rowset = std::make_shared<FakeRowset>(std::vector<SegmentSharedPtr>{corrupt}, /*overlapped=*/false, /*id=*/1);
     std::vector<std::vector<BaseRowsetSharedPtr>> tablet_rowsets = {{rowset}};

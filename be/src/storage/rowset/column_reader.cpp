@@ -41,6 +41,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/testutil/sync_point.h"
 #include "column/column.h"
 #include "column/column_access_path.h"
 #include "column/column_helper.h"
@@ -416,6 +417,11 @@ Status ColumnReader::_new_idg_backed_bitmap_index_iterator(const IndexReadOption
     if (!encryption_meta.empty()) {
         ASSIGN_OR_RETURN(raf_opts.encryption_info, KeyCache::instance().unwrap_encryption_meta(encryption_meta));
     }
+    raf_opts.skip_peer_cache = opts.lake_io_opts.skip_peer_cache;
+    // The filesystem comes from FileSystemFactory::CreateSharedFromString, not opts.lake_io_opts.fs,
+    // so a test cannot observe raf_opts by injecting a double through lake_io_opts.fs; hook here
+    // instead.
+    TEST_SYNC_POINT_CALLBACK("ColumnReader::idg_sidecar_open_options", &raf_opts);
     ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(idx_path));
     ASSIGN_OR_RETURN(auto idx_file, fs->new_random_access_file(raf_opts, idx_path));
 
@@ -590,6 +596,8 @@ Status ColumnReader::bloom_filter(const std::vector<const ColumnPredicate*>& pre
                     ASSIGN_OR_RETURN(raf_opts.encryption_info,
                                      KeyCache::instance().unwrap_encryption_meta(e.encryption_meta));
                 }
+                raf_opts.skip_peer_cache = opts.lake_io_opts.skip_peer_cache;
+                TEST_SYNC_POINT_CALLBACK("ColumnReader::idg_sidecar_open_options", &raf_opts);
                 ASSIGN_OR_RETURN(auto fs, FileSystemFactory::CreateSharedFromString(idx_path));
                 ASSIGN_OR_RETURN(idg_file_holder, fs->new_random_access_file(raf_opts, idx_path));
 
