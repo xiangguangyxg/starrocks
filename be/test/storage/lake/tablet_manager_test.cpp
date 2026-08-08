@@ -342,7 +342,7 @@ TEST_F(LakeTabletManagerTest, tablet_meta_corruption_counts_other_drop_and_rerea
 // the caller is told NotFound, and everything the caller tries next reads a different file, so there
 // is no re-read of this path to observe. So it moves its own bucket and neither self-heal re-read
 // counter. (The mismatch in get_single_tablet_metadata() is not drop-only -- see
-// gtid_mismatch_in_bundle_makes_fallback_read_bypass_caches.)
+// gtid_mismatch_rereads_bundle_bypassing_caches.)
 TEST_F(LakeTabletManagerTest, tablet_meta_gtid_mismatch_counts_drop_without_reread) {
     constexpr int64_t kDurableGtid = 1000;
     constexpr int64_t kRequestedGtid = 1001;
@@ -1619,12 +1619,12 @@ TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_pee
     EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
 }
 
-// A GTID mismatch inside get_single_tablet_metadata() is not a drop-only site: it drops the
-// per-tablet metadata file's local disk cache entry and reports NotFound, and get_tablet_metadata()
-// then re-reads exactly that file. That fallback is the drop's re-read even though it lives in the
-// caller, so it has to bypass the disk and peer caches -- otherwise a peer BE holding the same stale
-// copy (or an entry a concurrent reader repopulated) can hand back the bytes just dropped, the same
-// mismatch fires again, and the read never converges on authoritative storage.
+// The mixed-layout remainder of a GTID rejection. get_single_tablet_metadata() resolves the bundle
+// itself (see gtid_mismatch_rereads_bundle_bypassing_caches); when authoritative storage confirms
+// the bundle really is at a different gtid, it also invalidates the per-tablet file's cache entry,
+// because this version may exist in that layout too and get_tablet_metadata() reads it next. That
+// fallback has to bypass the disk and peer caches -- otherwise a peer BE holding the same stale copy
+// (or an entry a concurrent reader repopulated) can hand it back and the mismatch repeats.
 //
 // The bypass has to hold whether or not the drop itself succeeded, so the drop's outcome is forced
 // and both cases are covered. The failed-drop case is not an edge case: FileSystem::drop_local_cache
@@ -1634,7 +1634,7 @@ TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_pee
 // The last case is the other side of the contract: a NotFound that rejected nothing must leave the
 // caches alone. That one is routine, not exceptional -- once a partition has been published in
 // aggregate mode, every version it did not bundle takes the same fallback.
-TEST_F(LakeTabletManagerTest, gtid_mismatch_in_bundle_makes_fallback_read_bypass_caches) {
+TEST_F(LakeTabletManagerTest, gtid_mismatch_mixed_layout_fallback_bypasses_caches) {
     constexpr int64_t kStaleGtid = 1000;
     constexpr int64_t kDurableGtid = 1001;
     constexpr int64_t kSchemaId = 10;
@@ -1753,6 +1753,117 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_in_bundle_makes_fallback_read_bypass
     ASSERT_EQ(3, opens);
     EXPECT_FALSE(skip_disk_cache);
     EXPECT_FALSE(skip_peer_cache);
+}
+
+// The bytes a GTID check rejects come out of the bundle file, so the bundle is what has to be
+// re-read from authoritative storage. Re-reading the per-tablet file instead would resolve nothing
+// in the one configuration that produces bundle hits at all: an aggregate publish writes only the
+// bundle (lake_service.cpp derives skip_write_tablet_metadata from enable_aggregate_publish, and
+// transactions.cpp then skips put_tablet_metadata), so there is no per-tablet file to re-read.
+// This test builds exactly that shape -- a bundle and no per-tablet file.
+TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
+    constexpr int64_t kStaleGtid = 2000;
+    constexpr int64_t kDurableGtid = 2001;
+    constexpr int64_t kSchemaId = 10;
+
+    TabletSchemaPB schema_pb;
+    schema_pb.set_id(kSchemaId);
+    schema_pb.set_num_short_key_columns(1);
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_rows_per_row_block(65535);
+    auto c0 = schema_pb.add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+
+    auto tablet_id = next_id();
+    auto write_bundle = [&](int64_t gtid) {
+        starrocks::TabletMetadataPB metadata;
+        metadata.set_id(tablet_id);
+        metadata.set_version(2);
+        metadata.set_gtid(gtid);
+        metadata.mutable_schema()->CopyFrom(schema_pb);
+        (*metadata.mutable_historical_schemas())[kSchemaId].CopyFrom(schema_pb);
+        std::map<int64_t, TabletMetadataPB> bundle;
+        bundle.emplace(tablet_id, std::move(metadata));
+        return _tablet_manager->put_bundle_tablet_metadata(bundle);
+    };
+    // Only the bundle is written -- deliberately no put_tablet_metadata, so there is no per-tablet
+    // file for anything to fall back to.
+    ASSERT_OK(write_bundle(kStaleGtid));
+
+    int first_opens = 0;
+    int retry_opens = 0;
+    const void* first_opts_addr = nullptr;
+    const void* retry_opts_addr = nullptr;
+    bool first_skip_disk_cache = true;
+    bool retry_skip_disk_cache = false;
+    bool retry_skip_peer_cache = false;
+    bool heal_on_retry = false;
+
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_retry_open_options");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options", [&](void* arg) {
+        first_opens++;
+        first_opts_addr = arg;
+        first_skip_disk_cache = static_cast<RandomAccessFileOptions*>(arg)->skip_disk_cache;
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::gtid_retry_open_options", [&](void* arg) {
+        retry_opens++;
+        retry_opts_addr = arg;
+        const auto* o = static_cast<RandomAccessFileOptions*>(arg);
+        retry_skip_disk_cache = o->skip_disk_cache;
+        retry_skip_peer_cache = o->skip_peer_cache;
+        if (heal_on_retry) {
+            // Model authoritative storage holding the current bundle while the first read was served
+            // the stale one from the local cache or a peer: rewrite the file just before the
+            // bypassing re-read opens it. The re-read is outside the singleflight, so writing here
+            // is safe.
+            EXPECT_OK(write_bundle(kDurableGtid));
+        }
+    });
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t gtid_before = metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value();
+    auto path = _tablet_manager->tablet_metadata_location(tablet_id, 2);
+    auto read = [&]() {
+        _tablet_manager->metacache()->erase(path);
+        return _tablet_manager->get_tablet_metadata(path, lake::CacheOptions{}, kDurableGtid);
+    };
+
+    // 1. Authoritative storage agrees the bundle is at that gtid, so the rejection stands. There is
+    //    no per-tablet file, so the whole read reports NotFound rather than converging.
+    auto res = read();
+    EXPECT_TRUE(res.status().is_not_found()) << res.status();
+    // Positive controls: the re-read really happened -- it only runs on a mismatch -- and it carried
+    // both bypasses on an options object of its own, not by mutating the first read's, which the
+    // singleflight may share with coalesced callers.
+    ASSERT_EQ(1, retry_opens);
+    EXPECT_TRUE(retry_skip_disk_cache);
+    EXPECT_TRUE(retry_skip_peer_cache);
+    ASSERT_EQ(1, first_opens);
+    EXPECT_FALSE(first_skip_disk_cache);
+    EXPECT_NE(first_opts_addr, retry_opts_addr);
+    EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+
+    // 2. Authoritative storage has the up-to-date bundle, so the bypassing re-read resolves the
+    //    mismatch and the read converges -- with no per-tablet file involved anywhere.
+    heal_on_retry = true;
+    res = read();
+    ASSERT_TRUE(res.ok()) << res.status();
+    EXPECT_EQ(kDurableGtid, res.value()->gtid());
+    EXPECT_EQ(tablet_id, res.value()->id());
+    ASSERT_EQ(2, retry_opens);
+    EXPECT_TRUE(retry_skip_disk_cache);
+    EXPECT_TRUE(retry_skip_peer_cache);
+    // The rejection was resolved by the re-read, so the terminal drop was never reached.
+    EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {

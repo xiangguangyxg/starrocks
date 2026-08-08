@@ -841,12 +841,12 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
     auto [tablet_id, version] = parse_tablet_metadata_filename(basename(path));
     auto cache_key = _location_provider->real_location(tablet_metadata_root_location(tablet_id));
     if (cache_key.ok() && _metacache->lookup_aggregation_partition(*cache_key)) {
-        // On a GTID mismatch get_single_tablet_metadata() rejects |path|'s metadata as stale,
-        // invalidates its local disk cache entry and reports NotFound, so the fallback below is that
-        // rejection's re-read even though it lives here. Without the bypass it can be handed back
-        // the very copy that was just rejected -- from a peer BE holding it, or from a local entry
-        // that outlived the drop -- and the mismatch repeats instead of converging on authoritative
-        // storage.
+        // A GTID rejection inside get_single_tablet_metadata() concerns the bundle file, and that
+        // function re-reads the bundle from authoritative storage itself. What reaches here is the
+        // mixed-layout remainder: it also invalidated this per-tablet file's cache entry, because
+        // the version may exist in both layouts and the fallback below reads the per-tablet one.
+        // Without the bypass that read can be handed the stale copy -- from a peer BE holding it, or
+        // from a local entry that outlived the drop -- and the mismatch repeats.
         //
         // The bypass is conditional because the other reasons that call reports NotFound (initial
         // version, tablet absent from the bundle, no bundle file for this version) drop nothing and
@@ -1063,7 +1063,6 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
                      }));
     g_read_bundle_tablet_meta_latency << (butil::gettimeofday_us() - t0);
 
-    auto file_size = serialized_string.size();
     BundleTabletMetadataPtr bundle_metadata;
     auto bundle_metadata_status = parse_bundle_tablet_metadata(path, serialized_string);
     if (!bundle_metadata_status.ok()) {
@@ -1084,89 +1083,129 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         TEST_SYNC_POINT_CALLBACK("TabletManager::metadata_retry_open_options", &retry_opts);
         ASSIGN_OR_RETURN(auto input_file, file_system->new_random_access_file(retry_opts, path));
         ASSIGN_OR_RETURN(serialized_string, input_file->read_all());
-        file_size = serialized_string.size();
         ASSIGN_OR_RETURN(bundle_metadata, parse_bundle_tablet_metadata(path, serialized_string));
         StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
     } else {
         bundle_metadata = bundle_metadata_status.value();
     }
 
-    auto meta_it = bundle_metadata->tablet_meta_pages().find(tablet_id);
-    size_t offset = 0;
-    size_t size = 0;
-    if (meta_it == bundle_metadata->tablet_meta_pages().end()) {
-        return Status::NotFound(strings::Substitute("can not find tablet $0 from shared tablet metadata", tablet_id));
-    } else {
-        const PagePointerPB& page_pointer = meta_it->second;
-        offset = page_pointer.offset();
-        size = page_pointer.size();
-    }
-
-    if (file_size < offset + size) {
-        return Status::Corruption(
-                strings::Substitute("deserialized shared metadata($0) failed, file_size($1) too small($2/$3)", path,
-                                    file_size, offset, size));
-    }
-
-    auto metadata = std::make_shared<TabletMetadataPB>();
-    std::string_view metadata_str = std::string_view(serialized_string.data() + offset);
-    auto crc_it = bundle_metadata->tablet_meta_page_checksum().find(tablet_id);
-    if (crc_it != bundle_metadata->tablet_meta_page_checksum().end() &&
-        olap_adler32(ADLER32_INIT, metadata_str.data(), size) != crc_it->second) {
-        auto corrupted_status = Status::Corruption(
-                strings::Substitute("mismatched checksum of tablet $0 metadata in shared metadata", tablet_id));
-        (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
-        return corrupted_status;
-    }
-    if (!metadata->ParseFromArray(metadata_str.data(), size)) {
-        auto corrupted_status =
-                Status::Corruption(strings::Substitute("deserialized tablet $0 metadata failed", tablet_id));
-        (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
-        return corrupted_status;
-    }
-    normalize_tablet_metadata_after_load(metadata.get());
-
-    FAIL_POINT_TRIGGER_EXECUTE(tablet_schema_not_found_in_bundle_metadata, { tablet_id = 10003; });
-    auto schema_id = bundle_metadata->tablet_to_schema().find(tablet_id);
-    if (schema_id == bundle_metadata->tablet_to_schema().end()) {
-        return Status::Corruption(
-                strings::Substitute("tablet $0 metadata can not find schema_id in shared metadata", tablet_id));
-    }
-    auto schema_it = bundle_metadata->schemas().find(schema_id->second);
-    if (schema_it == bundle_metadata->schemas().end()) {
-        return Status::Corruption(strings::Substitute("tablet $0 metadata can not find schema($1) in shared metadata",
-                                                      tablet_id, schema_id->second));
-    } else {
-        metadata->mutable_schema()->CopyFrom(schema_it->second);
-        auto& item = (*metadata->mutable_historical_schemas())[schema_id->second];
-        item.CopyFrom(schema_it->second);
-    }
-
-    // The schema was stripped from the bundle and only restored above, so the earlier
-    // normalize_tablet_metadata_after_load() could not tell this was a primary-key tablet.
-    // Re-apply the cloud-native persistent index normalization now that keys_type is known.
-    force_cloud_native_pk_persistent_index(metadata.get());
-
-    for (auto& [_, schema_id] : metadata->rowset_to_schema()) {
-        schema_it = bundle_metadata->schemas().find(schema_id);
-        if (schema_it == bundle_metadata->schemas().end()) {
-            return Status::Corruption(strings::Substitute(
-                    "tablet $0 metadata can not find schema($1) in shared metadata", tablet_id, schema_id));
+    // Carving this tablet's metadata out of the bundle's bytes runs twice when the GTID check
+    // rejects the first result, so it lives in one place instead of being duplicated there.
+    auto extract_tablet_metadata = [&](const std::string& serialized,
+                                       const BundleTabletMetadataPtr& bundle) -> StatusOr<TabletMetadataPtr> {
+        const auto file_size = serialized.size();
+        auto meta_it = bundle->tablet_meta_pages().find(tablet_id);
+        size_t offset = 0;
+        size_t size = 0;
+        if (meta_it == bundle->tablet_meta_pages().end()) {
+            return Status::NotFound(
+                    strings::Substitute("can not find tablet $0 from shared tablet metadata", tablet_id));
         } else {
-            auto& item = (*metadata->mutable_historical_schemas())[schema_id];
+            const PagePointerPB& page_pointer = meta_it->second;
+            offset = page_pointer.offset();
+            size = page_pointer.size();
+        }
+
+        if (file_size < offset + size) {
+            return Status::Corruption(
+                    strings::Substitute("deserialized shared metadata($0) failed, file_size($1) too small($2/$3)", path,
+                                        file_size, offset, size));
+        }
+
+        auto metadata = std::make_shared<TabletMetadataPB>();
+        std::string_view metadata_str = std::string_view(serialized.data() + offset);
+        auto crc_it = bundle->tablet_meta_page_checksum().find(tablet_id);
+        if (crc_it != bundle->tablet_meta_page_checksum().end() &&
+            olap_adler32(ADLER32_INIT, metadata_str.data(), size) != crc_it->second) {
+            auto corrupted_status = Status::Corruption(
+                    strings::Substitute("mismatched checksum of tablet $0 metadata in shared metadata", tablet_id));
+            (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
+            return corrupted_status;
+        }
+        if (!metadata->ParseFromArray(metadata_str.data(), size)) {
+            auto corrupted_status =
+                    Status::Corruption(strings::Substitute("deserialized tablet $0 metadata failed", tablet_id));
+            (void)corrupted_tablet_meta_handler(corrupted_status, path, CacheDropSite::kBundlePage);
+            return corrupted_status;
+        }
+        normalize_tablet_metadata_after_load(metadata.get());
+
+        // Deliberately a copy: the failpoint below rewrites it, and this runs more than once.
+        int64_t schema_lookup_id = tablet_id;
+        FAIL_POINT_TRIGGER_EXECUTE(tablet_schema_not_found_in_bundle_metadata, { schema_lookup_id = 10003; });
+        auto schema_id = bundle->tablet_to_schema().find(schema_lookup_id);
+        if (schema_id == bundle->tablet_to_schema().end()) {
+            return Status::Corruption(strings::Substitute(
+                    "tablet $0 metadata can not find schema_id in shared metadata", schema_lookup_id));
+        }
+        auto schema_it = bundle->schemas().find(schema_id->second);
+        if (schema_it == bundle->schemas().end()) {
+            return Status::Corruption(strings::Substitute(
+                    "tablet $0 metadata can not find schema($1) in shared metadata", tablet_id, schema_id->second));
+        } else {
+            metadata->mutable_schema()->CopyFrom(schema_it->second);
+            auto& item = (*metadata->mutable_historical_schemas())[schema_id->second];
             item.CopyFrom(schema_it->second);
         }
+
+        // The schema was stripped from the bundle and only restored above, so the earlier
+        // normalize_tablet_metadata_after_load() could not tell this was a primary-key tablet.
+        // Re-apply the cloud-native persistent index normalization now that keys_type is known.
+        force_cloud_native_pk_persistent_index(metadata.get());
+
+        for (auto& [_, schema_id] : metadata->rowset_to_schema()) {
+            schema_it = bundle->schemas().find(schema_id);
+            if (schema_it == bundle->schemas().end()) {
+                return Status::Corruption(strings::Substitute(
+                        "tablet $0 metadata can not find schema($1) in shared metadata", tablet_id, schema_id));
+            } else {
+                auto& item = (*metadata->mutable_historical_schemas())[schema_id];
+                item.CopyFrom(schema_it->second);
+            }
+        }
+        return metadata;
+    };
+
+    auto gtid_rejected = [&](const TabletMetadataPtr& m) {
+        return expected_gtid > 0 && m->gtid() > 0 && expected_gtid != m->gtid();
+    };
+
+    ASSIGN_OR_RETURN(auto metadata, extract_tablet_metadata(serialized_string, bundle_metadata));
+
+    if (gtid_rejected(metadata)) {
+        // The rejected bytes came out of the bundle file, so the bundle is what has to be re-read
+        // from authoritative storage. Re-reading the per-tablet file instead would miss the case
+        // entirely: an aggregate publish writes only the bundle (lake_service.cpp sets
+        // skip_write_tablet_metadata from enable_aggregate_publish, and transactions.cpp then skips
+        // put_tablet_metadata), so in the configuration that produces bundle hits at all there is no
+        // per-tablet file to re-read.
+        //
+        // Same shape as the corrupted-bundle re-read above, and the same reason for a separate
+        // options object: the bypass belongs to this one re-read, while |opts| is what the
+        // singleflight'd first read was issued with and may be shared with coalesced callers.
+        RandomAccessFileOptions retry_opts = opts;
+        retry_opts.skip_disk_cache = true;
+        retry_opts.skip_peer_cache = true;
+        TEST_SYNC_POINT_CALLBACK("TabletManager::gtid_retry_open_options", &retry_opts);
+        ASSIGN_OR_RETURN(auto retry_file, file_system->new_random_access_file(retry_opts, path));
+        ASSIGN_OR_RETURN(auto retry_serialized, retry_file->read_all());
+        ASSIGN_OR_RETURN(auto retry_bundle, parse_bundle_tablet_metadata(path, retry_serialized));
+        ASSIGN_OR_RETURN(metadata, extract_tablet_metadata(retry_serialized, retry_bundle));
     }
 
-    if (expected_gtid > 0 && metadata->gtid() > 0 && expected_gtid != metadata->gtid()) {
+    if (gtid_rejected(metadata)) {
+        // Authoritative storage agrees with what was rejected, so the bundle is genuinely at a
+        // different gtid. What is left is the mixed-layout case: this version may also exist as a
+        // per-tablet file, which the caller reads next. Invalidate that file's cache entry and tell
+        // the caller its read of it has to bypass the disk and peer caches too.
+        //
+        // The signal is raised before the drop is attempted rather than after it succeeds: a drop
+        // that fails leaves the stale entry exactly where it was, which is a stronger reason to
+        // bypass on the re-read, not a reason to skip it. That is also the ordinary shape rather
+        // than an edge case -- FileSystem::drop_local_cache reports NotFound when there was nothing
+        // cached, and nothing being cached locally is precisely the case where a peer BE served the
+        // stale copy.
         StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, tablet_path);
-        // Tell the caller its fallback read of |tablet_path| is a self-heal re-read that has to
-        // bypass the disk and peer caches. Rejecting the metadata is what establishes that, so this
-        // is set before the drop is attempted rather than after it succeeds: a drop that fails
-        // leaves the stale entry exactly where it was, which is a stronger reason to bypass on the
-        // re-read, not a reason to skip it. That is also the ordinary shape rather than an edge
-        // case -- FileSystem::drop_local_cache reports NotFound when there was nothing cached, and
-        // nothing being cached locally is precisely the case where a peer BE served the stale copy.
         if (needs_authoritative_reread != nullptr) {
             *needs_authoritative_reread = true;
         }
