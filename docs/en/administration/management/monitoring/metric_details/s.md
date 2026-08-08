@@ -40,13 +40,13 @@ description: "Alphabetical s"
 
 - Unit: Count
 - Type: Cumulative
-- Description: Total number of times a shared-data read re-read a file after rejecting the bytes it was first served. Only the sites that re-open the file are counted: a corrupted tablet metadata file, a corrupted bundled metadata file, a persistent index SST that failed to open, and a bundled metadata file whose tablet metadata carried an unexpected GTID. Sites that retry on the stream they already hold, and sites that only drop the entry without re-reading, are not counted. The first three invalidate the local cache entry before re-reading; the GTID site re-reads first and invalidates afterwards, because which entry is at fault is not known until the re-read returns — the bundled file's entry when the re-read disagrees with what was served, the per-tablet file's entry when it confirms the rejection.
+- Description: Total number of times a shared-data read re-read a file after rejecting the bytes it was first served. Only the sites that re-open the file are counted: a corrupted tablet metadata file, a corrupted bundled metadata file, a persistent index SST that failed to open, and a bundled metadata file whose tablet metadata carried an unexpected GTID. Sites that retry on the stream they already hold, and sites that only drop the entry without re-reading, are not counted. The first three invalidate the local cache entry before re-reading; the GTID site re-reads first and invalidates afterwards, because which entry is at fault is not known until the re-read returns — the bundled file's entry when the re-read disagrees with what was served, the per-tablet file's entry when it confirms the rejection, and neither when the re-read itself fails before returning bytes.
 
 ## `self_heal_reread_success_total`
 
 - Unit: Count
 - Type: Cumulative
-- Description: Total number of the self-heal re-reads counted by `self_heal_reread_attempts_total` that resolved what triggered them: usable bytes for the corruption sites, metadata carrying the requested GTID for the GTID site. A gap between the two means a re-read did not resolve its trigger. On its own that does not mean the read failed — the caller may still succeed from the other metadata layout, and a publish idempotency check that correctly reports a version as published by a different transaction adds a steady, healthy baseline to the gap.
+- Description: Total number of the self-heal re-reads counted by `self_heal_reread_attempts_total` that resolved what triggered them: usable bytes for the corruption sites, metadata the request no longer rejects for the GTID site. A gap between the two means a re-read did not resolve its trigger. On its own that does not mean the read failed — the caller may still succeed from the other metadata layout, and a publish idempotency check that correctly reports a version as published by a different transaction adds a steady, healthy baseline to the gap.
 
 ## `short_key_index_mem_bytes`
 

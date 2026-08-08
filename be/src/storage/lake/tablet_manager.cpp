@@ -1193,8 +1193,10 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         // served them, the offending entry lives on that BE and no invalidation reachable from here
         // can touch it: dropping the local entry restores exactly the state that sends the next read
         // back to the same peer, so the burst repeats until that BE evicts or heals its own copy.
-        // Whether starlet's peer read validates freshness against authoritative storage -- which
-        // would rule the second case out -- is not determinable from this repository.
+        // The second case is not theoretical: a peer serves whatever its own cache holds for the
+        // requested key, the serving side checking only the request's shape and the reading side
+        // only the reply's length, so neither end revalidates the bytes against authoritative
+        // storage. Bounding it needs cross-BE invalidation, which does not exist today.
         //
         // Unlike the other self-heal re-reads, this one invalidates *after* reading rather than
         // before. Which entry it invalidates depends on the outcome, and neither is known until the
@@ -1220,6 +1222,7 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
             StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, path);
             TEST_SYNC_POINT_CALLBACK("TabletManager::gtid_stale_bundle_drop", &path);
             auto stale_drop_status = drop_local_cache(path);
+            TEST_SYNC_POINT_CALLBACK("TabletManager::gtid_stale_bundle_drop_status", &stale_drop_status);
             // NotFound means nothing was cached, which is the state this wants (see
             // FileSystem::drop_local_cache). Any other failure is logged and left at that: this read
             // has already converged, and failing it over a cache eviction would be a regression.

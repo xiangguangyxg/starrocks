@@ -1804,6 +1804,8 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     bool heal_on_retry = false;
 
     int stale_bundle_drops = 0;
+    int drop_outcomes = 0;
+    bool fail_the_drop = false;
     std::string dropped_path;
 
     SyncPoint::GetInstance()->EnableProcessing();
@@ -1811,11 +1813,18 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
         SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
         SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_retry_open_options");
         SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_stale_bundle_drop");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_stale_bundle_drop_status");
         SyncPoint::GetInstance()->DisableProcessing();
     });
     SyncPoint::GetInstance()->SetCallBack("TabletManager::gtid_stale_bundle_drop", [&](void* arg) {
         stale_bundle_drops++;
         dropped_path = *static_cast<std::string*>(arg);
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::gtid_stale_bundle_drop_status", [&](void* arg) {
+        drop_outcomes++;
+        if (fail_the_drop) {
+            *static_cast<Status*>(arg) = Status::IOError("injected drop failure");
+        }
     });
     SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options", [&](void* arg) {
         first_opens++;
@@ -1890,6 +1899,19 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     EXPECT_EQ(_tablet_manager->bundle_tablet_metadata_location(tablet_id, 2), dropped_path);
     // The terminal branch was never reached, so this drop is the healed branch's, not its.
     EXPECT_EQ(gtid_before + 2, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    ASSERT_EQ(1, drop_outcomes);
+
+    // 3. The invalidation fails outright. The read has already converged by that point, so it must
+    //    still return the authoritative metadata: failing a healed read over a cache eviction would
+    //    be a regression. Swallowing the error is deliberate, and this is what pins it.
+    ASSERT_OK(write_bundle(kStaleGtid)); // make the first read stale again
+    fail_the_drop = true;
+    res = read();
+    ASSERT_TRUE(res.ok()) << res.status();
+    EXPECT_EQ(kDurableGtid, res.value()->gtid());
+    ASSERT_EQ(3, retry_opens);
+    ASSERT_EQ(2, stale_bundle_drops);
+    ASSERT_EQ(2, drop_outcomes); // positive control: the injected failure was actually reached
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {
