@@ -1184,6 +1184,11 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         // options object: the bypass belongs to this one re-read, while |opts| is what the
         // singleflight'd first read was issued with and may be shared with coalesced callers.
         //
+        // Being past the singleflight also means concurrent readers of different tablets in this
+        // bundle each issue their own full-bundle read here instead of coalescing into one. That
+        // burst is self-limiting and needs no suppression of its own: the invalidation below removes
+        // the entry that caused the rejection, so the readers behind it are not rejected at all.
+        //
         // Unlike the other self-heal re-reads, this one invalidates *after* reading rather than
         // before. Which entry it invalidates depends on the outcome, and neither is known until the
         // re-read returns. It also keeps the cost off the common healthy case: a publish-idempotency
