@@ -1831,6 +1831,8 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
 
     auto* metrics = StorageMetrics::instance();
     const int64_t gtid_before = metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value();
+    const int64_t attempts_before = metrics->self_heal_reread_attempts_total.value();
+    const int64_t successes_before = metrics->self_heal_reread_success_total.value();
     auto path = _tablet_manager->tablet_metadata_location(tablet_id, 2);
     auto read = [&]() {
         _tablet_manager->metacache()->erase(path);
@@ -1851,6 +1853,10 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     EXPECT_FALSE(first_skip_disk_cache);
     EXPECT_NE(first_opts_addr, retry_opts_addr);
     EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    // The re-read was issued but did not recover anything, so only the attempt counts. Deltas,
+    // because these counters are process-global.
+    EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before, metrics->self_heal_reread_success_total.value());
 
     // 2. Authoritative storage has the up-to-date bundle, so the bypassing re-read resolves the
     //    mismatch and the read converges -- with no per-tablet file involved anywhere.
@@ -1862,8 +1868,12 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     ASSERT_EQ(2, retry_opens);
     EXPECT_TRUE(retry_skip_disk_cache);
     EXPECT_TRUE(retry_skip_peer_cache);
-    // The rejection was resolved by the re-read, so the terminal drop was never reached.
+    // The rejection was resolved by the re-read, so the terminal drop was never reached. This is the
+    // one site whose attempt can move without `invalidating_cache_drops_total` moving with it: it
+    // re-reads first and only invalidates if authoritative storage confirms the rejection.
     EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    EXPECT_EQ(attempts_before + 2, metrics->self_heal_reread_attempts_total.value());
+    EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {
@@ -2128,9 +2138,10 @@ TEST_F(LakeTabletManagerTest, get_single_tablet_metadata_parse_failure) {
     EXPECT_TRUE(handler_called) << "corrupted_tablet_meta_handler should have been called";
 
     // A bundle header that fails its crc is category-(a): the bundle is dropped as `other` and
-    // re-read. Nothing else in the tree covers the case where that re-read then *fails*, which is
-    // the pairing `self_heal_reread_success_total` exists to expose, so pin it here: one attempt,
-    // no success. The re-read pulls the same bytes off disk, so it cannot succeed. `bundle_page` is
+    // re-read. This is the corruption side of the pairing `self_heal_reread_success_total` exists to
+    // expose -- a re-read that then *fails* -- so pin it here: one attempt, no success. The re-read
+    // pulls the same bytes off disk, so it cannot succeed. (The GTID side of the same pairing is
+    // covered by gtid_mismatch_rereads_bundle_bypassing_caches.) `bundle_page` is
     // asserted unchanged to keep the two paths apart -- corrupting a single tablet page, leaving
     // the header intact, is what the checksum test below does.
     EXPECT_EQ(other_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kOther).value());

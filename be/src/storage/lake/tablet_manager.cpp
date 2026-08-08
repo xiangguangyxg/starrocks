@@ -1183,6 +1183,12 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         // Same shape as the corrupted-bundle re-read above, and the same reason for a separate
         // options object: the bypass belongs to this one re-read, while |opts| is what the
         // singleflight'd first read was issued with and may be shared with coalesced callers.
+        //
+        // Unlike the other self-heal re-reads this one is not preceded by a cache-entry drop -- it
+        // re-reads first and invalidates below only if authoritative storage confirms the rejection
+        // -- so it is the one site where the attempts counter can move without
+        // `invalidating_cache_drops_total` moving with it.
+        StorageMetrics::instance()->self_heal_reread_attempts_total.increment(1);
         RandomAccessFileOptions retry_opts = opts;
         retry_opts.skip_disk_cache = true;
         retry_opts.skip_peer_cache = true;
@@ -1191,6 +1197,9 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         ASSIGN_OR_RETURN(auto retry_serialized, retry_file->read_all());
         ASSIGN_OR_RETURN(auto retry_bundle, parse_bundle_tablet_metadata(path, retry_serialized));
         ASSIGN_OR_RETURN(metadata, extract_tablet_metadata(retry_serialized, retry_bundle));
+        if (!gtid_rejected(metadata)) {
+            StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
+        }
     }
 
     if (gtid_rejected(metadata)) {

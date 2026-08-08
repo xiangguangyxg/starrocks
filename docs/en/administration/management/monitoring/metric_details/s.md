@@ -40,7 +40,7 @@ description: "Alphabetical s"
 
 - Unit: Count
 - Type: Cumulative
-- Description: Total number of times a shared-data read re-read a file after invalidating its corrupt local cache entry. Only the sites that re-open the file are counted: a corrupted tablet metadata file, a corrupted bundled metadata file, and a persistent index SST that failed to open. Sites that retry on the stream they already hold, and sites that only drop the entry without re-reading, are not counted, so this never exceeds `invalidating_cache_drops_total`.
+- Description: Total number of times a shared-data read re-read a file after rejecting the bytes it was first served. Only the sites that re-open the file are counted: a corrupted tablet metadata file, a corrupted bundled metadata file, a persistent index SST that failed to open, and a bundled metadata file whose tablet metadata carried an unexpected GTID. Sites that retry on the stream they already hold, and sites that only drop the entry without re-reading, are not counted. The first three invalidate the local cache entry before re-reading, so they also move `invalidating_cache_drops_total`; the GTID site re-reads first and invalidates only if the re-read confirms the rejection, so it can move this metric on its own.
 
 ## `self_heal_reread_success_total`
 
