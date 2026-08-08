@@ -147,9 +147,16 @@ public:
     StatusOr<TabletMetadataPtr> get_single_tablet_metadata(int64_t tablet_id, int64_t version, bool fill_cache = true,
                                                            int64_t expected_gtid = 0,
                                                            const std::shared_ptr<FileSystem>& fs = nullptr);
+    // |needs_authoritative_reread|, when non-null, is set to true if this call rejected the metadata
+    // on a GTID mismatch. The caller's fallback read of the per-tablet metadata file must then
+    // bypass the disk and peer caches, so that it cannot be handed back the stale copy this call
+    // just rejected; see get_tablet_metadata(const std::string&, const CacheOptions&, ...). It is
+    // set whether or not dropping the stale local cache entry succeeded, because a failed drop
+    // leaves that entry in place.
     StatusOr<TabletMetadataPtr> get_single_tablet_metadata(int64_t tablet_id, int64_t version,
                                                            const CacheOptions& cache_opts, int64_t expected_gtid = 0,
-                                                           const std::shared_ptr<FileSystem>& fs = nullptr);
+                                                           const std::shared_ptr<FileSystem>& fs = nullptr,
+                                                           bool* needs_authoritative_reread = nullptr);
 
     static StatusOr<BundleTabletMetadataPtr> parse_bundle_tablet_metadata(const std::string& path,
                                                                           const std::string& serialized_string);
@@ -335,7 +342,7 @@ private:
     Status put_tablet_metadata(const TabletMetadataPtr& metadata, const std::string& metadata_location);
     StatusOr<TabletMetadataPtr> load_tablet_metadata(const std::string& metadata_location, bool fill_data_cache,
                                                      int64_t expected_gtid, const std::shared_ptr<FileSystem>& fs,
-                                                     bool skip_peer_cache);
+                                                     bool skip_peer_cache, bool skip_disk_cache);
     StatusOr<TabletMetadataPtr> construct_initial_metadata(int64_t tablet_id);
     // Build version 1 TabletMetadataPB from a FE response. Exposed for unit tests.
     StatusOr<TabletMetadataPtr> build_initial_metadata(int64_t tablet_id, const TGetTabletMetadataResponse& resp);

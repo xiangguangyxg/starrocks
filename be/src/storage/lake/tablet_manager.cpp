@@ -729,12 +729,14 @@ Status TabletManager::corrupted_tablet_meta_handler(const Status& s, const std::
 StatusOr<TabletMetadataPtr> TabletManager::load_tablet_metadata(const string& metadata_location, bool fill_data_cache,
                                                                 int64_t expected_gtid,
                                                                 const std::shared_ptr<FileSystem>& fs,
-                                                                bool skip_peer_cache) {
+                                                                bool skip_peer_cache, bool skip_disk_cache) {
     TEST_ERROR_POINT("TabletManager::load_tablet_metadata");
     auto t0 = butil::gettimeofday_us();
     auto metadata = std::make_shared<TabletMetadataPB>();
-    auto s = load_lake_protobuf(metadata_location, metadata.get(),
-                                {.fill_cache = fill_data_cache, .skip_peer_cache = skip_peer_cache}, fs);
+    auto s = load_lake_protobuf(
+            metadata_location, metadata.get(),
+            {.fill_cache = fill_data_cache, .skip_disk_cache = skip_disk_cache, .skip_peer_cache = skip_peer_cache},
+            fs);
     if (!s.ok()) {
         RETURN_IF_ERROR(corrupted_tablet_meta_handler(s, metadata_location, CacheDropSite::kOther));
         // reset metadata
@@ -839,14 +841,30 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
     auto [tablet_id, version] = parse_tablet_metadata_filename(basename(path));
     auto cache_key = _location_provider->real_location(tablet_metadata_root_location(tablet_id));
     if (cache_key.ok() && _metacache->lookup_aggregation_partition(*cache_key)) {
-        metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs);
+        // On a GTID mismatch get_single_tablet_metadata() rejects |path|'s metadata as stale,
+        // invalidates its local disk cache entry and reports NotFound, so the fallback below is that
+        // rejection's re-read even though it lives here. Without the bypass it can be handed back
+        // the very copy that was just rejected -- from a peer BE holding it, or from a local entry
+        // that outlived the drop -- and the mismatch repeats instead of converging on authoritative
+        // storage.
+        //
+        // The bypass is conditional because the other reasons that call reports NotFound (initial
+        // version, tablet absent from the bundle, no bundle file for this version) drop nothing and
+        // are routine rather than exceptional: any partition that has ever been published in
+        // aggregate mode takes this branch for every version, including those written as a
+        // per-tablet file. Bypassing the disk cache there would send every such read to remote
+        // storage.
+        bool needs_authoritative_reread = false;
+        metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs,
+                                                 &needs_authoritative_reread);
         if (metadata_or.status().is_not_found()) {
             metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs,
-                                               cache_opts.skip_peer_cache);
+                                               cache_opts.skip_peer_cache || needs_authoritative_reread,
+                                               /*skip_disk_cache=*/needs_authoritative_reread);
         }
     } else {
-        metadata_or =
-                load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs, cache_opts.skip_peer_cache);
+        metadata_or = load_tablet_metadata(path, cache_opts.fill_data_cache, expected_gtid, fs,
+                                           cache_opts.skip_peer_cache, /*skip_disk_cache=*/false);
         if (metadata_or.status().is_not_found()) {
             metadata_or = get_single_tablet_metadata(tablet_id, version, cache_opts, expected_gtid, fs);
             if (metadata_or.ok() && cache_key.ok()) {
@@ -859,7 +877,7 @@ StatusOr<TabletMetadataPtr> TabletManager::get_tablet_metadata(const string& pat
         // If the metadata is not found, we will try to read the initial metadata at least
         std::string new_path = join_path(prefix_name(path), tablet_initial_metadata_filename());
         metadata_or = load_tablet_metadata(new_path, cache_opts.fill_data_cache, expected_gtid, fs,
-                                           cache_opts.skip_peer_cache);
+                                           cache_opts.skip_peer_cache, /*skip_disk_cache=*/false);
         // set tablet id for initial metadata
         if (metadata_or.ok()) {
             auto metadata = const_cast<starrocks::TabletMetadataPB*>(metadata_or.value().get());
@@ -1008,7 +1026,8 @@ DEFINE_FAIL_POINT(tablet_schema_not_found_in_bundle_metadata);
 StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t tablet_id, int64_t version,
                                                                       const CacheOptions& cache_opts,
                                                                       int64_t expected_gtid,
-                                                                      const std::shared_ptr<FileSystem>& fs) {
+                                                                      const std::shared_ptr<FileSystem>& fs,
+                                                                      bool* needs_authoritative_reread) {
     auto tablet_path = tablet_metadata_location(tablet_id, version);
     if (!cache_opts.skip_meta_cache) {
         if (auto ptr = _metacache->lookup_tablet_metadata(tablet_path); ptr != nullptr) {
@@ -1141,7 +1160,18 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
 
     if (expected_gtid > 0 && metadata->gtid() > 0 && expected_gtid != metadata->gtid()) {
         StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, tablet_path);
+        // Tell the caller its fallback read of |tablet_path| is a self-heal re-read that has to
+        // bypass the disk and peer caches. Rejecting the metadata is what establishes that, so this
+        // is set before the drop is attempted rather than after it succeeds: a drop that fails
+        // leaves the stale entry exactly where it was, which is a stronger reason to bypass on the
+        // re-read, not a reason to skip it. That is also the ordinary shape rather than an edge
+        // case -- FileSystem::drop_local_cache reports NotFound when there was nothing cached, and
+        // nothing being cached locally is precisely the case where a peer BE served the stale copy.
+        if (needs_authoritative_reread != nullptr) {
+            *needs_authoritative_reread = true;
+        }
         auto drop_status = drop_local_cache(tablet_path);
+        TEST_SYNC_POINT_CALLBACK("TabletManager::gtid_mismatch_drop_status", &drop_status);
         if (!drop_status.ok()) {
             LOG(WARNING) << "clear dirty cache for " << tablet_path << " failed, "
                          << "error: " << drop_status;

@@ -338,9 +338,11 @@ TEST_F(LakeTabletManagerTest, tablet_meta_corruption_counts_other_drop_and_rerea
     EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
 }
 
-// A GTID mismatch is a drop-only site: the stale entry is invalidated and the caller is told
-// NotFound, with no re-read on this path to observe. So it moves its own bucket and neither
-// self-heal re-read counter.
+// The GTID mismatch in load_tablet_metadata() is a drop-only site: the stale entry is invalidated,
+// the caller is told NotFound, and everything the caller tries next reads a different file, so there
+// is no re-read of this path to observe. So it moves its own bucket and neither self-heal re-read
+// counter. (The mismatch in get_single_tablet_metadata() is not drop-only -- see
+// gtid_mismatch_in_bundle_makes_fallback_read_bypass_caches.)
 TEST_F(LakeTabletManagerTest, tablet_meta_gtid_mismatch_counts_drop_without_reread) {
     constexpr int64_t kDurableGtid = 1000;
     constexpr int64_t kRequestedGtid = 1001;
@@ -1615,6 +1617,142 @@ TEST_F(LakeTabletManagerTest, bundle_meta_self_heal_reread_bypasses_disk_and_pee
     EXPECT_EQ(bundle_page_before, metrics->invalidating_cache_drops(CacheDropSite::kBundlePage).value());
     EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
     EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
+}
+
+// A GTID mismatch inside get_single_tablet_metadata() is not a drop-only site: it drops the
+// per-tablet metadata file's local disk cache entry and reports NotFound, and get_tablet_metadata()
+// then re-reads exactly that file. That fallback is the drop's re-read even though it lives in the
+// caller, so it has to bypass the disk and peer caches -- otherwise a peer BE holding the same stale
+// copy (or an entry a concurrent reader repopulated) can hand back the bytes just dropped, the same
+// mismatch fires again, and the read never converges on authoritative storage.
+//
+// The bypass has to hold whether or not the drop itself succeeded, so the drop's outcome is forced
+// and both cases are covered. The failed-drop case is not an edge case: FileSystem::drop_local_cache
+// answers NotFound when there was nothing cached (fs.h), and nothing being cached locally is exactly
+// the case where a peer BE served the stale copy in the first place.
+//
+// The last case is the other side of the contract: a NotFound that rejected nothing must leave the
+// caches alone. That one is routine, not exceptional -- once a partition has been published in
+// aggregate mode, every version it did not bundle takes the same fallback.
+TEST_F(LakeTabletManagerTest, gtid_mismatch_in_bundle_makes_fallback_read_bypass_caches) {
+    constexpr int64_t kStaleGtid = 1000;
+    constexpr int64_t kDurableGtid = 1001;
+    constexpr int64_t kSchemaId = 10;
+
+    TabletSchemaPB schema_pb;
+    schema_pb.set_id(kSchemaId);
+    schema_pb.set_num_short_key_columns(1);
+    schema_pb.set_keys_type(DUP_KEYS);
+    schema_pb.set_num_rows_per_row_block(65535);
+    auto c0 = schema_pb.add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+
+    auto make_metadata = [&](int64_t tablet_id, int64_t gtid) {
+        starrocks::TabletMetadataPB metadata;
+        metadata.set_id(tablet_id);
+        metadata.set_version(2);
+        metadata.set_gtid(gtid);
+        metadata.mutable_schema()->CopyFrom(schema_pb);
+        (*metadata.mutable_historical_schemas())[kSchemaId].CopyFrom(schema_pb);
+        return metadata;
+    };
+
+    // |bundled_id| is in the bundle with a stale gtid; |unbundled_id| is not in the bundle at all.
+    // Both have an authoritative per-tablet metadata file.
+    auto bundled_id = next_id();
+    auto unbundled_id = next_id();
+    std::map<int64_t, TabletMetadataPB> bundle;
+    bundle.emplace(bundled_id, make_metadata(bundled_id, kStaleGtid));
+    // Writing the bundle is also what marks the partition as using aggregated metadata, which is
+    // what routes both reads below through get_single_tablet_metadata() first.
+    ASSERT_OK(_tablet_manager->put_bundle_tablet_metadata(bundle));
+
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(make_metadata(bundled_id, kDurableGtid)));
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(make_metadata(unbundled_id, kDurableGtid)));
+
+    int opens = 0;
+    bool skip_disk_cache = false;
+    bool skip_peer_cache = false;
+    int drop_attempts = 0;
+    // The drop's outcome is forced rather than inherited from the environment. PosixFileSystem does
+    // not override FileSystem::drop_local_cache, so here it always answers NotFound; taking that as
+    // given would silently cover only one of the two cases below, and would leave the successful
+    // drop -- the one the production path normally takes -- untested.
+    Status forced_drop_status = Status::OK();
+
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ProtobufFileWithHeader::open_options");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_mismatch_drop_status");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    // Only the per-tablet metadata file is read through ProtobufFileWithHeader; the bundle file is
+    // opened directly. So this hook observes the fallback read and nothing else.
+    SyncPoint::GetInstance()->SetCallBack("ProtobufFileWithHeader::open_options", [&](void* arg) {
+        opens++;
+        const auto* o = static_cast<RandomAccessFileOptions*>(arg);
+        skip_disk_cache = o->skip_disk_cache;
+        skip_peer_cache = o->skip_peer_cache;
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::gtid_mismatch_drop_status", [&](void* arg) {
+        drop_attempts++;
+        *static_cast<Status*>(arg) = forced_drop_status;
+    });
+
+    auto* metrics = StorageMetrics::instance();
+    const int64_t gtid_before = metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value();
+
+    // The writes above warmed the metacache; evict just the entry being read so each read really
+    // opens the files. prune() would also evict the aggregated-partition marker and send the reads
+    // down the other branch, where there is no fallback to observe.
+    auto bundled_path = _tablet_manager->tablet_metadata_location(bundled_id, 2);
+    auto unbundled_path = _tablet_manager->tablet_metadata_location(unbundled_id, 2);
+    auto read = [&](const std::string& path) {
+        _tablet_manager->metacache()->erase(path);
+        return _tablet_manager->get_tablet_metadata(path, lake::CacheOptions{}, kDurableGtid);
+    };
+
+    // 1. The stale entry was cached locally and the drop removed it.
+    auto res = read(bundled_path);
+    ASSERT_TRUE(res.ok()) << res.status();
+    // Positive controls: the read converged on the authoritative file rather than the bundle's stale
+    // copy, the gtid rejection and its drop really happened, and the fallback really opened the
+    // per-tablet file -- so the flags below are that open's and not their initial values.
+    EXPECT_EQ(kDurableGtid, res.value()->gtid());
+    EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    ASSERT_EQ(1, drop_attempts);
+    ASSERT_EQ(1, opens);
+    EXPECT_TRUE(skip_disk_cache);
+    EXPECT_TRUE(skip_peer_cache);
+
+    // 2. Nothing was cached locally, so there was nothing to drop. The re-read still has to bypass,
+    //    and the peer bypass is the whole point here: a local cache that missed is why a peer BE
+    //    supplied the stale copy to begin with.
+    forced_drop_status = Status::NotFound("no local cache entry");
+    res = read(bundled_path);
+    ASSERT_TRUE(res.ok()) << res.status();
+    EXPECT_EQ(kDurableGtid, res.value()->gtid());
+    EXPECT_EQ(gtid_before + 2, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    ASSERT_EQ(2, drop_attempts);
+    ASSERT_EQ(2, opens);
+    EXPECT_TRUE(skip_disk_cache);
+    EXPECT_TRUE(skip_peer_cache);
+
+    // 3. Same fallback, reached because the tablet is absent from the bundle rather than rejected on
+    //    its gtid. Nothing was rejected, so the caches stay in play -- including for a caller that
+    //    did pass an expected gtid. The unchanged counters are what prove no rejection happened.
+    res = read(unbundled_path);
+    ASSERT_TRUE(res.ok()) << res.status();
+    EXPECT_EQ(kDurableGtid, res.value()->gtid());
+    EXPECT_EQ(gtid_before + 2, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
+    EXPECT_EQ(2, drop_attempts);
+    ASSERT_EQ(3, opens);
+    EXPECT_FALSE(skip_disk_cache);
+    EXPECT_FALSE(skip_peer_cache);
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {
