@@ -1184,10 +1184,11 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         // options object: the bypass belongs to this one re-read, while |opts| is what the
         // singleflight'd first read was issued with and may be shared with coalesced callers.
         //
-        // Unlike the other self-heal re-reads this one is not preceded by a cache-entry drop -- it
-        // re-reads first and invalidates below only if authoritative storage confirms the rejection
-        // -- so it is the one site where the attempts counter can move without
-        // `invalidating_cache_drops_total` moving with it.
+        // Unlike the other self-heal re-reads, this one invalidates *after* reading rather than
+        // before. Which entry it invalidates depends on the outcome, and neither is known until the
+        // re-read returns. It also keeps the cost off the common healthy case: a publish-idempotency
+        // check whose gtid legitimately belongs to another transaction would otherwise evict the
+        // bundle -- shared by every tablet in the partition -- on each such check.
         StorageMetrics::instance()->self_heal_reread_attempts_total.increment(1);
         RandomAccessFileOptions retry_opts = opts;
         retry_opts.skip_disk_cache = true;
@@ -1199,6 +1200,21 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         ASSIGN_OR_RETURN(metadata, extract_tablet_metadata(retry_serialized, retry_bundle));
         if (!gtid_rejected(metadata)) {
             StorageMetrics::instance()->self_heal_reread_success_total.increment(1);
+            // Authoritative storage disagreed with what the first read was handed, which is proof
+            // that copy -- from the local disk cache, or from a peer BE -- is stale. Drop it. The
+            // bundle is shared by every tablet in the partition, and a reader that passes no
+            // expected gtid has nothing to check it against, so leaving it would let the same stale
+            // bytes be returned silently for a different tablet.
+            StorageMetrics::instance()->record_invalidating_cache_drop(CacheDropSite::kGtidMismatch, path);
+            TEST_SYNC_POINT_CALLBACK("TabletManager::gtid_stale_bundle_drop", &path);
+            auto stale_drop_status = drop_local_cache(path);
+            // NotFound means nothing was cached, which is the state this wants (see
+            // FileSystem::drop_local_cache). Any other failure is logged and left at that: this read
+            // has already converged, and failing it over a cache eviction would be a regression.
+            if (!stale_drop_status.ok() && !stale_drop_status.is_not_found()) {
+                LOG(WARNING) << "clear stale bundle cache for " << path << " failed, "
+                             << "error: " << stale_drop_status;
+            }
         }
     }
 

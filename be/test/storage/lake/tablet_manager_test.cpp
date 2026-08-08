@@ -1803,11 +1803,19 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     bool retry_skip_peer_cache = false;
     bool heal_on_retry = false;
 
+    int stale_bundle_drops = 0;
+    std::string dropped_path;
+
     SyncPoint::GetInstance()->EnableProcessing();
     DeferOp defer([]() {
         SyncPoint::GetInstance()->ClearCallBack("TabletManager::metadata_open_options");
         SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_retry_open_options");
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::gtid_stale_bundle_drop");
         SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::gtid_stale_bundle_drop", [&](void* arg) {
+        stale_bundle_drops++;
+        dropped_path = *static_cast<std::string*>(arg);
     });
     SyncPoint::GetInstance()->SetCallBack("TabletManager::metadata_open_options", [&](void* arg) {
         first_opens++;
@@ -1857,6 +1865,9 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     // because these counters are process-global.
     EXPECT_EQ(attempts_before + 1, metrics->self_heal_reread_attempts_total.value());
     EXPECT_EQ(successes_before, metrics->self_heal_reread_success_total.value());
+    // The bundle agreed with authoritative storage, so its own entry is sound and must be left
+    // alone. The drop recorded above is the per-tablet file's, for the mixed-layout fallback.
+    EXPECT_EQ(0, stale_bundle_drops);
 
     // 2. Authoritative storage has the up-to-date bundle, so the bypassing re-read resolves the
     //    mismatch and the read converges -- with no per-tablet file involved anywhere.
@@ -1868,12 +1879,17 @@ TEST_F(LakeTabletManagerTest, gtid_mismatch_rereads_bundle_bypassing_caches) {
     ASSERT_EQ(2, retry_opens);
     EXPECT_TRUE(retry_skip_disk_cache);
     EXPECT_TRUE(retry_skip_peer_cache);
-    // The rejection was resolved by the re-read, so the terminal drop was never reached. This is the
-    // one site whose attempt can move without `invalidating_cache_drops_total` moving with it: it
-    // re-reads first and only invalidates if authoritative storage confirms the rejection.
-    EXPECT_EQ(gtid_before + 1, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
     EXPECT_EQ(attempts_before + 2, metrics->self_heal_reread_attempts_total.value());
     EXPECT_EQ(successes_before + 1, metrics->self_heal_reread_success_total.value());
+    // The re-read disagreeing with the first read is proof the copy that was served -- from the
+    // local disk cache or a peer -- is stale, so the bundle's own entry has to go. Without this the
+    // next reader of any tablet in the same bundle is handed the same stale bytes, and one that
+    // passes no expected gtid has nothing to reject them with. The path is asserted because
+    // dropping the per-tablet file here instead would leave the offending entry in place.
+    ASSERT_EQ(1, stale_bundle_drops);
+    EXPECT_EQ(_tablet_manager->bundle_tablet_metadata_location(tablet_id, 2), dropped_path);
+    // The terminal branch was never reached, so this drop is the healed branch's, not its.
+    EXPECT_EQ(gtid_before + 2, metrics->invalidating_cache_drops(CacheDropSite::kGtidMismatch).value());
 }
 
 TEST_F(LakeTabletManagerTest, parse_bundle_tablet_metadata_with_zero_size) {
