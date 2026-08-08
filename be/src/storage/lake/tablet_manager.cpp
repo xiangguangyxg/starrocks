@@ -1185,9 +1185,16 @@ StatusOr<TabletMetadataPtr> TabletManager::get_single_tablet_metadata(int64_t ta
         // singleflight'd first read was issued with and may be shared with coalesced callers.
         //
         // Being past the singleflight also means concurrent readers of different tablets in this
-        // bundle each issue their own full-bundle read here instead of coalescing into one. That
-        // burst is self-limiting and needs no suppression of its own: the invalidation below removes
-        // the entry that caused the rejection, so the readers behind it are not rejected at all.
+        // bundle each issue their own full-bundle read here instead of coalescing into one.
+        //
+        // How long that burst lasts depends on where the stale bytes came from, and only one of the
+        // two cases is self-limiting. If this BE's own disk cache held them, the invalidation below
+        // removes that entry and the readers behind this one are not rejected at all. If a peer BE
+        // served them, the offending entry lives on that BE and no invalidation reachable from here
+        // can touch it: dropping the local entry restores exactly the state that sends the next read
+        // back to the same peer, so the burst repeats until that BE evicts or heals its own copy.
+        // Whether starlet's peer read validates freshness against authoritative storage -- which
+        // would rule the second case out -- is not determinable from this repository.
         //
         // Unlike the other self-heal re-reads, this one invalidates *after* reading rather than
         // before. Which entry it invalidates depends on the outcome, and neither is known until the
