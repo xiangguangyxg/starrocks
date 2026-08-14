@@ -1478,6 +1478,14 @@ CONF_mInt32(starlet_filesystem_instance_cache_ttl_sec, "86400");
 // enabled. Warmup and CACHE SELECT never use peer reads: peer read buys critical-path latency,
 // while background bulk work would just contend for a production node's scarce disk IOPS.
 CONF_mBool(starlet_enable_peer_cache_read, "false");
+// Deadline for one peer cache read, in milliseconds, passed through to starlet's
+// peer_cache_read_rpc_timeout_ms. It has to sit above the first-byte latency of a same-cluster
+// object-store read, because that is what it is standing in for: set below, every read pays a round
+// trip and then falls back anyway, and a timeout trips the peer's health gate immediately, so the
+// feature switches itself off while still paying for the attempts. Measured on a 6-node 1 TB
+// cluster: at 100 ms the peer supplied 0.3% of the bytes a scan could not serve locally, at 10000 ms
+// it supplied 98.7%. Recalibrate per cluster before enabling.
+CONF_Int32(starlet_peer_cache_read_rpc_timeout_ms, "100");
 // Whether this BE serves peer cache read requests from other BEs whose local disk cache missed.
 // This is the server half of the two-axis peer-cache-read switch; starlet_enable_peer_cache_read
 // (above) is the client half. Rollout order matters: enable this config on every node first, then

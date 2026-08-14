@@ -296,6 +296,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：starlet filesystem 实例缓存的过期时间。
 - 引入版本：v3.3.15, 3.4.5
 
+### starlet_peer_cache_read_rpc_timeout_ms
+
+- 默认值：100
+- 类型：Int
+- 单位：毫秒
+- 是否动态：否
+- 描述：单次对端缓存读取的超时时间。该值必须高于同集群对象存储读取的首字节延迟，因为对端读取正是用来替代该读取的。若设置得过低，每次对端读取都会白付一次往返后仍回落到对象存储；更严重的是，一次超时会立即触发该对端的健康熔断，此后整条查询都不再使用对端缓存，但仍然付出了尝试的代价。在 6 节点集群 1 TB 数据上实测：默认 100 ms 时，对端仅提供了查询无法从本地缓存读取的字节中的 0.3%；设置为 10000 ms 时提供了 98.7%。开启 `starlet_enable_peer_cache_read` 前请针对集群重新校准该值。
+- 引入版本：-
+
 ### starlet_port
 
 - 默认值：9070

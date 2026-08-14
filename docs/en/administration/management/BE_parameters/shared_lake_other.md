@@ -299,6 +299,15 @@ This topic introduces the following types of BE configurations:
 - Description: The cache expiration time of starlet filesystem instances.
 - Introduced in: v3.3.15, 3.4.5
 
+### starlet_peer_cache_read_rpc_timeout_ms
+
+- Default: 100
+- Type: Int
+- Unit: Milliseconds
+- Is mutable: No
+- Description: Deadline for one peer cache read. It must sit above the first-byte latency of a same-cluster object-store read, because that is the read it stands in for. Set below it, every peer read pays a round trip and then falls back to object storage anyway; worse, a timeout trips that peer's health gate immediately and the feature suppresses itself for the rest of the query while still paying for the attempts. Measured on a 6-node cluster over 1 TB: at the default of 100 ms a peer supplied 0.3% of the bytes a scan could not serve from its own cache, and at 10000 ms it supplied 98.7%. Recalibrate for the cluster before enabling `starlet_enable_peer_cache_read`.
+- Introduced in: -
+
 ### starlet_port
 
 - Default: 9070

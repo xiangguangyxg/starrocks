@@ -26,6 +26,7 @@
 #include "common/shutdown_hook.h"
 #include "common/util/table_metrics.h"
 #include "compute_env/staros/staros_worker.h"
+#include "fslib/peer_cache_read_configuration.h"
 #include "fslib/star_cache_configuration.h"
 #include "fslib/star_cache_handler.h"
 #include "gflags/gflags.h"
@@ -116,6 +117,10 @@ void init_staros_worker(const std::shared_ptr<starcache::StarCache>& star_cache,
     fslib::FLAGS_star_cache_disk_size_percent = config::starlet_star_cache_disk_size_percent;
     fslib::FLAGS_star_cache_disk_size_bytes = config::starlet_star_cache_disk_size_bytes;
     fslib::FLAGS_star_cache_block_size_bytes = config::starlet_star_cache_block_size_bytes;
+    // The flag has no validator, so brpc refuses to change it at runtime, and there was no supported
+    // way to set it at start-up either: the only route was a gflag placed after a `--` on the CN
+    // command line, which start_backend.sh's option loop rejects unless it sits exactly there.
+    fslib::FLAGS_peer_cache_read_rpc_timeout_ms = config::starlet_peer_cache_read_rpc_timeout_ms;
 
     staros::starlet::StarletConfig starlet_config;
     starlet_config.rpc_port = config::starlet_port;
