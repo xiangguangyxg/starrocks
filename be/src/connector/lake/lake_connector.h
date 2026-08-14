@@ -281,6 +281,7 @@ private:
     // Compressed bytes read
     RuntimeProfile::Counter* _compressed_bytes_read_local_disk_counter = nullptr;
     RuntimeProfile::Counter* _compressed_bytes_read_remote_counter = nullptr;
+    RuntimeProfile::Counter* _data_cache_read_peer_bytes_counter = nullptr;
     RuntimeProfile::Counter* _compressed_bytes_read_total_counter = nullptr;
     RuntimeProfile::Counter* _compressed_bytes_read_request_counter = nullptr;
     // IO count

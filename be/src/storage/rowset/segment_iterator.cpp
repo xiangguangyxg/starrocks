@@ -4862,6 +4862,12 @@ void SegmentIterator::_update_stats(io::SeekableInputStream* rfile) {
         } else if (name == kBytesReadRemote) {
             _opts.stats->compressed_bytes_read_remote += value;
             _opts.stats->compressed_bytes_read += value;
+        } else if (name == kBytesReadPeer) {
+            // Added to the total for the same reason the two branches above are: a peer read is a
+            // third source, counted by neither of them, so leaving it out would make the total
+            // fall short of the bytes the scan actually consumed.
+            _opts.stats->compressed_bytes_read_peer += value;
+            _opts.stats->compressed_bytes_read += value;
         } else if (name == kIOCountLocalDisk) {
             _opts.stats->io_count_local_disk += value;
             _opts.stats->io_count += value;

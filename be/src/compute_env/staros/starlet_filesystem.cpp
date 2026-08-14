@@ -207,10 +207,11 @@ public:
 
         const auto& read_stats = (*stream_st)->get_io_stats();
         auto stats = std::make_unique<io::NumericStatistics>();
-        stats->reserve(11);
+        stats->reserve(12);
         stats->append(kBytesReadLocalDisk, read_stats.bytes_read_local_disk);
         stats->append(kBytesWriteLocalDisk, read_stats.bytes_write_local_disk);
         stats->append(kBytesReadRemote, read_stats.bytes_read_remote);
+        stats->append(kBytesReadPeer, read_stats.bytes_read_peer);
         stats->append(kIOCountLocalDisk, read_stats.io_count_local_disk);
         stats->append(kIOCountRemote, read_stats.io_count_remote);
         stats->append(kIONsReadLocalDisk, read_stats.io_ns_read_local_disk);

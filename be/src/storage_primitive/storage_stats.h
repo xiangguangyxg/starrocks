@@ -135,6 +135,10 @@ struct OlapReaderStatistics {
     int64_t compressed_bytes_read_local_disk = 0;
     int64_t compressed_bytes_write_local_disk = 0;
     int64_t compressed_bytes_read_remote = 0;
+    // Served by another node's cache. Disjoint from the two counters above -- such a read reaches
+    // neither this node's disk nor the object store -- and included in compressed_bytes_read, so
+    // that the total stays the sum of where the bytes came from.
+    int64_t compressed_bytes_read_peer = 0;
     // bytes read requested from be, same as compressed_bytes_read for local tablet
     int64_t compressed_bytes_read_request = 0;
 
@@ -200,6 +204,7 @@ struct OlapWriterStatistics {
 const char* const kBytesReadLocalDisk = "bytes_read_local_disk";
 const char* const kBytesWriteLocalDisk = "bytes_write_local_disk";
 const char* const kBytesReadRemote = "bytes_read_remote";
+const char* const kBytesReadPeer = "bytes_read_peer";
 const char* const kBytesWriteRemote = "bytes_write_remote";
 const char* const kIOCountLocalDisk = "io_count_local_disk";
 const char* const kIOCountRemote = "io_count_remote";

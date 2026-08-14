@@ -1447,6 +1447,10 @@ void LakeDataSource::init_counter(RuntimeState* state) {
             ADD_CHILD_COUNTER(_runtime_profile, "CompressedBytesReadLocalDisk", TUnit::BYTES, io_statistics_name);
     _compressed_bytes_read_remote_counter =
             ADD_CHILD_COUNTER(_runtime_profile, "CompressedBytesReadRemote", TUnit::BYTES, io_statistics_name);
+    // Same name the hive scanner already publishes, so one profile question -- how many bytes came
+    // from another node's cache -- has one answer regardless of table type.
+    _data_cache_read_peer_bytes_counter =
+            ADD_CHILD_COUNTER(_runtime_profile, "DataCacheReadPeerBytes", TUnit::BYTES, io_statistics_name);
     _compressed_bytes_read_total_counter =
             ADD_CHILD_COUNTER(_runtime_profile, "CompressedBytesReadTotal", TUnit::BYTES, io_statistics_name);
     _compressed_bytes_read_request_counter =
@@ -1604,6 +1608,7 @@ void LakeDataSource::update_counter(RuntimeState* state) {
 
     COUNTER_UPDATE(_compressed_bytes_read_local_disk_counter, _reader->stats().compressed_bytes_read_local_disk);
     COUNTER_UPDATE(_compressed_bytes_read_remote_counter, _reader->stats().compressed_bytes_read_remote);
+    COUNTER_UPDATE(_data_cache_read_peer_bytes_counter, _reader->stats().compressed_bytes_read_peer);
     COUNTER_UPDATE(_compressed_bytes_read_total_counter, _reader->stats().compressed_bytes_read);
     COUNTER_UPDATE(_compressed_bytes_read_request_counter, _reader->stats().compressed_bytes_read_request);
 
