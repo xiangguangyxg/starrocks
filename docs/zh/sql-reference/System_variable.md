@@ -1525,6 +1525,14 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 * 数据类型：Int
 * 别名：`scan_hive_partition_num_limit`
 
+### skip_fill_data_cache
+
+* **描述**: 会话标志，只阻止本会话的查询回填本地 data cache，不影响从该 cache 读取。设置为 `true` 时，`OlapScanNode.addScanRangeLocations()` 会把每个 `TInternalScanRange` 的 `fill_data_cache` 置为 false，BE 仍从数据已在的位置读取，但不再写回。适用于一次性扫描冷数据、又不希望挤掉已有热数据的场景。它与 `skip_local_disk_cache` 不同：后者连读取也一并关闭，在存算分离表上还会连带禁用跨节点的 peer cache 读；因此需要保留 peer 读能力的查询必须用本变量。表属性 `datacache.partition_duration` 表达的是同一种抑制，但作用粒度是分区而非会话。
+* **作用域**: Session
+* **默认值**: `false`
+* **数据类型**: boolean
+* **引入版本**: v4.2
+
 ### skip_local_disk_cache
 
 * **描述**: 会话标志，指示 FE 在构建 scan ranges 时为每个 tablet 的内部扫描范围标记 `skip_disk_cache`。当设置为 `true` 时，`OlapScanNode.addScanRangeLocations()` 会在创建的 `TInternalScanRange` 对象上调用 `internalRange.setSkip_disk_cache(true)`，从而通知下游 BE 的扫描节点在该扫描中绕过本地磁盘缓存。该设置按会话应用，并在计划/扫描范围构建时评估。可与 `skip_page_cache`（控制页面缓存跳过）和数据缓存相关变量（`enable_scan_datacache` / `enable_populate_datacache`）结合使用。

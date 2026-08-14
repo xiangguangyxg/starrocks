@@ -632,7 +632,8 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
                 ctx == null ? null : ctx.getScanVersionOverride());
         scanPartitionVersions.put(physicalPartition.getId(), visibleVersion);
         String visibleVersionStr = String.valueOf(visibleVersion);
-        boolean fillDataCache = olapTable.isEnableFillDataCache(partition);
+        boolean fillDataCache = olapTable.isEnableFillDataCache(partition)
+                && !(ctx != null && ctx.getSessionVariable().isSkipFillDataCache());
         selectedPartitionNames.add(partition.getName());
 
         checkSomeAliveComputeNode();

@@ -1766,6 +1766,14 @@ Used for compatibility with JDBC connection pool C3P0. No practical use.
 * **Data type**: Int
 * **Alias**: `scan_hive_partition_num_limit`
 
+### skip_fill_data_cache
+
+* **Description**: Session flag that stops this session's queries from populating the local data cache, while leaving reads from that cache untouched. When set to `true`, `OlapScanNode.addScanRangeLocations()` clears `fill_data_cache` on every `TInternalScanRange`, so backends serve the scan from wherever the bytes already are but write nothing back. Use it for one-off scans of cold data that should not evict a warm working set. It differs from `skip_local_disk_cache`, which turns the read off as well; on shared-data tables that also disables the cross-node peer cache read, so a query that must still be allowed to read a peer's cache has to use this variable instead. The table property `datacache.partition_duration` expresses the same suppression per partition rather than per session.
+* **Scope**: Session
+* **Default**: `false`
+* **Data Type**: boolean
+* **Introduced in**: v4.2
+
 ### skip_local_disk_cache
 
 * **Description**: Session flag that instructs the FE, when building scan ranges, to mark each tablet's internal scan range with `skip_disk_cache`. When set to `true`, `OlapScanNode.addScanRangeLocations()` sets `internalRange.setSkip_disk_cache(true)` on the created `TInternalScanRange` objects so downstream BE scan nodes are told to bypass the local disk cache for that scan. It is applied per-session and is evaluated at plan/scan-range construction time. Use this together with `skip_page_cache` (to control page cache skipping) and data-cache related variables (`enable_scan_datacache` / `enable_populate_datacache`) as appropriate.

@@ -403,6 +403,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String SKIP_PAGE_CACHE = "skip_page_cache";
 
+    public static final String SKIP_FILL_DATA_CACHE = "skip_fill_data_cache";
+
     public static final String SKIP_BLACK_LIST = "skip_black_list";
 
     /**
@@ -1323,6 +1325,12 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VariableMgr.VarAttr(name = SKIP_PAGE_CACHE)
     private boolean skipPageCache = false;
+
+    // Leaves reading the local disk cache alone and only stops this query's bytes being written
+    // into it, which is what SKIP_LOCAL_DISK_CACHE cannot express: that one turns off the read as
+    // well, and on shared-data tables it also takes the cross-node peer read down with it.
+    @VariableMgr.VarAttr(name = SKIP_FILL_DATA_CACHE)
+    private boolean skipFillDataCache = false;
 
     @VariableMgr.VarAttr(name = SKIP_BLACK_LIST)
     private boolean skipBlackList = false;
@@ -3907,6 +3915,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public boolean isSkipPageCache() {
         return skipPageCache;
+    }
+
+    public boolean isSkipFillDataCache() {
+        return skipFillDataCache;
     }
 
     public boolean isSkipBlackList() {
