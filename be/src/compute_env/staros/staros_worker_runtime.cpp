@@ -121,6 +121,9 @@ void init_staros_worker(const std::shared_ptr<starcache::StarCache>& star_cache,
     // way to set it at start-up either: the only route was a gflag placed after a `--` on the CN
     // command line, which start_backend.sh's option loop rejects unless it sits exactly there.
     fslib::FLAGS_peer_cache_read_rpc_timeout_ms = config::starlet_peer_cache_read_rpc_timeout_ms;
+    fslib::FLAGS_peer_cache_read_connections_per_peer =
+            config::starlet_peer_cache_read_connections_per_peer;
+    fslib::FLAGS_peer_cache_read_buffer_enable = config::starlet_peer_cache_read_buffer_enable;
 
     staros::starlet::StarletConfig starlet_config;
     starlet_config.rpc_port = config::starlet_port;

@@ -119,6 +119,32 @@ CONF_mBool(starlet_enable_peer_cache_read, "false");
 // it supplied 98.7%. Recalibrate per cluster before enabling.
 CONF_Int32(starlet_peer_cache_read_rpc_timeout_ms, "100");
 
+// Connections opened to each peer, over which peer cache reads are spread round robin, passed
+// through to starlet's peer_cache_read_connections_per_peer. One connection puts every concurrent
+// read of a peer onto a single HTTP/2 stream set, which caps a reader well below its NIC and lets
+// one lost segment stall every read at once. Measured between two 25 Gbps compute nodes: one
+// connection held 591 MB/s no matter how many reader threads were used, eight reached 2959 MB/s
+// (23.7 Gbps, the link), and sixty-four added nothing. Starlet clamps this to [1, 64].
+//
+// Takes effect while running, on peers already in the pool as well as new ones: raising it adds
+// connections that the next reads dial, lowering it drops the ones above the new count without
+// disturbing a read already in flight on them.
+CONF_mInt32(starlet_peer_cache_read_connections_per_peer, "8");
+
+// Whether a peer cache read that asks for less than a whole cache block fetches the whole block and
+// serves later reads of it from memory, passed through to starlet's peer_cache_read_buffer_enable.
+//
+// Every other read path in starlet already buffers: the object-store, hdfs and azure streams each
+// wrap their raw stream in a buffer of starlet_fs_stream_buffer_size_bytes, and the peer layer sits
+// above that wrapper, so it was the one read path without one. It only shows when the cache is not
+// being filled -- datacache.partition_duration outside its window, or the skip_fill_data_cache
+// session variable -- because the layer below then reads what the scan asked for rather than a whole
+// block, about 17 KB in a measured scan. At that granularity the object-store arm turned those asks
+// into one 1 MB fetch plus sixty memory hits and reached 2172 MB/s, while the peer arm turned them
+// into sixty round trips and reached 879 MB/s; the same peer path at block granularity reaches
+// 2702 MB/s. When the caller already asks for a whole block this does nothing at all.
+CONF_mBool(starlet_peer_cache_read_buffer_enable, "true");
+
 // Whether this BE serves peer cache read requests from other BEs whose local disk cache missed.
 // This is the server half of the two-axis peer-cache-read switch; starlet_enable_peer_cache_read
 // (above) is the client half. Rollout order matters: enable this config on every node first, then

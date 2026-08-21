@@ -299,6 +299,24 @@ This topic introduces the following types of BE configurations:
 - Description: The cache expiration time of starlet filesystem instances.
 - Introduced in: v3.3.15, 3.4.5
 
+### starlet_peer_cache_read_buffer_enable
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether a peer cache read that asks for less than a whole cache block fetches the whole block and serves later reads of it from memory. Every other read path in starlet already buffers, and the peer layer sits above that buffer, so without this it was the one read path with none of its own. It only takes effect when the local cache is not being filled -- outside `datacache.partition_duration`, or with the `skip_fill_data_cache` session variable -- because the layer below then reads what the scan asked for rather than a whole block, about 17 KB in a measured scan. Turning it off restores one round trip per ask. It retains up to one cache block per open stream, which is why it has a switch.
+- Introduced in: -
+
+### starlet_peer_cache_read_connections_per_peer
+
+- Default: 8
+- Type: Int
+- Unit: -
+- Is mutable: Yes
+- Description: Number of connections opened to each peer, over which peer cache reads are spread round robin. One connection puts every concurrent read of a peer onto a single HTTP/2 stream set, which caps a reader well below its NIC and lets one lost segment stall every read at once. Measured between two 25 Gbps compute nodes: one connection held 591 MB/s regardless of reader-thread count, eight reached 2959 MB/s (23.7 Gbps, the link), and sixty-four added nothing. Clamped to the range [1, 64]. Takes effect while running, on peers already pooled as well as new ones.
+- Introduced in: -
+
 ### starlet_peer_cache_read_rpc_timeout_ms
 
 - Default: 100

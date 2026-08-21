@@ -296,6 +296,24 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：starlet filesystem 实例缓存的过期时间。
 - 引入版本：v3.3.15, 3.4.5
 
+### starlet_peer_cache_read_buffer_enable
+
+- 默认值: true
+- 类型: Boolean
+- 单位: -
+- 是否动态: 是
+- 描述: 当一次邻节点缓存读请求的数据量小于一个完整缓存块时，是否取回整块并将该块后续的读从内存中提供。starlet 的其他读路径都自带缓冲，而邻节点读这一层位于缓冲之上，因此在此之前它是唯一没有缓冲的读路径。该配置仅在本地缓存不被填充时生效——即超出 `datacache.partition_duration` 范围，或设置了 `skip_fill_data_cache` 会话变量——因为此时下层只读取扫描所请求的数据量而非整块，实测扫描中约为 17 KB。关闭后每次请求恢复为一次独立的网络往返。每个打开的流最多保留一个缓存块，因此提供该开关。
+- 引入版本: -
+
+### starlet_peer_cache_read_connections_per_peer
+
+- 默认值: 8
+- 类型: Int
+- 单位: -
+- 是否动态: 是
+- 描述: 向每个邻节点建立的连接数，邻节点缓存读请求在这些连接上轮询分发。仅用一条连接会使该邻节点的所有并发读共享同一组 HTTP/2 流，使读取能力远低于网卡上限，且一次丢包会同时阻塞所有读。在两台 25 Gbps 计算节点间实测：单连接无论使用多少读线程都只有 591 MB/s，8 条连接达到 2959 MB/s（23.7 Gbps，即链路上限），64 条不再有提升。取值被限制在 [1, 64] 范围内。运行时修改即时生效，对已建立连接的邻节点和新邻节点均适用。
+- 引入版本: -
+
 ### starlet_peer_cache_read_rpc_timeout_ms
 
 - 默认值：100
