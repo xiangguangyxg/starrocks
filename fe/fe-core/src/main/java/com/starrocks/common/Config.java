@@ -3726,6 +3726,22 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static int lake_warehouse_max_compute_replica = 3;
 
+    /**
+     * BENCHMARK ONLY. Passed through to StarMgr as PEER_TEST_FORCE_PEER_WORKER_IDS: comma-separated
+     * {@code workerId@host:port} entries offered as peer cache read sources for every shard, without
+     * the usual check that the source is registered and alive in the reading group. Lets a benchmark
+     * read entirely from a node that holds no shards and only holds cache. Never set in production.
+     */
+    @ConfField(mutable = true)
+    public static String peer_test_force_peer_worker_ids = "";
+
+    /**
+     * BENCHMARK ONLY. Passed through to StarMgr as PEER_TEST_DRAIN_WORKER_IDS, which no longer reads
+     * it. Kept so this bridge matches the frontend already deployed on the benchmark cluster.
+     */
+    @ConfField(mutable = true)
+    public static String peer_test_drain_worker_ids = "";
+
     @ConfField(mutable = true, comment = "time interval to check whether warehouse is idle")
     public static long warehouse_idle_check_interval_seconds = 60;
 

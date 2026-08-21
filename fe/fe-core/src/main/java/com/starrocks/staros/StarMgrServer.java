@@ -181,6 +181,10 @@ public class StarMgrServer {
             com.staros.util.Config.WORKER_HEARTBEAT_INTERVAL_SEC = Config.heartbeat_timeout_second;
             com.staros.util.Config.WORKER_HEARTBEAT_RETRY_COUNT = Config.heartbeat_retry_times;
             com.staros.util.Config.GRPC_RPC_TIME_OUT_SEC = Config.starmgr_grpc_timeout_seconds;
+            // BENCHMARK ONLY. Registered here rather than in the startup block so they follow
+            // ADMIN SET FRONTEND CONFIG like every other mutable mirror above.
+            com.staros.util.Config.PEER_TEST_FORCE_PEER_WORKER_IDS = Config.peer_test_force_peer_worker_ids;
+            com.staros.util.Config.PEER_TEST_DRAIN_WORKER_IDS = Config.peer_test_drain_worker_ids;
             com.staros.util.Config.ENABLE_BALANCE_SHARD_NUM_BETWEEN_WORKERS = Config.lake_enable_balance_tablets_between_workers;
             com.staros.util.Config.BALANCE_WORKER_SHARDS_THRESHOLD_IN_PERCENT = Config.lake_balance_tablets_threshold;
             com.staros.util.Config.SHARD_DEAD_REPLICA_EXPIRE_SECS = (int) Config.tablet_sched_be_down_tolerate_time_s;
